@@ -1,0 +1,12 @@
+# Changes here will be overwritten by Copier
+Authors: Yixin Liu <lyx@fudan.edu.cn>
+JuliaMinVersion: '1.11'
+License: MIT
+LicenseCopyrightHolders: Yixin Liu
+PackageName: CrystallographicFFT
+PackageOwner: liuyxpp
+PackageUUID: 77d87cf4-6451-5050-a4a3-5ce7c515c7a6
+StrategyConfirmIncluded: false
+StrategyLevel: 1
+StrategyReviewExcluded: false
+_src_path: /home/lyx/.julia/packages/BestieTemplate/fOzc4
