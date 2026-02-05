@@ -12,27 +12,73 @@ struct SpectralIndexing
     N::Tuple
 end
 
+
+"""
+    calc_spectral_asu(ops::Vector{SymOp}, dim::Int, N::Tuple) -> SpectralIndexing
+
+Calculate the spectral ASU for a given set of direct space operations.
+Used when custom operations (e.g. shifted) are provided.
+"""
+function calc_spectral_asu(direct_ops::Vector{SymOp}, dim::Int, N::Tuple)
+    # 2. Compute dual operations for reciprocal space
+    # R* = (R^-1)^T, t* = 0 (BUT we need original t for filtering!)
+    recip_ops = dual_ops(direct_ops)
+    
+    # 3. Calculate ASU on the reciprocal grid
+    raw_points = calc_asu(N, recip_ops)
+    
+    # 4. Filter forbidden modes (Extinctions)
+    # Condition: Sum_{g in Stab(k)} exp(-i k . t_g) != 0
+    valid_points = Vector{ASUPoint}()
+    
+    for p in raw_points
+        k_idx = p.idx
+        
+        # Identify Stabilizer
+        stab_sum = 0.0 + 0.0im
+        stab_count = 0
+        
+        for (i, op) in enumerate(recip_ops)
+            # Check if op stabilizes k_idx (modulo N)
+            k_new = op.R * k_idx
+            
+            # Check equality mod N
+            diff = (k_new .- k_idx) .% collect(N)
+            if all(d -> d == 0, diff)
+                # In Stabilizer
+                stab_count += 1
+                
+                # Add phase exp(-i k . t_direct)
+                t_direct = direct_ops[i].t
+                
+                phase = 0.0
+                for d in 1:length(N)
+                    phase += k_idx[d] * t_direct[d] / N[d]
+                end
+                
+                stab_sum += exp(-im * 2π * phase)
+            end
+        end
+        
+        # If sum is non-zero, keep point.
+        # Use tolerance
+        if abs(stab_sum) > 1e-5
+            push!(valid_points, p)
+        end
+    end
+    
+    return SpectralIndexing(valid_points, recip_ops, N)
+end
+
 """
     calc_spectral_asu(sg_num, dim, N::Tuple) -> SpectralIndexing
 
 Calculate the spectral ASU for a given space group and grid size.
-Uses the dual symmetry operations (reciprocal space).
-Forces shift to be 0 (standard frequency grid).
+Wrapper collecting operations from `sg_num`.
 """
-function calc_spectral_asu(sg_num, dim, N::Tuple)
-    # 1. Get direct space operations
+function calc_spectral_asu(sg_num::Int, dim, N::Tuple)
     direct_ops = get_ops(sg_num, dim, N)
-    
-    # 2. Compute dual operations for reciprocal space
-    # R* = (R^-1)^T, t* = 0
-    recip_ops = dual_ops(direct_ops)
-    
-    # 3. Calculate ASU on the reciprocal grid
-    # We pass recip_ops directly to calc_asu, bypassing find_optimal_shift
-    # This effectively uses shift=0, because t*=0 for all ops imply 0 is a high symmetry point.
-    points = calc_asu(N, recip_ops)
-    
-    return SpectralIndexing(points, recip_ops, N)
+    return calc_spectral_asu(direct_ops, dim, N)
 end
 
 """
