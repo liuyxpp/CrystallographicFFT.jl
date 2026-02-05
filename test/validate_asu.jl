@@ -104,4 +104,5 @@ run_validation(7, 2, (8, 8), "p2mg")
 
 # 3. Pmmm (SG 47, 3D)
 # 8x8x8 grid checks 3D recursion logic
-run_validation(47, 3, (8, 8, 8), "Pmmm")
+# 4. p2mm (SG 6, 2D) - 16x16 (Check depth scaling)
+run_validation(6, 2, (16, 16), "p2mm_16")

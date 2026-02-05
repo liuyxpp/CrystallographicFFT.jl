@@ -10,5 +10,3 @@ coverage
 docs/build/
 env
 node_modules
-docs/references/*
-docs/design/*
