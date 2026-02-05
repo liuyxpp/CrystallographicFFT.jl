@@ -1,7 +1,11 @@
 module CrystallographicFFT
 
+include("symmetry_ops.jl")
+using .SymmetryOps
 include("asu.jl")
 using .ASU
+include("spectral_indexing.jl")
+using .SpectralIndexing
 include("cfft_plan.jl")
 include("execution.jl")
 export CFFTPlan, plan_cfft

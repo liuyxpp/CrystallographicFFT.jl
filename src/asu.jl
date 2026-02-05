@@ -1,32 +1,12 @@
 module ASU
 
-export SymOp, apply_op, calc_asu, ASUPoint, classify_points, get_ops
-export ASUBlock, CrystallographicASU, pack_asu, find_optimal_shift
+export calc_asu, ASUPoint, classify_points, ASUBlock, CrystallographicASU, pack_asu, find_optimal_shift
+# Re-export SymOp related from SymmetryOps
+using ..SymmetryOps
+export SymOp, apply_op, get_ops
 
 using LinearAlgebra
 using Crystalline
-
-struct SymOp
-    R::Matrix{Int}
-    t::Vector{Int}
-end
-
-function convert_op(op::SymOperation, N::Tuple)
-    t_grid = op.translation .* collect(N)
-    t_int = round.(Int, t_grid)
-    if !all(isapprox.(t_grid, t_int, atol=1e-5))
-        error("Symmetry operation not commensurate with grid $N")
-    end
-    return SymOp(round.(Int, op.rotation), t_int)
-end
-
-function get_ops(sg_num::Int, dim::Int, N::Tuple)
-    [convert_op(op, N) for op in operations(spacegroup(sg_num, dim))]
-end
-
-function apply_op(op::SymOp, x::Vector{Int}, N::Tuple)
-    map((val, mod) -> mod1(val + 1, mod) - 1, op.R * x .+ op.t, N)
-end
 
 struct ASUPoint
     idx::Vector{Int}
@@ -55,19 +35,6 @@ function calc_asu(sg_num, dim, N::Tuple)
     ops = get_ops(sg_num, dim, N)
     best_shift, shifted_ops = find_optimal_shift(ops, N)
     return calc_asu(N, shifted_ops), Tuple(best_shift)
-end
-
-function check_shift_invariance(ops::Vector{SymOp}, shift::Vector{Float64}, N::Tuple)
-    deltas = Vector{Vector{Int}}(undef, length(ops))
-    for (i, op) in enumerate(ops)
-        delta_float = (op.R * shift .+ (op.t ./ collect(N)) .- shift) .* collect(N)
-        delta_int = round.(Int, delta_float)
-        if !all(isapprox.(delta_float, delta_int, atol=1e-5))
-            return false, Vector{Vector{Int}}()
-        end
-        deltas[i] = delta_int
-    end
-    return true, deltas
 end
 
 function find_optimal_shift(ops::Vector{SymOp}, N::Tuple)
