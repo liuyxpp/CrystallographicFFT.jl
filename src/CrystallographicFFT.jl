@@ -6,6 +6,8 @@ include("asu.jl")
 using .ASU
 include("spectral_indexing.jl")
 using .SpectralIndexing
+include("matrix_q.jl")
+using .MatrixQ
 include("cfft_plan.jl")
 include("execution.jl")
 export CFFTPlan, plan_cfft
