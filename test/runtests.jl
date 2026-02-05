@@ -1,4 +1,16 @@
+using Test
 using CrystallographicFFT
-using TestItemRunner
 
-@run_package_tests verbose=true
+@testset "CrystallographicFFT.jl" begin
+    @testset "ASU Construction" begin
+        include("test_asu.jl")
+    end
+    
+    @testset "ASU Packing" begin
+        include("test_packing.jl")
+    end
+    
+    @testset "CFFT Planning" begin
+        include("test_cfft.jl")
+    end
+end
