@@ -1,5 +1,6 @@
 using Test
 using CrystallographicFFT.ASU
+using CrystallographicFFT.SymmetryOps
 using Crystalline
 using LinearAlgebra
 
@@ -32,7 +33,7 @@ end
         @test shift ≈ [0.5/8, 0.5/8]
         
         # Check invariance manually
-        valid, _ = CrystallographicFFT.ASU.check_shift_invariance(base_ops, collect(shift), N)
+        valid, _ = check_shift_invariance(base_ops, collect(shift), N)
         @test valid
     end
 

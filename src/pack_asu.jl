@@ -23,7 +23,8 @@ function pack_asu(points::Vector{ASUPoint}, N::Tuple, T::Type=Float64, ArrayType
             coords = hcat([p.idx for p in group]...)
             for d in 1:D
                 vals = unique(sort(coords[d, :]))
-                strides[d] = length(vals) > 1 ? gcd(diff(vals)) : 1
+                # Force stride 1 for Contiguous Blocks (Required by Modulated FFT Logic)
+                strides[d] = 1
             end
         end
 
@@ -98,4 +99,104 @@ function pack_asu(points::Vector{ASUPoint}, N::Tuple, T::Type=Float64, ArrayType
     end
     
     return CrystallographicASU{D, T, A_final}(dim_blocks, shift)
+end
+
+"""
+    pack_asu_interleaved(u::AbstractArray, N::Tuple, ops::Vector{SymOp}; 
+                              L::Union{Nothing, Tuple}=nothing, asu_only::Bool=true)
+
+Pack a full grid `u` into Interleaved ASUBlocks (Mode B).
+If `asu_only=true` (default), only returns the single ASU subgrid (Γ₀).
+If `asu_only=false`, returns all orbit representatives (legacy behavior).
+Returns a `CrystallographicASU`.
+"""
+function pack_asu_interleaved(u::AbstractArray, N::Tuple, ops::Vector{SymOp}; 
+                              L::Union{Nothing, Tuple}=nothing, asu_only::Bool=true)
+    D = length(N)
+    T = eltype(u)
+    # Heuristic for ArrayType: Array or CuArray hint
+    ArrayType = u isa Array ? Array : (u isa AbstractArray ? typeof(u).name.wrapper : Array)
+    
+    # 1. Analyze Orbits (Subgrid Discovery)
+    # L defaults to (2,2,...) inside analyze_interleaved_orbits if nothing
+    orbits = analyze_interleaved_orbits(N, ops; L=L)
+    
+    # Ensure L is set for slicing
+    if isnothing(L)
+        L = Tuple(fill(2, D))
+    end
+    
+    # 2. ASU Selection: If asu_only, keep only the first orbit (Γ₀ = shift (0,0,...))
+    if asu_only
+        # Find the orbit with representative [0,0,0,...]
+        asu_orbit = nothing
+        for o in orbits
+            if all(o.representative .== 0)
+                asu_orbit = o
+                break
+            end
+        end
+        if isnothing(asu_orbit)
+            # Fallback: use first orbit
+            asu_orbit = first(orbits)
+        end
+        orbits = [asu_orbit]
+    end
+    
+    blocks = ASUBlock{T, D, ArrayType{T,D}}[]
+    
+    for orbit in orbits
+        # Representative shift: orbit.representative (0-based)
+        # Subgrid Range: start:step:stop
+        # start = orbit.representative[d] + 1 (1-based index)
+        # step = L[d]
+        
+        rep_0based = orbit.representative
+        range_tuples = Vector{StepRange{Int, Int}}(undef, D)
+        
+        for d in 1:D
+            start = rep_0based[d] + 1
+            step = L[d]
+            # stop should be last valid index <= N[d]
+            # Range logic handles stop automatically: start:step:N[d]
+            range_tuples[d] = start : step : N[d]
+        end
+        
+        # Slicing needs 1-based range (range_tuples)
+        # ASUBlock needs Global 0-based range
+        
+        # Convert range_tuples (1-based) to 0-based
+        current_range = Vector{StepRange{Int, Int}}(undef, D)
+        for d in 1:D
+             r = range_tuples[d]
+             current_range[d] = (first(r)-1) : step(r) : (last(r)-1)
+        end
+        
+        # Extract Data
+        # If u is empty/dummy, we might skip allocation? No, ASUBlock needs data.
+        # u[range_tuples...] creates a copy by default for StepRange slicing in standard Array.
+        # For GPU arrays, it might be different.
+        block_data = u[range_tuples...]
+        
+        # Ensure concrete ArrayType
+        # If u is view, block_data is Array.
+        # If ArrayType is specialized, convert.
+        if !(block_data isa ArrayType{T, D})
+            block_data = convert(ArrayType{T, D}, block_data)
+        end
+        
+        # Depth: In Mode B, depth is irrelevant (use zeros)
+        depth = zeros(Int, D)
+        
+        # For asu_only=true, use Mode A (no orbit info → correct reconstruction formula)
+        # For asu_only=false, attach orbit info (Mode B orbit reduction)
+        block_orbit = asu_only ? nothing : orbit
+        push!(blocks, ASUBlock(block_data, current_range, depth, block_orbit))
+    end
+    
+    # Organize into Structure
+    dim_blocks = Dict{Int, Vector{ASUBlock{T, D, ArrayType{T,D}}}}()
+    dim_blocks[D] = blocks # All blocks are full dimension
+    
+    return CrystallographicASU{D, T, ArrayType{T,D}}(dim_blocks, Tuple(zeros(Float64, D)))
 end

@@ -28,9 +28,21 @@ function apply_op(op::SymOp, x::Vector{Int}, N::Tuple)
 end
 
 function check_shift_invariance(ops::Vector{SymOp}, shift::Vector{Float64}, N::Tuple)
+    # Check if shifting origin by `shift` keeps the operations commensurate with grid `N`.
+    # Original: g(x) = Rx + t.
+    # Shifted: g'(x) = g(x+s)-s = R(x+s)+t-s = Rx + (Rs + t - s).
+    # New t' = t + (Rs - s).
+    # We return deltas = (Rs - s), so t' = t + deltas.
+    # We check if t' is integer. Since t is integer, we need (Rs - s) to be integer?
+    # Actually, we need (Rs + t - s) to be integer.
+    # Generally (Rs - s) might not be integer, but combined with t it might be?
+    # But t is always integer (on grid).
+    # So (Rs - s) must be integer.
+    deltas = Vector{Vector{Int}}(undef, length(ops))
     deltas = Vector{Vector{Int}}(undef, length(ops))
     for (i, op) in enumerate(ops)
-        delta_float = (op.R * shift .+ (op.t ./ collect(N)) .- shift) .* collect(N)
+        # We want the change in translation: R*s - s
+        delta_float = (op.R * shift .- shift) .* collect(N)
         delta_int = round.(Int, delta_float)
         if !all(isapprox.(delta_float, delta_int, atol=1e-5))
             return false, Vector{Vector{Int}}()

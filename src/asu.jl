@@ -1,12 +1,24 @@
 module ASU
 
-export calc_asu, ASUPoint, classify_points, ASUBlock, CrystallographicASU, pack_asu, find_optimal_shift
+export calc_asu, ASUPoint, classify_points, ASUBlock, CrystallographicASU, pack_asu, find_optimal_shift, InterleavedOrbit, analyze_interleaved_orbits, pack_asu_interleaved
 # Re-export SymOp related from SymmetryOps
 using ..SymmetryOps
 export SymOp, apply_op, get_ops
 
 using LinearAlgebra
 using Crystalline
+
+"""
+    InterleavedOrbit
+
+Represents an orbit of subgrids (ASUBlocks) under the symmetry group.
+"""
+struct InterleavedOrbit
+    representative::Vector{Int}       # The x_s (shift) stored in memory
+    members::Vector{Vector{Int}}      # All x_s in this orbit
+    ops::Vector{Vector{SymOp}}        # Operations mapping rep -> member (one list per member)
+    multiplicity::Int                 # Size of the orbit (unique members)
+end
 
 struct ASUPoint
     idx::Vector{Int}
@@ -18,14 +30,19 @@ struct ASUBlock{T, N, A<:AbstractArray{T, N}}
     data::A
     range::Vector{StepRange{Int, Int}}
     depth::Vector{Int}
+    orbit::Union{Nothing, InterleavedOrbit} # Added for Mode B
 end
+
+# Backward compatibility constructor
+ASUBlock(data::A, range::Vector{StepRange{Int, Int}}, depth::Vector{Int}) where {T, N, A<:AbstractArray{T, N}} = ASUBlock(data, range, depth, nothing)
+
 
 struct CrystallographicASU{D, T, A}
     dim_blocks::Dict{Int, Vector{ASUBlock{T, D, A}}}
     shift::NTuple{D, Float64}
 end
 
-include("pack_asu.jl")
+
 
 """
     calc_asu(sg_num, dim, N::Tuple) -> (points, shift)
@@ -155,5 +172,114 @@ function calc_asu(N::Tuple, ops::Vector{SymOp})
     end
     sort!(asu_points, by = p->p.idx)
 end
+
+
+
+
+"""
+    analyze_interleaved_orbits(N::Tuple, ops::Vector{SymOp}; L::Union{Nothing, Tuple}=nothing)
+
+Analyze the symmetry orbits of the subgrids defined by stride `L`.
+If `L` is not provided, defaults to `(2, 2, ...)` (Standard Cooley-Tukey Radix-2).
+Returns a list of `InterleavedOrbit`s, which become the `ASUBlock`s.
+"""
+function analyze_interleaved_orbits(N::Tuple, ops::Vector{SymOp}; L::Union{Nothing, Tuple}=nothing)
+    D = length(N)
+    if isnothing(L)
+        L = Tuple(fill(2, D))
+    end
+    
+    # Generate all coset shifts (coarse grid points)
+    # 0 : L-1
+    coarse_pts = vec(collect(Iterators.product([0:l-1 for l in L]...)))
+    visited = Set{Vector{Int}}()
+    orbits = Vector{InterleavedOrbit}()
+    
+    # Pre-calculate integer operations for speed?
+    # R is usually integer. t is fractional.
+    # We need t_grid = round(t * N).
+    
+    for p_tuple in coarse_pts
+        p = collect(p_tuple)
+        if p in visited
+            continue
+        end
+        
+        # Start new orbit
+        member_set = Set([p])
+        members = [p]
+        ops_map = Dict{Vector{Int}, Vector{SymOp}}()
+        ops_map[p] = [SymOp(Matrix{Int}(I, D, D), zeros(Int, D))] # Identity maps p to p
+        
+        # BFS to find all connected subgrids
+        queue = [p]
+        while !isempty(queue)
+            curr = popfirst!(queue)
+            
+            for op in ops
+                # Calculate transformed shift index
+                # x' = (R * x + t_grid) % L
+                # t_grid = op.t (already in grid units!)
+                # Be careful with floating point t.
+                
+                t_grid = op.t
+                x_prime = (op.R * curr .+ t_grid) .% L
+                
+                # Handle negative modulo in Julia
+                x_prime = mod.(x_prime, L)
+                
+                x_prime_vec = Vector(x_prime)
+                
+                if !(x_prime_vec in member_set)
+                    push!(member_set, x_prime_vec)
+                    push!(members, x_prime_vec)
+                    push!(queue, x_prime_vec)
+                    ops_map[x_prime_vec] = [op]
+                else
+                    # Add op to existing member if needed?
+                    # For simplicty, we just need ONE op to map rep -> member.
+                    # But keeping all might be useful for verification.
+                    if haskey(ops_map, x_prime_vec)
+                        push!(ops_map[x_prime_vec], op)
+                    else
+                        ops_map[x_prime_vec] = [op]
+                    end
+                end
+            end
+        end
+        
+        # Store orbit
+        # We need ops mapping Representative (p) -> Member (m)
+        # The BFS above mapped curr -> next. 
+        # Actually, for a group, applying all ops to 'p' generates the orbit directly.
+        # We don't need BFS if 'ops' is just generators, we need BFS.
+        # 'get_ops' usually returns the full group (including expanded translations for centered cells?).
+        # Let's assume 'ops' is the full set of operations relevant for the ASU.
+        
+        # Re-scan to build exact mapping p -> m
+        final_members = sort(collect(member_set))
+        final_ops = Vector{Vector{SymOp}}(undef, length(final_members))
+        
+        for (i, m) in enumerate(final_members)
+            # Find all ops g such that g(p) = m
+            matching_ops = SymOp[]
+            for op in ops
+                t_grid = op.t
+                x_prime = mod.((op.R * p .+ t_grid), L)
+                if x_prime == m
+                    push!(matching_ops, op)
+                end
+            end
+            final_ops[i] = matching_ops
+        end
+        
+        push!(orbits, InterleavedOrbit(p, final_members, final_ops, length(final_members)))
+        union!(visited, member_set)
+    end
+    
+    return orbits
+end
+
+include("pack_asu.jl")
 
 end
