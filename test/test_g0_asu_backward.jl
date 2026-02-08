@@ -1,7 +1,6 @@
-## Test G0 ASU Backward Transform (IKRFFT)
+## Test G0 ASU Backward Transform (P3c-level)
 #
-# Verifies the backward transform by checking forward-backward roundtrip:
-# u ≈ Backward(Forward(u)) for symmetrized random fields.
+# Verifies forward→backward roundtrip consistency.
 
 using Test
 using FFTW
@@ -15,12 +14,13 @@ using CrystallographicFFT.KRFFT: plan_krfft_g0asu, execute_g0asu_krfft!,
 
 # Helper: symmetrize a random field
 function make_symmetric(ops, N)
+    Random.seed!(42)
     u = rand(N...)
     s = zeros(N...)
     for op in ops
         for idx in CartesianIndices(u)
             x = collect(Tuple(idx)) .- 1
-            x2 = mod.(Int.(op.R) * x .+ round.(Int, op.t), collect(N)) .+ 1
+            x2 = mod.(round.(Int, op.R) * x .+ round.(Int, op.t), collect(N)) .+ 1
             s[idx] += u[x2...]
         end
     end
@@ -39,10 +39,8 @@ end
     ]
 
     @testset "Forward-backward roundtrip — $name N=$N" for
-            (sg, name) in test_cases,
-            N in [(16,16,16)]
+            (sg, name) in test_cases, N in [(16,16,16)]
 
-        Random.seed!(42)
         ops = get_ops(sg, 3, N)
         _, ops_s = find_optimal_shift(ops, N)
         spec = calc_spectral_asu(ops_s, 3, N)
@@ -66,12 +64,9 @@ end
         u_out = zeros(N...)
         execute_g0asu_ikrfft!(bplan, spec, copy(F_asu), u_out)
 
-        # Check: u' should match u on the full grid
-        max_err = maximum(abs.(u_out .- u))
-
-        @test max_err < 1e-10
+        max_err = maximum(abs.(u .- u_out))
         println("  $name N=$N: max roundtrip error = $(max_err)")
+        @test max_err < 1e-10
     end
-
 
 end
