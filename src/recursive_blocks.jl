@@ -75,20 +75,25 @@ function plan_krfft_recursive(spec_asu::SpectralIndexing, ops_shifted::Vector{Sy
     n_spec = length(spec_asu.points)
     n_a8 = 8
 
-    # Select representative operations for 8 A8 subgrids
-    subgrid_reps = Vector{SymOp}(undef, n_a8)
+    # Select representative operations for A8 subgrids (one per parity class)
+    subgrid_reps = Vector{Union{Nothing, SymOp}}(nothing, n_a8)
     for op in ops_shifted
         t = round.(Int, op.t)
         x0 = [mod(t[d], 2) for d in 1:dim]
         idx = 1 + x0[1] + 2*x0[2] + 4*x0[3]
-        subgrid_reps[idx] = op
+        if subgrid_reps[idx] === nothing
+            subgrid_reps[idx] = op
+        end
     end
+    active_a8 = [i for i in 1:8 if subgrid_reps[i] !== nothing]
 
     # Build A8 reconstruction table: 8 entries per spectral point
     a8_table = Matrix{P3cReconEntry}(undef, n_a8, n_spec)
     for (h_idx, _) in enumerate(spec_asu.points)
         h_vec = get_k_vector(spec_asu, h_idx)
-        for (g_idx, g) in enumerate(subgrid_reps)
+        slot = 0
+        for a8_idx in active_a8
+            g = subgrid_reps[a8_idx]::SymOp
             # A8 phase
             a8_phase = sum(h_vec[d] * g.t[d] / N[d] for d in 1:dim)
             a8_tw = cispi(-2 * a8_phase)
@@ -98,7 +103,12 @@ function plan_krfft_recursive(spec_asu::SpectralIndexing, ops_shifted::Vector{Sy
 
             # Linear index into G0 cache (1-based, column-major)
             lin = 1 + rot_h[1] + M[1] * rot_h[2] + M[1] * M[2] * rot_h[3]
-            a8_table[g_idx, h_idx] = P3cReconEntry(Int32(lin), a8_tw)
+            slot += 1
+            a8_table[slot, h_idx] = P3cReconEntry(Int32(lin), a8_tw)
+        end
+        # Pad remaining rows with zero weight
+        for s in (slot+1):8
+            a8_table[s, h_idx] = P3cReconEntry(Int32(1), complex(0.0))
         end
     end
 
@@ -521,14 +531,17 @@ function plan_krfft_sparse(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp
 
     n_spec = length(spec_asu.points)
 
-    # Select A8 representative operations (8 subgrids by translation parity)
-    subgrid_reps = Vector{SymOp}(undef, 8)
+    # Select A8 representative operations (one per parity class)
+    subgrid_reps = Vector{Union{Nothing, SymOp}}(nothing, 8)
     for op in ops_shifted
         t = round.(Int, op.t)
         x0 = [mod(t[d], 2) for d in 1:dim]
         idx = 1 + x0[1] + 2*x0[2] + 4*x0[3]
-        subgrid_reps[idx] = op
+        if subgrid_reps[idx] === nothing
+            subgrid_reps[idx] = op
+        end
     end
+    active_a8 = [i for i in 1:8 if subgrid_reps[i] !== nothing]
 
     # Build CSR sparse table
     all_entries = P3cReconEntry[]
@@ -543,7 +556,8 @@ function plan_krfft_sparse(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp
         row_ptrs[h_idx] = length(all_entries) + 1
         empty!(local_map)
 
-        for (g_idx, g) in enumerate(subgrid_reps)
+        for a8_idx in active_a8
+            g = subgrid_reps[a8_idx]::SymOp
             # A8 phase: exp(-2πi h·t_g/N)
             a8_phase = sum(h_vec[d] * g.t[d] / N[d] for d in 1:dim)
             a8_tw = cispi(-2 * a8_phase)
@@ -753,14 +767,17 @@ function plan_krfft_selective(spec_asu::SpectralIndexing, ops_shifted::Vector{Sy
 
     n_spec = length(spec_asu.points)
 
-    # Step 1: Select A8 representative operations (8 subgrids by translation parity)
-    subgrid_reps = Vector{SymOp}(undef, 8)
+    # Step 1: Select A8 representative operations (one per parity class)
+    subgrid_reps = Vector{Union{Nothing, SymOp}}(nothing, 8)
     for op in ops_shifted
         t = round.(Int, op.t)
         x0 = [mod(t[d], 2) for d in 1:dim]
         idx = 1 + x0[1] + 2*x0[2] + 4*x0[3]
-        subgrid_reps[idx] = op
+        if subgrid_reps[idx] === nothing
+            subgrid_reps[idx] = op
+        end
     end
+    active_a8 = [i for i in 1:8 if subgrid_reps[i] !== nothing]
 
     # Step 2: Collect unique G0 positions and build A8 table
     g0_pos_map = Dict{Int, Int}()  # M-grid linear index → compact index
@@ -768,7 +785,9 @@ function plan_krfft_selective(spec_asu::SpectralIndexing, ops_shifted::Vector{Sy
 
     for (h_idx, _) in enumerate(spec_asu.points)
         h_vec = get_k_vector(spec_asu, h_idx)
-        for (g_idx, g) in enumerate(subgrid_reps)
+        slot = 0
+        for a8_idx in active_a8
+            g = subgrid_reps[a8_idx]::SymOp
             # A8 phase
             a8_phase = sum(h_vec[d] * g.t[d] / N[d] for d in 1:dim)
             a8_tw = cispi(-2 * a8_phase)
@@ -782,7 +801,12 @@ function plan_krfft_selective(spec_asu::SpectralIndexing, ops_shifted::Vector{Sy
                 g0_pos_map[lin] = length(g0_pos_map) + 1
             end
             compact_idx = g0_pos_map[lin]
-            a8_table[(h_idx-1)*8 + g_idx] = SelectiveG0Entry(Int32(compact_idx), a8_tw)
+            slot += 1
+            a8_table[(h_idx-1)*8 + slot] = SelectiveG0Entry(Int32(compact_idx), a8_tw)
+        end
+        # Pad remaining A8 slots with zero weight
+        for s in (slot+1):8
+            a8_table[(h_idx-1)*8 + s] = SelectiveG0Entry(Int32(1), complex(0.0))
         end
     end
 
@@ -996,14 +1020,24 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
 
     n_spec = length(spec_asu.points)
 
-    # Step 1: Select A8 representative operations
-    subgrid_reps = Vector{SymOp}(undef, 8)
+    # Step 1: Select A8 representative operations (one per parity class)
+    subgrid_reps = Vector{Union{Nothing, SymOp}}(nothing, 8)
     for op in ops_shifted
         t = round.(Int, op.t)
         x0 = [mod(t[d], 2) for d in 1:dim]
         idx = 1 + x0[1] + 2*x0[2] + 4*x0[3]
-        subgrid_reps[idx] = op
+        if subgrid_reps[idx] === nothing
+            subgrid_reps[idx] = op
+        end
     end
+    # Determine active A8 classes
+    active_a8 = Int[]
+    for idx in 1:8
+        if subgrid_reps[idx] !== nothing
+            push!(active_a8, idx)
+        end
+    end
+    n_a8 = length(active_a8)
 
     # Step 2: Extract remaining point group (even-translation ops)
     rem_ops = SymOp[]
@@ -1016,20 +1050,27 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
     n_rem = length(rem_ops)
 
     # Step 3: Collect all accessed G0 positions + per-spectral-point A8 info
-    # g0_lin: linear index in M-grid (1-based)
     g0_pos_set = Set{Int}()
-    # Store (h_idx, g_idx) → (g0_linear, a8_twiddle) for later A8 table build
+    # Each spectral point has 8 A8 entries (padded with zero-weight for inactive classes)
     a8_raw = Vector{Tuple{Int, ComplexF64}}(undef, 8 * n_spec)
 
     for (h_idx, _) in enumerate(spec_asu.points)
         h_vec = get_k_vector(spec_asu, h_idx)
-        for (g_idx, g) in enumerate(subgrid_reps)
+        base = (h_idx - 1) * 8
+        slot = 0
+        for a8_idx in active_a8
+            g = subgrid_reps[a8_idx]::SymOp
             a8_phase = sum(h_vec[d] * g.t[d] / N[d] for d in 1:dim)
             a8_tw = cispi(-2 * a8_phase)
             rot_h = [mod(sum(Int(g.R[d2, d1]) * h_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
             lin = 1 + rot_h[1] + M[1] * rot_h[2] + M[1] * M[2] * rot_h[3]
             push!(g0_pos_set, lin)
-            a8_raw[(h_idx-1)*8 + g_idx] = (lin, a8_tw)
+            slot += 1
+            a8_raw[base + slot] = (lin, a8_tw)
+        end
+        # Pad remaining slots with zero weight (pointing to a safe index)
+        for s in (slot+1):8
+            a8_raw[base + s] = (1, complex(0.0))
         end
     end
 

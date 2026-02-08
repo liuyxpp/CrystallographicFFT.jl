@@ -18,11 +18,17 @@ using LinearAlgebra: mul!
 function make_symmetric_field(ops, N)
     u = rand(N...)
     u_sym = zeros(N...)
-    for op in ops
-        for idx in CartesianIndices(u)
-            x = collect(Tuple(idx)) .- 1
-            x2 = mod.(op.R * x .+ op.t, collect(N)) .+ 1
-            u_sym[idx] += u[x2...]
+    R_mats = [Int.(op.R) for op in ops]
+    t_vecs = [round.(Int, op.t) for op in ops]
+    Nv = collect(Int, N)
+    @inbounds for k in 1:N[3], j in 1:N[2], i in 1:N[1]
+        x1, x2, x3 = i-1, j-1, k-1
+        for g in eachindex(ops)
+            R = R_mats[g]; t = t_vecs[g]
+            y1 = mod(R[1,1]*x1 + R[1,2]*x2 + R[1,3]*x3 + t[1], Nv[1]) + 1
+            y2 = mod(R[2,1]*x1 + R[2,2]*x2 + R[2,3]*x3 + t[2], Nv[2]) + 1
+            y3 = mod(R[3,1]*x1 + R[3,2]*x2 + R[3,3]*x3 + t[3], Nv[3]) + 1
+            u_sym[i,j,k] += u[y1, y2, y3]
         end
     end
     u_sym ./= length(ops)
@@ -84,10 +90,13 @@ end
 
 function run_benchmarks()
     test_groups = [
-        (225, "Fm-3m"),   # |G|=192, highest symmetry
-        (229, "Im-3m"),   # |G|=96
-        (221, "Pm-3m"),   # |G|=48
-        (200, "Pm-3"),    # |G|=24
+        (225, "Fm-3m"),   # |G|=192, cubic
+        (227, "Fd-3m"),   # |G|=192, cubic (diamond)
+        (229, "Im-3m"),   # |G|=96, cubic
+        (221, "Pm-3m"),   # |G|=48, cubic
+        (200, "Pm-3"),    # |G|=24, cubic
+        (136, "P42/mnm"), # |G|=16, tetragonal
+        (70,  "Fddd"),    # |G|=16, orthorhombic
     ]
 
     for N_size in [64]
