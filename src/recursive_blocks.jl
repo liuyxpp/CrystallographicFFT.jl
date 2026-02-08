@@ -344,3 +344,244 @@ Reconstruct a single G_0(hx,hy,hz) value from P3c FFTs (debugging only).
 
     return val
 end
+
+# ============================================================================
+# Sparse Matrix Reconstruction — End-to-End P3c + A8
+# ============================================================================
+
+"""
+    SparseKRFFTPlan
+
+Plan for recursive KRFFT with end-to-end sparse matrix reconstruction.
+Precomputes the combined P3c + A8 mapping as a CSR sparse table that maps
+directly from 4 × M2³ FFT outputs to n_spec spectral ASU points, without
+materializing the intermediate M³ G0 cache.
+
+Cost is O(n_spec × nnz_per_row) instead of O(M³).
+"""
+struct SparseKRFFTPlan
+    sub_plan::Any                         # FFTW plan for (M/2)³
+    buffers::Vector{Array{ComplexF64,3}}  # 4 input: F000, F001, F110, F111
+    work_ffts::Vector{Array{ComplexF64,3}} # 4 FFT outputs
+    fft_concat::Vector{ComplexF64}        # concatenated FFT outputs [4 × M2³]
+    output_buffer::Vector{ComplexF64}     # spectral ASU output
+
+    # End-to-end sparse recon table (CSR format)
+    # entries[row_ptrs[h] .. row_ptrs[h+1]-1] = contributions for spectral point h
+    entries::Vector{P3cReconEntry}        # (linear_idx into fft_concat, weight)
+    row_ptrs::Vector{Int}                 # CSR row pointers, length n_spec+1
+
+    grid_N::Vector{Int}
+    subgrid_dims::Vector{Int}   # M = N/2
+    sub_sub_dims::Vector{Int}   # M2 = N/4
+end
+
+# P3c sub-sub-grid permutation table:
+# Maps (n1,n2,n3) → (buffer_offset, permutation of qt)
+# Buffer: 0=F000, 1=F001, 2=F110, 3=F111
+# Permutation applied to (qt_x, qt_y, qt_z) to get array position
+const _P3C_MAP = (
+    # (n1,n2,n3) => (buf_offset, perm_type)
+    # perm_type: 0=identity, 1=cyclic(z,x,y), 2=cyclic(y,z,x)
+    (0, 0),  # (0,0,0) → F000, identity
+    (1, 0),  # (0,0,1) → F001, identity
+    (1, 1),  # (0,1,0) → F001, (z,x,y)
+    (1, 2),  # (1,0,0) → F001, (y,z,x)
+    (2, 0),  # (1,1,0) → F110, identity
+    (2, 1),  # (1,0,1) → F110, (z,x,y)
+    (2, 2),  # (0,1,1) → F110, (y,z,x)
+    (3, 0),  # (1,1,1) → F111, identity
+)
+
+# Ordering: iterate n3,n2,n1 (inner to outer) → index = 1+n1+2*n2+4*n3
+# But we want the P3c order matching parity bits:
+# (0,0,0)=1, (1,0,0)=2, (0,1,0)=3, (1,1,0)=4, (0,0,1)=5, (1,0,1)=6, (0,1,1)=7, (1,1,1)=8
+const _P3C_ORDER = (
+    (0,0,0), (1,0,0), (0,1,0), (1,1,0),
+    (0,0,1), (1,0,1), (0,1,1), (1,1,1),
+)
+const _P3C_BUF = (0, 1, 1, 2, 1, 2, 2, 3)
+const _P3C_PERM = (0, 2, 1, 0, 0, 1, 2, 0)
+
+@inline function _p3c_linear_idx(buf_off::Int, perm::Int,
+                                  qt_x::Int, qt_y::Int, qt_z::Int,
+                                  M2::Vector{Int}, M2_vol::Int)
+    if perm == 0      # identity: (qt_x, qt_y, qt_z)
+        return Int32(buf_off * M2_vol + 1 + qt_x + M2[1]*qt_y + M2[1]*M2[2]*qt_z)
+    elseif perm == 1  # cyclic: (qt_z, qt_x, qt_y)
+        return Int32(buf_off * M2_vol + 1 + qt_z + M2[1]*qt_x + M2[1]*M2[2]*qt_y)
+    else              # cyclic: (qt_y, qt_z, qt_x)
+        return Int32(buf_off * M2_vol + 1 + qt_y + M2[1]*qt_z + M2[1]*M2[2]*qt_x)
+    end
+end
+
+"""
+    plan_krfft_sparse(spec_asu, ops_shifted)
+
+Create a sparse KRFFT plan with end-to-end P3c + A8 reconstruction.
+Precomputes a CSR sparse table mapping directly from FFT outputs to spectral ASU.
+"""
+function plan_krfft_sparse(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+    N = spec_asu.N
+    dim = length(N)
+    @assert dim == 3 "Sparse KRFFT currently supports 3D only"
+
+    M = [N[d] ÷ 2 for d in 1:dim]
+    M2 = [M[d] ÷ 2 for d in 1:dim]
+    M2_vol = prod(M2)
+
+    @assert all(M .* 2 .== collect(N)) "Grid size must be divisible by 2"
+    @assert all(M2 .* 2 .== M) "M must be divisible by 2 for P3c"
+
+    n_spec = length(spec_asu.points)
+
+    # Select A8 representative operations (8 subgrids by translation parity)
+    subgrid_reps = Vector{SymOp}(undef, 8)
+    for op in ops_shifted
+        t = round.(Int, op.t)
+        x0 = [mod(t[d], 2) for d in 1:dim]
+        idx = 1 + x0[1] + 2*x0[2] + 4*x0[3]
+        subgrid_reps[idx] = op
+    end
+
+    # Build CSR sparse table
+    all_entries = P3cReconEntry[]
+    row_ptrs = Vector{Int}(undef, n_spec + 1)
+    sizehint!(all_entries, n_spec * 40)  # estimate ~40 after merging
+
+    # Temp buffer for merging entries per row
+    local_map = Dict{Int32, ComplexF64}()
+
+    for (h_idx, _) in enumerate(spec_asu.points)
+        h_vec = get_k_vector(spec_asu, h_idx)
+        row_ptrs[h_idx] = length(all_entries) + 1
+        empty!(local_map)
+
+        for (g_idx, g) in enumerate(subgrid_reps)
+            # A8 phase: exp(-2πi h·t_g/N)
+            a8_phase = sum(h_vec[d] * g.t[d] / N[d] for d in 1:dim)
+            a8_tw = cispi(-2 * a8_phase)
+
+            # Rotated frequency: R_g^T h mod M
+            q1 = mod(sum(Int(g.R[d2, 1]) * h_vec[d2] for d2 in 1:dim), M[1])
+            q2 = mod(sum(Int(g.R[d2, 2]) * h_vec[d2] for d2 in 1:dim), M[2])
+            q3 = mod(sum(Int(g.R[d2, 3]) * h_vec[d2] for d2 in 1:dim), M[3])
+
+            qt_x = mod(q1, M2[1])
+            qt_y = mod(q2, M2[2])
+            qt_z = mod(q3, M2[3])
+
+            # 8 P3c sub-sub-grid contributions
+            for s in 1:8
+                n1, n2, n3 = _P3C_ORDER[s]
+
+                # P3c twiddle: exp(-2πi (q·n / M))
+                p3c_phase = q1*n1/M[1] + q2*n2/M[2] + q3*n3/M[3]
+                combined_w = a8_tw * cispi(-2 * p3c_phase)
+
+                # Buffer and permuted position
+                buf_off = _P3C_BUF[s]
+                perm = _P3C_PERM[s]
+                lin = _p3c_linear_idx(buf_off, perm, qt_x, qt_y, qt_z, M2, M2_vol)
+
+                # Merge into local map
+                existing = get(local_map, lin, zero(ComplexF64))
+                local_map[lin] = existing + combined_w
+            end
+        end
+
+        # Flush non-zero entries
+        for (lin, w) in local_map
+            if abs(w) > 1e-14
+                push!(all_entries, P3cReconEntry(lin, w))
+            end
+        end
+    end
+    row_ptrs[n_spec + 1] = length(all_entries) + 1
+
+    nnz = length(all_entries)
+    avg = nnz / max(n_spec, 1)
+    @info "Sparse KRFFT plan: n_spec=$n_spec, nnz=$nnz, avg=$(round(avg, digits=1))/row, input=$(4*M2_vol)"
+
+    # Allocate buffers
+    M2_tuple = Tuple(M2)
+    buffers = [zeros(ComplexF64, M2_tuple) for _ in 1:4]
+    work_ffts = [zeros(ComplexF64, M2_tuple) for _ in 1:4]
+    fft_concat = zeros(ComplexF64, 4 * M2_vol)
+    sub_plan = plan_fft(buffers[1])
+    output_buffer = zeros(ComplexF64, n_spec)
+
+    return SparseKRFFTPlan(
+        sub_plan, buffers, work_ffts, fft_concat, output_buffer,
+        all_entries, row_ptrs,
+        collect(N), M, M2
+    )
+end
+
+"""
+    execute_sparse_krfft!(plan, spec_asu, u)
+
+Full sparse KRFFT pipeline:
+1. Pack 4 sub-sub-grids at stride 4
+2. FFT × 4 on (N/4)³ grids
+3. Concatenate FFT outputs
+4. Sparse matrix multiply → spectral ASU
+"""
+function execute_sparse_krfft!(plan::SparseKRFFTPlan, spec_asu::SpectralIndexing,
+                               u::AbstractArray{<:Real})
+    M2 = plan.sub_sub_dims
+
+    # Pack P3c sub-sub-grids at stride 4
+    buf000, buf001 = plan.buffers[1], plan.buffers[2]
+    buf110, buf111 = plan.buffers[3], plan.buffers[4]
+    @inbounds for k in 1:M2[3], j in 1:M2[2], i in 1:M2[1]
+        ii = 4*(i-1); jj = 4*(j-1); kk = 4*(k-1)
+        buf000[i,j,k] = complex(u[ii+1, jj+1, kk+1])
+        buf001[i,j,k] = complex(u[ii+1, jj+1, kk+3])
+        buf110[i,j,k] = complex(u[ii+3, jj+3, kk+1])
+        buf111[i,j,k] = complex(u[ii+3, jj+3, kk+3])
+    end
+
+    # FFT × 4
+    p = plan.sub_plan
+    for i in 1:4
+        mul!(plan.work_ffts[i], p, plan.buffers[i])
+    end
+
+    # Concatenate FFT outputs into flat vector
+    M2_vol = prod(M2)
+    concat = plan.fft_concat
+    @inbounds for b in 1:4
+        src = plan.work_ffts[b]
+        offset = (b-1) * M2_vol
+        copyto!(concat, offset + 1, vec(src), 1, M2_vol)
+    end
+
+    # Sparse reconstruction: CSR SpMV
+    sparse_reconstruct!(plan)
+    return plan.output_buffer
+end
+
+"""
+    sparse_reconstruct!(plan)
+
+Sparse matrix-vector multiply: spectral ASU = T × fft_concat.
+Each row has variable number of entries (typically 20-50 after merging).
+"""
+function sparse_reconstruct!(plan::SparseKRFFTPlan)
+    out = plan.output_buffer
+    concat = plan.fft_concat
+    entries = plan.entries
+    ptrs = plan.row_ptrs
+    n_spec = length(out)
+
+    @inbounds for h in 1:n_spec
+        val = zero(ComplexF64)
+        for i in ptrs[h]:ptrs[h+1]-1
+            e = entries[i]
+            val += e.weight * concat[e.linear_idx]
+        end
+        out[h] = val
+    end
+    return out
+end

@@ -12,6 +12,9 @@ using ..SymmetryOps: SymOp
 export GeneralCFFTPlan, map_fft!, map_ifft!, build_recombination_map, plan_krfft
 export fast_reconstruct!, pack_stride!, execute_krfft!, ReconEntry, fft_reconstruct!
 export auto_L
+export plan_krfft_recursive, execute_recursive_krfft!, pack_p3c!, fft_p3c!
+export fill_g0_butterfly!, reconstruct_from_g0!
+export plan_krfft_sparse, execute_sparse_krfft!, sparse_reconstruct!
 
 """
     ActiveBlock
