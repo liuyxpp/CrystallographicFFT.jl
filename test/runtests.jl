@@ -17,4 +17,8 @@ using CrystallographicFFT
     @testset "Selective G0 Cascade" begin
         include("test_selective_g0.jl")
     end
+
+    @testset "G0 ASU Reconstruction" begin
+        include("test_g0_asu.jl")
+    end
 end
