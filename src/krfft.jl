@@ -891,5 +891,6 @@ function unflatten_from_buffer!(asu::CrystallographicASU, buffer::AbstractVector
 end
 
 include("recursive_blocks.jl")
+include("recursive_blocks_backward.jl")
 
 end

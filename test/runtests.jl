@@ -21,4 +21,8 @@ using CrystallographicFFT
     @testset "G0 ASU Reconstruction" begin
         include("test_g0_asu.jl")
     end
+
+    @testset "G0 ASU Backward Transform" begin
+        include("test_g0_asu_backward.jl")
+    end
 end

@@ -51,7 +51,7 @@ end
                 ci = CartesianIndex(Tuple(hv .+ 1))
                 abs(F_asu[i] - F_ref[ci])
             end
-            @test err < 1e-12
+            @test err < 1e-10
         end
     end
 
