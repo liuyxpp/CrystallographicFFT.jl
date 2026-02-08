@@ -278,13 +278,23 @@ function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
     # 2. Select one representative operation per subgrid
     #    Group ops by subgrid mapping: x₀ = t_g mod L
     #    F(h) = Σ_{x₀} exp(-2πi h·t_{g(x₀)}/N) · Y₀(R_{g(x₀)}^T h mod M)
-    #    Sum has exactly prod(L) terms, one per subgrid
-    subgrid_reps = Dict{Vector{Int}, SymOp}()  # x₀ → representative op
+    #    Prefer diagonal R with simple translations t_d ∈ {0,-1} so more groups
+    #    can benefit from the separable Pmmm fast path.
+    subgrid_reps = Dict{Vector{Int}, SymOp}()
+    subgrid_quality = Dict{Vector{Int}, Int}()  # higher = better
+    
     for op in ops_shifted
         t = round.(Int, op.t)
         x0 = [mod(t[d], L[d]) for d in 1:dim]
-        if !haskey(subgrid_reps, x0)
+        
+        # Score: 2 = diagonal R + simple t, 1 = diagonal R only, 0 = non-diagonal
+        is_diag = all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j)
+        simple_t = all(mod(t[d], N[d]) ∈ (0, N[d]-1) for d in 1:dim)
+        quality = is_diag ? (simple_t ? 2 : 1) : 0
+        
+        if !haskey(subgrid_reps, x0) || quality > subgrid_quality[x0]
             subgrid_reps[x0] = op
+            subgrid_quality[x0] = quality
         end
     end
     
@@ -451,7 +461,8 @@ function fast_reconstruct!(plan::GeneralCFFTPlan)
     M = plan.subgrid_dims
     dim = length(M)
     
-    if dim == 3 && plan.n_ops == 8 && length(plan.phase_factors) == 3
+    if dim == 3 && plan.n_ops == 8 && length(plan.phase_factors) == 3 &&
+       length(plan.output_buffer) == prod(plan.subgrid_dims)
         return _fast_reconstruct_pmmm!(plan)
     end
     
