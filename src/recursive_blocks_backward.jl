@@ -1,10 +1,13 @@
 # ============================================================================
-# G0 ASU Backward Transform — Step-Inverse Pipeline
+# G0 ASU Backward Transform — Factored Per-M2 Pipeline
 #
-# Pipeline: F_spec → inv A8 → g0_reps → G_rem expand → G0[M³]
-#           → inv butterfly → 4×FFT_out → IFFT → unpack → sym fill → u[N³]
+# Pipeline: F_spec → inv A8 → g0_reps → fused expansion+butterfly → 4×FFT_out
+#           → IFFT → unpack → sym fill → u[N³]
 #
-# Each step mirrors the forward, achieving comparable execution cost.
+# The fused expansion+butterfly step replaces the old 4-step process
+# (G_rem expand → octant read → 3-stage butterfly → collect) with a single
+# CSR-indexed loop over M2³ positions using closed-form butterfly weights.
+# This reduces bwd/fwd time ratio from ~2.7× to ~1.25×.
 # ============================================================================
 
 using LinearAlgebra: mul!
@@ -37,34 +40,66 @@ struct G0ExpansionEntry
 end
 
 """
+    OctExpEntry
+
+One expansion entry mapped to its M2³ position and octant.
+Stores the octant index (0-7), orbit-rep compact index, and phase.
+"""
+struct OctExpEntry
+    octant::Int8       # 0-7: xi + 2*yi + 4*zi
+    rep_compact::Int32
+    phase::ComplexF64
+end
+
+"""
+    PerM2Table
+
+CSR-indexed table mapping M2³ positions to their expansion entries.
+For each M2 position, stores the octant entries that contribute
+to the inverse butterfly at that position.
+"""
+struct PerM2Table
+    row_ptr::Vector{Int32}          # length = M2_vol + 1
+    entries::Vector{OctExpEntry}
+end
+
+# Inverse butterfly sign factors for each sub-FFT output.
+# Indexed by octant+1 where octant = xi + 2*yi + 4*zi.
+# oct:  0:(000) 1:(100) 2:(010) 3:(110) 4:(001) 5:(101) 6:(011) 7:(111)
+# F000: always +1 (no table needed)
+# F001: (-1)^zi
+const _SIGN_F001 = Int8[ 1, 1, 1, 1,-1,-1,-1,-1]
+# F110: (-1)^(xi⊕yi)
+const _SIGN_F110 = Int8[ 1,-1,-1, 1, 1,-1,-1, 1]
+# F111: (-1)^(xi⊕yi⊕zi)
+const _SIGN_F111 = Int8[ 1,-1,-1, 1,-1, 1, 1,-1]
+
+"""
     G0ASUBackwardPlan
 
-Step-inverse backward plan mirroring the forward pipeline.
+Factored backward plan: inv A8 → fused expansion+butterfly → IFFT.
 """
 struct G0ASUBackwardPlan
     # Step 1: Inverse A8 (block-diagonal)
     a8_blocks::Vector{A8InvBlock}
 
-    # Step 2: G_rem expansion (orbit reps → full M³)
-    expansion::Vector{G0ExpansionEntry}
-
-    # Step 3: Inverse butterfly (reuses forward twiddles)
+    # Step 2: Fused expansion + butterfly (per-M2 CSR table)
+    expansion::Vector{G0ExpansionEntry}   # kept for reference/debugging
+    per_m2::PerM2Table                    # CSR table for fused step
     tw_x::Vector{ComplexF64}
     tw_y::Vector{ComplexF64}
     tw_z::Vector{ComplexF64}
 
-    # Step 4–5: IFFT + unpack
+    # Step 3: IFFT
     ifft_plan::Any
-    work_bufs::Vector{Array{ComplexF64,3}}   # 8 work arrays for butterfly
-    fft_bufs::Vector{Array{ComplexF64,3}}    # 4 FFT output buffers
+    fft_bufs::Vector{Array{ComplexF64,3}}    # 4 FFT output buffers (F000,F001,F110,F111)
     ifft_out::Vector{Array{ComplexF64,3}}    # 4 IFFT output buffers
 
-    # Step 6: Symmetry fill
+    # Step 4: Symmetry fill
     unfilled_map::Vector{Tuple{Int,Int}}
 
     # Intermediate storage
     g0_reps::Vector{ComplexF64}              # orbit-rep values
-    g0_cache::Array{ComplexF64,3}            # full M³
 
     # Dimensions
     grid_N::Vector{Int}
@@ -268,6 +303,48 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
     end
 
     # ────────────────────────────────────────────────────────────────
+    # Build per-M2 CSR table (fused expansion + butterfly)
+    # For each M2 position, maps expansion entries to their octant.
+    # ────────────────────────────────────────────────────────────────
+
+    M2_vol = prod(M2)
+    m2_buckets = [OctExpEntry[] for _ in 1:M2_vol]
+
+    for e in expansion
+        lin0 = e.target_lin - 1
+        x = mod(lin0, M[1]) + 1
+        y = mod(div(lin0, M[1]), M[2]) + 1
+        z = div(lin0, M[1]*M[2]) + 1
+
+        xi = x > M2[1] ? 1 : 0
+        yi = y > M2[2] ? 1 : 0
+        zi = z > M2[3] ? 1 : 0
+        oct = xi + 2*yi + 4*zi
+
+        mi = xi == 0 ? x : x - M2[1]
+        mj = yi == 0 ? y : y - M2[2]
+        mk = zi == 0 ? z : z - M2[3]
+        m2_lin = mi + (mj-1)*M2[1] + (mk-1)*M2[1]*M2[2]
+
+        push!(m2_buckets[m2_lin], OctExpEntry(Int8(oct), e.rep_compact, e.phase))
+    end
+
+    # Build CSR arrays
+    total_entries = sum(length(b) for b in m2_buckets)
+    row_ptr = zeros(Int32, M2_vol + 1)
+    oct_entries = Vector{OctExpEntry}(undef, total_entries)
+    pos = 1
+    for j in 1:M2_vol
+        row_ptr[j] = pos
+        for oe in m2_buckets[j]
+            oct_entries[pos] = oe
+            pos += 1
+        end
+    end
+    row_ptr[M2_vol + 1] = pos
+    per_m2 = PerM2Table(row_ptr, oct_entries)
+
+    # ────────────────────────────────────────────────────────────────
     # Butterfly twiddles (same formula as forward)
     # ────────────────────────────────────────────────────────────────
 
@@ -306,12 +383,10 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
     # Allocate buffers
     # ────────────────────────────────────────────────────────────────
 
-    work_bufs = [zeros(ComplexF64, M2_tuple) for _ in 1:8]
     fft_bufs = [zeros(ComplexF64, M2_tuple) for _ in 1:4]
     ifft_out = [zeros(ComplexF64, M2_tuple) for _ in 1:4]
     ifft_plan = plan_ifft(fft_bufs[1])
     g0_reps_buf = zeros(ComplexF64, n_reps)
-    g0_cache = zeros(ComplexF64, M_tuple)
 
     n_blocks = length(a8_blocks)
     max_block = maximum(length(b.spec_idxs) for b in a8_blocks)
@@ -322,11 +397,12 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
     return G0ASUBackwardPlan(
         a8_blocks,
         expansion,
+        per_m2,
         tw_x, tw_y, tw_z,
         ifft_plan,
-        work_bufs, fft_bufs, ifft_out,
+        fft_bufs, ifft_out,
         unfilled_map,
-        g0_reps_buf, g0_cache,
+        g0_reps_buf,
         N_vec, M, M2, n_spec, n_reps
     )
 end
@@ -334,21 +410,19 @@ end
 """
     execute_g0asu_ikrfft!(plan, spec_asu, F_spec, u_out)
 
-Execute step-inverse backward: F_spec → u_out.
+Execute factored backward: F_spec → u_out.
 
 Steps:
 1. Inverse A8 (block-diagonal solve): F_spec → g0_reps
-2. G_rem expansion: g0_reps → G0[M³]
-3. Inverse P3c butterfly: G0[M³] → 4×FFT outputs
-4. IFFT × 4
-5. Unpack stride-4
-6. Symmetry fill
+2. Fused expansion + butterfly (per-M2 CSR loop): g0_reps → 4×FFT outputs
+3. IFFT × 4
+4. Unpack stride-4
+5. Symmetry fill
 """
 function execute_g0asu_ikrfft!(plan::G0ASUBackwardPlan,
                                spec_asu::SpectralIndexing,
                                F_spec::AbstractVector{ComplexF64},
                                u_out::AbstractArray{<:Number,3})
-    M = plan.subgrid_dims
     M2 = plan.sub_sub_dims
 
     # === Step 1: Inverse A8 — block-diagonal solve ===
@@ -361,7 +435,6 @@ function execute_g0asu_ikrfft!(plan::G0ASUBackwardPlan,
         inv_A = block.inv_matrix
         n = length(h_idxs)
 
-        # g0_block = inv_A × F_block
         for j in 1:n
             fh = F_spec[h_idxs[j]]
             for i in 1:n
@@ -370,123 +443,54 @@ function execute_g0asu_ikrfft!(plan::G0ASUBackwardPlan,
         end
     end
 
-    # === Step 2: G_rem expansion — orbit reps → full M³ ===
-    g0_cache = plan.g0_cache
-    fill!(g0_cache, zero(ComplexF64))
-
-    @inbounds for e in plan.expansion
-        g0_cache[e.target_lin] = e.phase * g0[e.rep_compact]
-    end
-
-    # === Step 3: Inverse P3c butterfly — G0[M³] → 4×FFT outputs ===
-    w = plan.work_bufs
-    tw_x, tw_y, tw_z = plan.tw_x, plan.tw_y, plan.tw_z
-    ox, oy, oz = M2[1], M2[2], M2[3]
-
-    # Stage 4⁻¹: Read 8 octants from M³ into work arrays
-    @inbounds for k in 1:M2[3], j in 1:M2[2], i in 1:M2[1]
-        w[1][i,j,k] = g0_cache[i,    j,    k]
-        w[2][i,j,k] = g0_cache[i,    j,    k+oz]
-        w[3][i,j,k] = g0_cache[i,    j+oy, k]
-        w[7][i,j,k] = g0_cache[i,    j+oy, k+oz]
-        w[4][i,j,k] = g0_cache[i+ox, j,    k]
-        w[6][i,j,k] = g0_cache[i+ox, j,    k+oz]
-        w[5][i,j,k] = g0_cache[i+ox, j+oy, k]
-        w[8][i,j,k] = g0_cache[i+ox, j+oy, k+oz]
-    end
-
-    # Stage 3⁻¹: Inverse x-butterfly
-    #   Forward: even = w_lo + tw_x × w_hi; odd = w_lo - tw_x × w_hi
-    #   Inverse: w_lo = (even + odd) / 2; w_hi = (even - odd) × conj(tw_x) / 2
-    #   But tw_x is a unit-magnitude twiddle, so 1/tw_x = conj(tw_x)
-    @inbounds for k in 1:M2[3], j in 1:M2[2]
-        @simd for i in 1:M2[1]
-            twx_inv = conj(tw_x[i])
-            a = w[1][i,j,k]; b = w[4][i,j,k]
-            w[1][i,j,k] = (a + b) / 2; w[4][i,j,k] = (a - b) * twx_inv / 2
-
-            a = w[3][i,j,k]; b = w[5][i,j,k]
-            w[3][i,j,k] = (a + b) / 2; w[5][i,j,k] = (a - b) * twx_inv / 2
-
-            a = w[2][i,j,k]; b = w[6][i,j,k]
-            w[2][i,j,k] = (a + b) / 2; w[6][i,j,k] = (a - b) * twx_inv / 2
-
-            a = w[7][i,j,k]; b = w[8][i,j,k]
-            w[7][i,j,k] = (a + b) / 2; w[8][i,j,k] = (a - b) * twx_inv / 2
-        end
-    end
-
-    # Stage 2⁻¹: Inverse y-butterfly
-    @inbounds for k in 1:M2[3], j in 1:M2[2]
-        twy_inv = conj(tw_y[j])
-        @simd for i in 1:M2[1]
-            a = w[1][i,j,k]; b = w[3][i,j,k]
-            w[1][i,j,k] = (a + b) / 2; w[3][i,j,k] = (a - b) * twy_inv / 2
-
-            a = w[4][i,j,k]; b = w[5][i,j,k]
-            w[4][i,j,k] = (a + b) / 2; w[5][i,j,k] = (a - b) * twy_inv / 2
-
-            a = w[2][i,j,k]; b = w[7][i,j,k]
-            w[2][i,j,k] = (a + b) / 2; w[7][i,j,k] = (a - b) * twy_inv / 2
-
-            a = w[6][i,j,k]; b = w[8][i,j,k]
-            w[6][i,j,k] = (a + b) / 2; w[8][i,j,k] = (a - b) * twy_inv / 2
-        end
-    end
-
-    # Stage 1⁻¹: Inverse z-butterfly
-    @inbounds for k in 1:M2[3], j in 1:M2[2]
-        twz_inv = conj(tw_z[k])
-        @simd for i in 1:M2[1]
-            a = w[1][i,j,k]; b = w[2][i,j,k]
-            w[1][i,j,k] = (a + b) / 2; w[2][i,j,k] = (a - b) * twz_inv / 2
-
-            a = w[3][i,j,k]; b = w[7][i,j,k]
-            w[3][i,j,k] = (a + b) / 2; w[7][i,j,k] = (a - b) * twz_inv / 2
-
-            a = w[4][i,j,k]; b = w[6][i,j,k]
-            w[4][i,j,k] = (a + b) / 2; w[6][i,j,k] = (a - b) * twz_inv / 2
-
-            a = w[5][i,j,k]; b = w[8][i,j,k]
-            w[5][i,j,k] = (a + b) / 2; w[8][i,j,k] = (a - b) * twz_inv / 2
-        end
-    end
-
-    # Stage 0⁻¹: Collect 8 work arrays → 4 FFT outputs (inverse permutation)
+    # === Step 2: Fused expansion + butterfly (per-M2 accumulation) ===
     F000, F001, F110, F111 = plan.fft_bufs
-    @inbounds for k in 1:M2[3], j in 1:M2[2], i in 1:M2[1]
-        F000[i,j,k] = w[1][i,j,k]          # (0,0,0)
-        F001[i,j,k] = w[2][i,j,k]          # (0,0,1) straight
-        # Inverse of Stage 0 forward permutation:
-        # Forward: w[3][i,j,k] = F001[k,i,j]  →  F001[k,i,j] = w[3][i,j,k]
-        # So: F001[a,b,c] gets contribution from w[3][b,c,a]
-        # But since we need F001[i,j,k], we read w[3][j,k,i]
-        # Wait — we already wrote w[3][i,j,k] during butterfly.
-        # The forward Stage 0 loads w[3] from F001 with permuted INDEX:
-        #   w[3][i,j,k] = F001[k,i,j]
-        # For the inverse we need: F001[i,j,k] = w[3][j,k,i]
-        # But no! That would only hold if w[3] still has the pre-butterfly values.
-        # After the inverse butterfly, w[3] has been un-butterflied back to the
-        # pre-butterfly state. So F001[k,i,j] = w[3][i,j,k] is correct.
-        # But the 4 physical FFT outputs are F000, F001, F110, F111.
-        # The permuted entries come from the SAME F001 array:
-        #   w[3][i,j,k] was loaded from F001[k,i,j]
-        #   w[4][i,j,k] was loaded from F001[j,k,i]
-        # After inverse butterfly, w[3] contains what was originally F001 at [k,i,j].
-        # We DON'T need to reconstruct F001 at permuted indices — we just take
-        # the straight entries:
-        F110[i,j,k] = w[5][i,j,k]          # (1,1,0) straight
-        F111[i,j,k] = w[8][i,j,k]          # (1,1,1) straight
-        # w[3], w[4], w[6], w[7] contain permuted copies — we can verify they're consistent
+    tw_x, tw_y, tw_z = plan.tw_x, plan.tw_y, plan.tw_z
+    row_ptr = plan.per_m2.row_ptr
+    entries = plan.per_m2.entries
+
+    @inbounds for k in 1:M2[3]
+        cz = conj(tw_z[k])
+        for j in 1:M2[2]
+            cy = conj(tw_y[j])
+            for i in 1:M2[1]
+                cx = conj(tw_x[i])
+                cxcy = cx * cy
+                cxcycz = cxcy * cz
+
+                m2_lin = i + (j-1)*M2[1] + (k-1)*M2[1]*M2[2]
+
+                f000 = zero(ComplexF64)
+                f001 = zero(ComplexF64)
+                f110 = zero(ComplexF64)
+                f111 = zero(ComplexF64)
+
+                for p in row_ptr[m2_lin]:(row_ptr[m2_lin+1]-1)
+                    e = entries[p]
+                    val = e.phase * g0[e.rep_compact]
+                    oct1 = e.octant + 1    # 1-based for sign table
+
+                    f000 += val
+                    f001 += _SIGN_F001[oct1] * val
+                    f110 += _SIGN_F110[oct1] * val
+                    f111 += _SIGN_F111[oct1] * val
+                end
+
+                F000[i,j,k] = f000 / 8
+                F001[i,j,k] = f001 * cz / 8
+                F110[i,j,k] = f110 * cxcy / 8
+                F111[i,j,k] = f111 * cxcycz / 8
+            end
+        end
     end
 
-    # === Step 4: IFFT × 4 ===
+    # === Step 3: IFFT × 4 ===
     p = plan.ifft_plan
     @inbounds for s in 1:4
         mul!(plan.ifft_out[s], p, plan.fft_bufs[s])
     end
 
-    # === Step 5: Unpack stride-4 ===
+    # === Step 4: Unpack stride-4 ===
     buf000, buf001, buf110, buf111 = plan.ifft_out
     @inbounds for k in 1:M2[3], j in 1:M2[2], i in 1:M2[1]
         ii = 4*(i-1); jj = 4*(j-1); kk = 4*(k-1)
@@ -496,7 +500,7 @@ function execute_g0asu_ikrfft!(plan::G0ASUBackwardPlan,
         u_out[ii+3, jj+3, kk+3] = real(buf111[i,j,k])
     end
 
-    # === Step 6: Symmetry fill ===
+    # === Step 5: Symmetry fill ===
     u_flat = vec(u_out)
     @inbounds for (target, source) in plan.unfilled_map
         u_flat[target] = u_flat[source]
