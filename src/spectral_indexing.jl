@@ -16,57 +16,162 @@ end
 """
     calc_spectral_asu(ops::Vector{SymOp}, dim::Int, N::Tuple) -> SpectralIndexing
 
-Calculate the spectral ASU for a given set of direct space operations.
-Used when custom operations (e.g. shifted) are provided.
+Calculate the spectral ASU using direct orbit enumeration.
+Bypasses recursive calc_asu for O(N³ × |G|) performance.
 """
 function calc_spectral_asu(direct_ops::Vector{SymOp}, dim::Int, N::Tuple)
-    # 2. Compute dual operations for reciprocal space
-    # R* = (R^-1)^T, t* = 0 (BUT we need original t for filtering!)
+    D = length(N)
+    N_vec = collect(N)
+    n_total = prod(N)
+    
+    # Reciprocal-space point group: R* = (R⁻¹)ᵀ, t=0
     recip_ops = dual_ops(direct_ops)
+    n_ops = length(recip_ops)
     
-    # 3. Calculate ASU on the reciprocal grid
-    raw_points = calc_asu(N, recip_ops)
+    # Visited mask: linear index → already assigned to an orbit
+    visited = falses(n_total)
     
-    # 4. Filter forbidden modes (Extinctions)
-    # Condition: Sum_{g in Stab(k)} exp(-i k . t_g) != 0
+    # Pre-allocate buffers
+    k = zeros(Int, D)
+    k_rot = zeros(Int, D)
+    
     valid_points = Vector{ASUPoint}()
     
-    for p in raw_points
-        k_idx = p.idx
+    # Pre-extract rotation matrices for fast access
+    R_mats = [op.R for op in recip_ops]
+    
+    # Iterate all k-points in lexicographic order
+    for lin_idx in 1:n_total
+        visited[lin_idx] && continue
         
-        # Identify Stabilizer
-        stab_sum = 0.0 + 0.0im
-        stab_count = 0
+        # Convert linear index to k-vector (0-based, column-major)
+        rem = lin_idx - 1
+        @inbounds for d in 1:D
+            k[d] = rem % N[d]
+            rem = rem ÷ N[d]
+        end
         
-        for (i, op) in enumerate(recip_ops)
-            # Check if op stabilizes k_idx (modulo N)
-            k_new = op.R * k_idx
-            
-            # Check equality mod N
-            diff = (k_new .- k_idx) .% collect(N)
-            if all(d -> d == 0, diff)
-                # In Stabilizer
-                stab_count += 1
-                
-                # Add phase exp(-i k . t_direct)
-                t_direct = direct_ops[i].t
-                
-                phase = 0.0
-                for d in 1:length(N)
-                    phase += k_idx[d] * t_direct[d] / N[d]
+        # Compute orbit
+        orbit_size = 0
+        min_lin = lin_idx  # Track canonical rep (smallest linear index)
+        
+        # Use the point itself
+        visited[lin_idx] = true
+        orbit_size += 1
+        
+        # Apply all ops to find orbit members
+        for g in 1:n_ops
+            R = R_mats[g]
+            # R * k mod N → linear index
+            @inbounds begin
+                li = 0
+                stride = 1
+                for d in 1:D
+                    s = 0
+                    for j in 1:D
+                        s += R[d, j] * k[j]
+                    end
+                    k_rot[d] = mod(s, N[d])
+                    li += k_rot[d] * stride
+                    stride *= N[d]
                 end
-                
-                stab_sum += exp(-im * 2π * phase)
+            end
+            li += 1  # 1-based
+            
+            if !visited[li]
+                visited[li] = true
+                orbit_size += 1
+                if li < min_lin
+                    min_lin = li
+                end
             end
         end
         
-        # If sum is non-zero, keep point.
-        # Use tolerance
+        # Also apply orbit closure (iterate existing orbit members through ops)
+        # For crystallographic point groups, single pass is usually sufficient
+        # but we need to be safe for higher-order groups.
+        # Use worklist approach:
+        worklist = [lin_idx]
+        wi = 1
+        while wi <= length(worklist)
+            curr_lin = worklist[wi]
+            wi += 1
+            
+            # Convert back to k-vector
+            rem_c = curr_lin - 1
+            @inbounds for d in 1:D
+                k_rot[d] = rem_c % N[d]
+                rem_c = rem_c ÷ N[d]
+            end
+            
+            for g in 1:n_ops
+                R = R_mats[g]
+                @inbounds begin
+                    li = 0
+                    stride = 1
+                    for d in 1:D
+                        s = 0
+                        for j in 1:D
+                            s += R[d, j] * k_rot[j]
+                        end
+                        val = mod(s, N[d])
+                        li += val * stride
+                        stride *= N[d]
+                    end
+                end
+                li += 1
+                
+                if !visited[li]
+                    visited[li] = true
+                    orbit_size += 1
+                    push!(worklist, li)
+                    if li < min_lin
+                        min_lin = li
+                    end
+                end
+            end
+        end
+        
+        # Convert min_lin to k-vector for the representative
+        rem_r = min_lin - 1
+        k_rep = zeros(Int, D)
+        @inbounds for d in 1:D
+            k_rep[d] = rem_r % N[d]
+            rem_r = rem_r ÷ N[d]
+        end
+        
+        # Extinction filter: Sum_{g in Stab(k)} exp(-2πi k·t_g/N) ≠ 0
+        stab_sum = zero(ComplexF64)
+        for (i, op) in enumerate(recip_ops)
+            R = op.R
+            is_stab = true
+            @inbounds for d in 1:D
+                s = 0
+                for j in 1:D
+                    s += R[d, j] * k_rep[j]
+                end
+                if (s - k_rep[d]) % N_vec[d] != 0
+                    is_stab = false
+                    break
+                end
+            end
+            if is_stab
+                t_direct = direct_ops[i].t
+                phase = 0.0
+                @inbounds for d in 1:D
+                    phase += k_rep[d] * t_direct[d] / N[d]
+                end
+                stab_sum += cispi(-2 * phase)
+            end
+        end
+        
         if abs(stab_sum) > 1e-5
-            push!(valid_points, p)
+            depth = zeros(Int, D)  # Not needed for spectral ASU
+            push!(valid_points, ASUPoint(k_rep, depth, orbit_size))
         end
     end
     
+    sort!(valid_points, by=p -> p.idx)
     return SpectralIndexing(valid_points, recip_ops, N)
 end
 

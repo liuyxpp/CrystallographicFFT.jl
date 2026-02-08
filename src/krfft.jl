@@ -2,6 +2,7 @@ module KRFFT
 
 using KernelAbstractions
 using AbstractFFTs
+using FFTW
 using LinearAlgebra
 using SparseArrays
 using ..ASU: CrystallographicASU, ASUBlock
@@ -883,5 +884,7 @@ function flatten_to_buffer!(buffer::AbstractVector, asu::CrystallographicASU)
 end
 function unflatten_from_buffer!(asu::CrystallographicASU, buffer::AbstractVector)
 end
+
+include("recursive_blocks.jl")
 
 end

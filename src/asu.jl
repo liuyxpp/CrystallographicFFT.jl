@@ -56,35 +56,146 @@ end
 
 function find_optimal_shift(ops::Vector{SymOp}, N::Tuple)
     D = length(N)
-    candidates = [
+    
+    # The optimal shift fraction (e.g. 0.5, 1/3) depends only on space group
+    # symmetry, not on N. Find it at small proxy N, then apply to target N.
+    # Proxy N must be divisible by shift denominators (2,3,4,5).
+    # Use 60 = LCM(2,3,4,5) to cover all candidates.
+    N_proxy = ntuple(_ -> 60, D)  # 60³=216K points — fast for orbit enum
+    ops_proxy = _rescale_ops(ops, N, N_proxy)
+    
+    frac_candidates = [
         zeros(Float64, D),
-        fill(0.5, D) ./ collect(N),
-        fill(1.0/3.0, D) ./ collect(N),
-        fill(0.25, D) ./ collect(N),
-        fill(0.2, D) ./ collect(N)
+        fill(0.5, D),
+        fill(1.0/3.0, D),
+        fill(0.25, D),
+        fill(0.2, D),
     ]
-
-    best_shift, best_ops = zeros(Float64, D), ops
+    
+    best_frac = frac_candidates[1]
     min_sp_count = typemax(Int)
-
-    for cand in candidates
-        valid, deltas = check_shift_invariance(ops, cand, N)
+    
+    for frac in frac_candidates
+        shift = frac ./ collect(N_proxy)
+        valid, deltas = check_shift_invariance(ops_proxy, shift, N_proxy)
         !valid && continue
-
-        curr_ops = [SymOp(op.R, op.t .+ deltas[i]) for (i, op) in enumerate(ops)]
-        points = calc_asu(N, curr_ops)
-
-        max_mult = maximum(p -> p.multiplicity, points)
-        sp_count = count(p -> p.multiplicity < max_mult, points)
-
+        
+        curr_ops_proxy = [SymOp(op.R, op.t .+ deltas[i]) for (i, op) in enumerate(ops_proxy)]
+        sp_count = _count_special_positions_fast(N_proxy, curr_ops_proxy)
+        
         if sp_count < min_sp_count
             min_sp_count = sp_count
-            best_shift = cand
-            best_ops = curr_ops
+            best_frac = frac
         end
         min_sp_count == 0 && break
     end
-    return best_shift, best_ops
+    
+    # Apply best_frac to the actual N
+    shift = best_frac ./ collect(N)
+    valid, deltas = check_shift_invariance(ops, shift, N)
+    if valid
+        best_ops = [SymOp(op.R, op.t .+ deltas[i]) for (i, op) in enumerate(ops)]
+        return shift, best_ops
+    else
+        return zeros(Float64, D), ops
+    end
+end
+
+"""
+    _rescale_ops(ops, N_from, N_to) -> Vector{SymOp}
+
+Rescale translation vectors from grid N_from to grid N_to.
+R stays the same, t_new = t * (N_to / N_from).
+"""
+function _rescale_ops(ops::Vector{SymOp}, N_from::Tuple, N_to::Tuple)
+    D = length(N_from)
+    result = Vector{SymOp}(undef, length(ops))
+    for (i, op) in enumerate(ops)
+        t_new = [round(Int, op.t[d] * N_to[d] ÷ N_from[d]) for d in 1:D]
+        result[i] = SymOp(op.R, t_new)
+    end
+    return result
+end
+
+"""
+    _count_special_positions_fast(N, ops) -> Int
+
+Count the number of ASU points with orbit multiplicity < |G|.
+Uses direct orbit enumeration with BitArray visited mask.
+O(N³ × |G|) with no recursion.
+"""
+function _count_special_positions_fast(N::Tuple, ops::Vector{SymOp})
+    D = length(N)
+    n_total = prod(N)
+    n_ops = length(ops)
+    max_orbit = n_ops  # Maximum orbit size = |G|
+    
+    visited = falses(n_total)
+    sp_count = 0
+    n_asu = 0
+    
+    x = zeros(Int, D)
+    x_rot = zeros(Int, D)
+    R_mats = [op.R for op in ops]
+    t_vecs = [op.t for op in ops]
+    
+    for lin_idx in 1:n_total
+        visited[lin_idx] && continue
+        
+        # Convert linear index to coordinate
+        rem = lin_idx - 1
+        @inbounds for d in 1:D
+            x[d] = rem % N[d]
+            rem = rem ÷ N[d]
+        end
+        
+        # Compute orbit via worklist
+        worklist = [lin_idx]
+        visited[lin_idx] = true
+        wi = 1
+        
+        while wi <= length(worklist)
+            curr_lin = worklist[wi]
+            wi += 1
+            
+            rem_c = curr_lin - 1
+            @inbounds for d in 1:D
+                x_rot[d] = rem_c % N[d]
+                rem_c = rem_c ÷ N[d]
+            end
+            
+            for g in 1:n_ops
+                R = R_mats[g]
+                t = t_vecs[g]
+                @inbounds begin
+                    li = 0
+                    stride = 1
+                    for d in 1:D
+                        s = t[d]
+                        for j in 1:D
+                            s += R[d, j] * x_rot[j]
+                        end
+                        li += mod(s, N[d]) * stride
+                        stride *= N[d]
+                    end
+                end
+                li += 1
+                
+                if !visited[li]
+                    visited[li] = true
+                    push!(worklist, li)
+                end
+            end
+        end
+        
+        orbit_size = length(worklist)
+        n_asu += 1
+        if orbit_size < max_orbit
+            sp_count += 1
+        end
+    end
+    
+    return sp_count
 end
 
 function calc_asu(N::Tuple, ops::Vector{SymOp})
@@ -94,6 +205,11 @@ function calc_asu(N::Tuple, ops::Vector{SymOp})
     # Queue: (N, ops, scale, offset, depth, is_gp)
     queue = Any[(N, ops, ones(Int, D), zeros(Int, D), zeros(Int, D), falses(D))]
 
+    # Pre-allocate reusable buffers for apply_op!
+    tmp_out = zeros(Int, D)
+    p_even = zeros(Int, D)
+    p_odd = zeros(Int, D)
+
     while !isempty(queue)
         (curr_N, curr_ops, curr_scale, curr_offset, curr_depth, curr_gp) = pop!(queue)
 
@@ -102,26 +218,29 @@ function calc_asu(N::Tuple, ops::Vector{SymOp})
         if all(curr_gp) || all(x->x<=1, curr_N)
             # Leaf: Generate points & orbits
             local_pts = vec(collect(Iterators.product([0:n-1 for n in curr_N]...)))
-            visited = Set{Vector{Int}}()
+            visited = Set{NTuple{D, Int}}()
 
             for p_tuple in local_pts
+                p_tuple in visited && continue
                 p = collect(p_tuple)
-                p in visited && continue
 
-                orbit = Set([p])
+                orbit_tuples = Set{NTuple{D, Int}}([p_tuple])
                 stack = [p]
                 while !isempty(stack)
                     curr_p = pop!(stack)
                     for op in curr_ops
-                        next_p = apply_op(op, curr_p, curr_N)
-                        if !(next_p in orbit)
-                            push!(orbit, next_p); push!(stack, next_p)
+                        apply_op!(tmp_out, op, curr_p, curr_N)
+                        next_tuple = NTuple{D, Int}(tmp_out)
+                        if !(next_tuple in orbit_tuples)
+                            push!(orbit_tuples, next_tuple)
+                            push!(stack, copy(tmp_out))
                         end
                     end
                 end
 
-                push!(asu_points, ASUPoint(curr_scale .* sort(collect(orbit))[1] .+ curr_offset, curr_depth, length(orbit)))
-                union!(visited, orbit)
+                rep = collect(minimum(orbit_tuples))
+                push!(asu_points, ASUPoint(curr_scale .* rep .+ curr_offset, curr_depth, length(orbit_tuples)))
+                union!(visited, orbit_tuples)
             end
             continue
         end
@@ -130,10 +249,21 @@ function calc_asu(N::Tuple, ops::Vector{SymOp})
         active_dims = findall(.!curr_gp)
         effective_gp = copy(curr_gp)
 
-        # Check even/odd preservation
+        # Check even/odd preservation — use apply_op! to avoid allocation
         for d in active_dims
-            p_even, p_odd = zeros(Int, D), zeros(Int, D); p_odd[d] = 1
-            if any(op -> apply_op(op, p_even, curr_N)[d]%2 != 0 || apply_op(op, p_odd, curr_N)[d]%2 != 1, curr_ops)
+            p_even .= 0; p_odd .= 0; p_odd[d] = 1
+            parity_ok = true
+            for op in curr_ops
+                apply_op!(tmp_out, op, p_even, curr_N)
+                if tmp_out[d] % 2 != 0
+                    parity_ok = false; break
+                end
+                apply_op!(tmp_out, op, p_odd, curr_N)
+                if tmp_out[d] % 2 != 1
+                    parity_ok = false; break
+                end
+            end
+            if !parity_ok
                 effective_gp[d] = true
             end
         end
@@ -152,12 +282,18 @@ function calc_asu(N::Tuple, ops::Vector{SymOp})
             for op in curr_ops
                 # R_new = S\R*S, t_new = S\(R*p + t - p)
                 R_val = op.R .* transpose(S_diag)
-                t_val = op.R * parity .+ op.t .- parity
+                # In-place multiply for R*parity
+                for i in 1:D
+                    tmp_out[i] = op.t[i] - parity[i]
+                    for j in 1:D
+                        tmp_out[i] += op.R[i, j] * parity[j]
+                    end
+                end
 
-                if any(R_val .% S_diag .!= 0) || any(t_val .% S_diag .!= 0)
+                if any(R_val .% S_diag .!= 0) || any(tmp_out .% S_diag .!= 0)
                     valid_sector = false; break
                 end
-                push!(new_ops, SymOp(R_val .÷ S_diag, t_val .÷ S_diag))
+                push!(new_ops, SymOp(R_val .÷ S_diag, tmp_out .÷ S_diag))
             end
 
             !valid_sector && continue

@@ -3,7 +3,7 @@ module SymmetryOps
 using LinearAlgebra
 using Crystalline
 
-export SymOp, apply_op, get_ops, convert_op, check_shift_invariance, dual_ops
+export SymOp, apply_op, apply_op!, get_ops, convert_op, check_shift_invariance, dual_ops
 
 struct SymOp
     R::Matrix{Int}
@@ -23,8 +23,30 @@ function get_ops(sg_num::Int, dim::Int, N::Tuple)
     [convert_op(op, N) for op in operations(spacegroup(sg_num, dim))]
 end
 
+"""
+    apply_op!(out, op, x, N)
+
+In-place version: write result of applying `op` to `x` into `out`.
+Avoids all allocations.
+"""
+function apply_op!(out::Vector{Int}, op::SymOp, x::Vector{Int}, N::Tuple)
+    D = length(N)
+    R = op.R
+    t = op.t
+    @inbounds for i in 1:D
+        s = t[i]
+        for j in 1:D
+            s += R[i, j] * x[j]
+        end
+        out[i] = mod(s, N[i])
+    end
+    return out
+end
+
 function apply_op(op::SymOp, x::Vector{Int}, N::Tuple)
-    map((val, mod) -> mod1(val + 1, mod) - 1, op.R * x .+ op.t, N)
+    out = similar(x)
+    apply_op!(out, op, x, N)
+    return out
 end
 
 function check_shift_invariance(ops::Vector{SymOp}, shift::Vector{Float64}, N::Tuple)
