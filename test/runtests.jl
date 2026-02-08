@@ -13,4 +13,8 @@ using CrystallographicFFT
     @testset "CFFT Planning" begin
         include("test_cfft.jl")
     end
+
+    @testset "Selective G0 Cascade" begin
+        include("test_selective_g0.jl")
+    end
 end
