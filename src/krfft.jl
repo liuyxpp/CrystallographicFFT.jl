@@ -7,7 +7,7 @@ using LinearAlgebra
 using SparseArrays
 using ..ASU: CrystallographicASU, ASUBlock
 using ..SpectralIndexing: SpectralIndexing, get_k_vector
-using ..SymmetryOps: SymOp
+using ..SymmetryOps: SymOp, apply_op!
 
 export GeneralCFFTPlan, map_fft!, map_ifft!, build_recombination_map, plan_krfft
 export fast_reconstruct!, pack_stride!, execute_krfft!, ReconEntry, fft_reconstruct!
@@ -18,6 +18,9 @@ export plan_krfft_sparse, execute_sparse_krfft!, sparse_reconstruct!, detect_cen
 export plan_krfft_selective, execute_selective_krfft!
 export plan_krfft_g0asu, execute_g0asu_krfft!
 export plan_krfft_g0asu_backward, execute_g0asu_ikrfft!
+export FractalNode, FractalCFFTPlan, calc_asu_tree, build_recursive_tree
+export collect_leaves, collect_inner_nodes_bottomup, tree_summary
+export plan_fractal_krfft, execute_fractal_krfft!
 
 """
     ActiveBlock
@@ -893,5 +896,6 @@ end
 
 include("recursive_blocks.jl")
 include("recursive_blocks_backward.jl")
+include("fractal_krfft.jl")
 
 end

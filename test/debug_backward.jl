@@ -92,13 +92,18 @@ end
 # ================================================================
 
 function bwd_inv_a8!(plan, F_spec)
-    g0 = plan.g0_reps; fill!(g0, zero(ComplexF64))
-    @inbounds for block in plan.a8_blocks
-        h_idxs = block.spec_idxs; r_idxs = block.rep_idxs
-        inv_A = block.inv_matrix; n = length(h_idxs)
-        for j in 1:n; fh = F_spec[h_idxs[j]]
-            for i in 1:n; g0[r_idxs[i]] += inv_A[i,j] * fh; end
-        end
+    g0 = plan.g0_reps; table = plan.inv_a8_table
+    @inbounds for r in 1:plan.n_reps
+        base = (r - 1) * 8
+        val  = table[base+1].weight * F_spec[table[base+1].spec_idx]
+        val += table[base+2].weight * F_spec[table[base+2].spec_idx]
+        val += table[base+3].weight * F_spec[table[base+3].spec_idx]
+        val += table[base+4].weight * F_spec[table[base+4].spec_idx]
+        val += table[base+5].weight * F_spec[table[base+5].spec_idx]
+        val += table[base+6].weight * F_spec[table[base+6].spec_idx]
+        val += table[base+7].weight * F_spec[table[base+7].spec_idx]
+        val += table[base+8].weight * F_spec[table[base+8].spec_idx]
+        g0[r] = val
     end
 end
 
