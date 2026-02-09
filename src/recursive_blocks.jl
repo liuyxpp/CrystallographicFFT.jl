@@ -960,10 +960,35 @@ end
 # ============================================================================
 
 """
+    has_cubic_p3c_symmetry(ops) → Bool
+
+Check whether the space group has cubic P3c symmetry — specifically, whether
+there exists an operation with the 3-fold body-diagonal rotation R that maps
+(x,y,z) → (y,z,x). This cyclic permutation is required by the P3c twiddle
+formula which hardcodes `F_001[iy,iz,ix]` and `F_001[iz,ix,iy]`.
+
+Only cubic groups (#195-#230) possess this symmetry. Tetragonal, orthorhombic,
+and lower-symmetry groups do NOT, and will produce incorrect results with the
+P3c decomposition.
+"""
+function has_cubic_p3c_symmetry(ops::Vector{SymOp})
+    # The 3-fold body-diagonal rotation: R = [0 0 1; 1 0 0; 0 1 0]
+    for op in ops
+        R = round.(Int, op.R)
+        if R == [0 0 1; 1 0 0; 0 1 0]
+            return true
+        end
+    end
+    return false
+end
+
+"""
     G0ASUPlan
 
 G0 ASU plan: computes G0 only at orbit representatives under the remaining
 point group (operations with even translations, |G_rem| = |G|/8).
+
+Requires cubic symmetry (P3c body-diagonal 3-fold rotation).
 
 The symmetry relation is:
     G0(R_α^T q mod M) = exp(-2πi q · (t_α/2) / M) × G0(q)
@@ -1010,6 +1035,9 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "G0 ASU KRFFT currently supports 3D only"
+    @assert has_cubic_p3c_symmetry(ops_shifted) "G0 ASU requires cubic symmetry (P3c body-diagonal 3-fold rotation). " *
+        "Non-cubic groups (tetragonal, orthorhombic, etc.) are not supported. " *
+        "Use plan_krfft_selective() or plan_krfft_sparse() instead."
 
     M = [N[d] ÷ 2 for d in 1:dim]
     M2 = [M[d] ÷ 2 for d in 1:dim]

@@ -17,6 +17,18 @@ using LinearAlgebra: mul!
 # ────────────────────────────────────────────────────────────────────
 
 """
+    InvA8GatherEntry
+
+One weighted gather from F_spec for the inverse A8 step.
+"""
+struct InvA8GatherEntry
+    weight::ComplexF64
+    spec_idx::Int32
+end
+
+const _ZERO_INV_A8 = InvA8GatherEntry(zero(ComplexF64), Int32(1))
+
+"""
     A8InvBlock
 
 One block of the block-diagonal A8 inverse.
@@ -44,6 +56,7 @@ end
 
 One expansion entry mapped to its M2³ position and octant.
 Stores the octant index (0-7), orbit-rep compact index, and phase.
+Compact layout (21 bytes) for L2-cache-friendly CSR scan.
 """
 struct OctExpEntry
     octant::Int8       # 0-7: xi + 2*yi + 4*zi
@@ -80,12 +93,13 @@ const _SIGN_F111 = Int8[ 1,-1,-1, 1,-1, 1, 1,-1]
 Factored backward plan: inv A8 → fused expansion+butterfly → IFFT.
 """
 struct G0ASUBackwardPlan
-    # Step 1: Inverse A8 (block-diagonal)
-    a8_blocks::Vector{A8InvBlock}
+    # Step 1: Inverse A8 — flattened per-rep gather table
+    inv_a8_table::Vector{InvA8GatherEntry}  # 8 × n_reps entries (zero-padded)
+    inv_a8_counts::Vector{Int8}             # actual # of nonzero entries per rep
 
     # Step 2: Fused expansion + butterfly (per-M2 CSR table)
     expansion::Vector{G0ExpansionEntry}   # kept for reference/debugging
-    per_m2::PerM2Table                    # CSR table for fused step
+    per_m2::PerM2Table                    # CSR table with pre-multiplied weights
     tw_x::Vector{ComplexF64}
     tw_y::Vector{ComplexF64}
     tw_z::Vector{ComplexF64}
@@ -122,6 +136,8 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "G0 ASU backward currently supports 3D only"
+    @assert has_cubic_p3c_symmetry(ops_shifted) "G0 ASU backward requires cubic symmetry (P3c body-diagonal 3-fold rotation). " *
+        "Non-cubic groups (tetragonal, orthorhombic, etc.) are not supported."
 
     M = [N[d] ÷ 2 for d in 1:dim]
     M2 = [M[d] ÷ 2 for d in 1:dim]
@@ -262,11 +278,10 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
         push!(block_map[root], h)
     end
 
-    # Build block inverses
+    # Build block inverses then flatten into per-rep gather table
     a8_blocks = A8InvBlock[]
     for (_, h_idxs) in block_map
         sort!(h_idxs)
-        # Collect rep indices used by this block
         rep_set = Set{Int}()
         for h in h_idxs
             for ((hh, r), _) in A_entries
@@ -279,7 +294,6 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
         n_r = length(rep_list)
         @assert n_h == n_r "Block size mismatch: $n_h specs vs $n_r reps"
 
-        # Build local A sub-matrix
         rep_to_local = Dict(r => i for (i, r) in enumerate(rep_list))
         A_sub = zeros(ComplexF64, n_h, n_r)
         for (local_h, h) in enumerate(h_idxs)
@@ -289,6 +303,29 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
         end
 
         push!(a8_blocks, A8InvBlock(h_idxs, rep_list, inv(A_sub)))
+    end
+
+    # Flatten block-diagonal inverse into per-rep gather table
+    # g0_reps[r] = Σ_j inv_A[r_local, j] × F_spec[h_idxs[j]]
+    # Padded to 8 entries per rep (matching forward A8 layout)
+    inv_a8_table = Vector{InvA8GatherEntry}(undef, 8 * n_reps)
+    inv_a8_counts = zeros(Int8, n_reps)
+    fill!(inv_a8_table, _ZERO_INV_A8)
+
+    for block in a8_blocks
+        inv_A = block.inv_matrix
+        h_idxs = block.spec_idxs
+        rep_list = block.rep_idxs
+        n = length(h_idxs)
+
+        for (local_r, compact_r) in enumerate(rep_list)
+            base = (compact_r - 1) * 8
+            inv_a8_counts[compact_r] = Int8(n)
+            for j in 1:n
+                inv_a8_table[base + j] = InvA8GatherEntry(
+                    inv_A[local_r, j], Int32(h_idxs[j]))
+            end
+        end
     end
 
     # ────────────────────────────────────────────────────────────────
@@ -378,6 +415,7 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
             end
         end
     end
+    sort!(unfilled_map, by = x -> x[2])   # Opt-1: group by source for cache locality
 
     # ────────────────────────────────────────────────────────────────
     # Allocate buffers
@@ -395,7 +433,7 @@ function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vect
           "unfilled=$(length(unfilled_map)), N=$N_tuple"
 
     return G0ASUBackwardPlan(
-        a8_blocks,
+        inv_a8_table, inv_a8_counts,
         expansion,
         per_m2,
         tw_x, tw_y, tw_z,
@@ -424,23 +462,23 @@ function execute_g0asu_ikrfft!(plan::G0ASUBackwardPlan,
                                F_spec::AbstractVector{ComplexF64},
                                u_out::AbstractArray{<:Number,3})
     M2 = plan.sub_sub_dims
+    n_reps = plan.n_reps
 
-    # === Step 1: Inverse A8 — block-diagonal solve ===
+    # === Step 1: Inverse A8 — flattened gather ===
     g0 = plan.g0_reps
-    fill!(g0, zero(ComplexF64))
+    table = plan.inv_a8_table
 
-    @inbounds for block in plan.a8_blocks
-        h_idxs = block.spec_idxs
-        r_idxs = block.rep_idxs
-        inv_A = block.inv_matrix
-        n = length(h_idxs)
-
-        for j in 1:n
-            fh = F_spec[h_idxs[j]]
-            for i in 1:n
-                g0[r_idxs[i]] += inv_A[i, j] * fh
-            end
-        end
+    @inbounds for r in 1:n_reps
+        base = (r - 1) * 8
+        val  = table[base+1].weight * F_spec[table[base+1].spec_idx]
+        val += table[base+2].weight * F_spec[table[base+2].spec_idx]
+        val += table[base+3].weight * F_spec[table[base+3].spec_idx]
+        val += table[base+4].weight * F_spec[table[base+4].spec_idx]
+        val += table[base+5].weight * F_spec[table[base+5].spec_idx]
+        val += table[base+6].weight * F_spec[table[base+6].spec_idx]
+        val += table[base+7].weight * F_spec[table[base+7].spec_idx]
+        val += table[base+8].weight * F_spec[table[base+8].spec_idx]
+        g0[r] = val
     end
 
     # === Step 2: Fused expansion + butterfly (per-M2 accumulation) ===
