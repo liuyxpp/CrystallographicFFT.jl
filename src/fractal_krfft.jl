@@ -50,6 +50,7 @@ mutable struct FractalNode
 
     # Orbit mapping: for each of the n_total_sectors sectors:
     #   sector_rep_idx[s] = index into children[] for this sector's representative
+    #     0 means extinct sector (centering: F=0 at those spectral positions)
     #   sector_rot[s] = rotation matrix mapping rep's FFT → sector's FFT
     #   sector_phase[s] = additional phase correction
     sector_rep_idx::Vector{Int}
@@ -62,6 +63,18 @@ mutable struct FractalNode
     butterfly_twiddles::Vector{Vector{ComplexF64}}  # [sector][h_lin]
     butterfly_rot_maps::Vector{Vector{Int32}}       # [sector][h_lin] → index in rep buffer
 
+    # ── Centering info (KRFFT III) ──
+    # When is_centering_split=true, this node uses centering decomposition.
+    # Children are centering channels with special packing (linear combinations
+    # of spatial data via half-grid translations).
+    # centering_pack_coeffs[child_idx][coset_k] = coefficient for coset member k
+    # centering_pack_offsets[coset_k] = spatial offset for coset member k (in grid coords)
+    # centering_pack_twiddle_h[child_idx] = spectral offset vector for e_A modulation
+    is_centering_split::Bool
+    centering_pack_coeffs::Vector{Vector{Float64}}     # [channel][coset_member]
+    centering_pack_offsets::Vector{Vector{Int}}         # [coset_member] → D-vector offset
+    centering_pack_twiddle_h::Vector{Vector{Float64}}   # [channel] → D-vector spectral offset
+
     # ── FFT buffer ──
     fft_buffer::Vector{ComplexF64}
 
@@ -73,6 +86,10 @@ mutable struct FractalNode
         sector_rep_idx=Int[], sector_rot=Matrix{Float64}[], sector_trans=Vector{Float64}[],
         butterfly_twiddles=Vector{ComplexF64}[],
         butterfly_rot_maps=Vector{Int32}[],
+        is_centering_split=false,
+        centering_pack_coeffs=Vector{Float64}[],
+        centering_pack_offsets=Vector{Int}[],
+        centering_pack_twiddle_h=Vector{Float64}[],
         fft_buffer=ComplexF64[],
     )
         new(subgrid_N, scale, offset, ops,
@@ -80,6 +97,8 @@ mutable struct FractalNode
             split_dims, n_total_sectors, sector_parities,
             sector_rep_idx, sector_rot, sector_trans,
             butterfly_twiddles, butterfly_rot_maps,
+            is_centering_split,
+            centering_pack_coeffs, centering_pack_offsets, centering_pack_twiddle_h,
             fft_buffer)
     end
 end
@@ -298,9 +317,27 @@ function build_recursive_tree(N::Tuple, ops::Vector{SymOp})
         # Step 1: Classify ops (use ORIGINAL ops for parity check)
         diag_ops, mixing_ops, _, _ = classify_ops(node.ops, D)
 
-        # Skip if only identity op
+        # Check for non-trivial rotation ops (R ≠ I)
         has_nontrivial = any(op -> !all(op.R[i,j] == (i==j ? 1 : 0) for i in 1:D, j in 1:D), node.ops)
         if !has_nontrivial
+            # No rotation ops left. Check for centering translations (R=I, t≠0 mod N)
+            # IMPORTANT: After coordinate transforms, t values may equal N (full-period),
+            # which is trivial (identity). Only keep genuinely non-trivial translations.
+            cent_ops = SymOp[]
+            for op in node.ops
+                if !all(op.R[i,j] == (i==j ? 1 : 0) for i in 1:D, j in 1:D)
+                    continue
+                end
+                t_mod = [mod(round(Int, op.t[d]), curr_N[d]) for d in 1:D]
+                if any(t_mod .!= 0)
+                    push!(cent_ops, SymOp(op.R, Float64.(t_mod)))
+                end
+            end
+            if !isempty(cent_ops) && all(x -> x >= 2, curr_N)
+                # Centering split (KRFFT III): decompose into multi-function channels
+                _setup_centering_split!(node, cent_ops, curr_N, D)
+                continue
+            end
             node.is_leaf = true
             continue
         end
@@ -431,6 +468,128 @@ function build_recursive_tree(N::Tuple, ops::Vector{SymOp})
     end
 
     return root
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# Centering Split (KRFFT III)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    _setup_centering_split!(node, cent_ops, curr_N, D)
+
+Set up centering decomposition (inspired by KRFFT III, Rowicka et al. 2003).
+
+When only centering translations remain (R=I, t≠0), perform a parity split
+where centering extinction eliminates sectors with cancelling phases.
+
+Centering creates periodicity WITHIN each stride-2 sector, not BETWEEN sectors.
+Therefore we only apply EXTINCTION (skip sectors where F=0), with NO orbit
+equivalence. Each alive sector gets its own independent child.
+"""
+function _setup_centering_split!(node::FractalNode, cent_ops::Vector{SymOp},
+                                  curr_N::Tuple, D::Int)
+    node.is_centering_split = true
+
+    # Split all even dimensions
+    split_dims = [d for d in 1:D if curr_N[d] >= 2 && curr_N[d] % 2 == 0]
+    node.split_dims = split_dims
+    n_split = length(split_dims)
+    n_sectors = 1 << n_split
+    node.n_total_sectors = n_sectors
+
+    # Generate all sector parities
+    parities = Vector{Vector{Int}}(undef, n_sectors)
+    for bits in 0:n_sectors-1
+        p = zeros(Int, D)
+        for (k, d) in enumerate(split_dims)
+            p[d] = (bits >> (k-1)) & 1
+        end
+        parities[bits+1] = p
+    end
+    node.sector_parities = parities
+
+    # Build centering group (all compositions of centering translations + identity)
+    cent_group = Set{Vector{Int}}()
+    push!(cent_group, zeros(Int, D))
+    queue_cg = [zeros(Int, D)]
+    for op in cent_ops
+        t = round.(Int, op.t)
+        if t ∉ cent_group
+            push!(cent_group, t)
+            push!(queue_cg, t)
+        end
+    end
+    while !isempty(queue_cg)
+        g = pop!(queue_cg)
+        for op in cent_ops
+            t = round.(Int, op.t)
+            h = [mod(g[d] + t[d], curr_N[d]) for d in 1:D]
+            if h ∉ cent_group
+                push!(cent_group, h)
+                push!(queue_cg, h)
+            end
+        end
+    end
+
+    # Identify extinction: F(h) = 0 when Σ_{τ∈G} exp(-2πi h·τ/N) = 0
+    sector_alive = trues(n_sectors)
+    for s in 1:n_sectors
+        p = parities[s]
+        phase_sum = 0.0im
+        for τ in cent_group
+            phase = sum(p[d] * τ[d] / curr_N[d] for d in 1:D)
+            phase_sum += cispi(-2 * phase)
+        end
+        if abs(phase_sum) < 0.5
+            sector_alive[s] = false
+        end
+    end
+
+    # Build children: one per ALIVE sector (no orbit equivalence)
+    S_diag = ones(Int, D)
+    for d in split_dims; S_diag[d] = 2; end
+    child_N = [d in split_dims ? curr_N[d] ÷ 2 : curr_N[d] for d in 1:D]
+
+    alive_indices = [s for s in 1:n_sectors if sector_alive[s]]
+    alive_to_child = Dict{Int, Int}()
+    for (ci, si) in enumerate(alive_indices)
+        alive_to_child[si] = ci
+    end
+
+    # sector_rep_idx: 0 for extinct, unique child index for alive
+    node.sector_rep_idx = zeros(Int, n_sectors)
+    for s in 1:n_sectors
+        if sector_alive[s]
+            node.sector_rep_idx[s] = alive_to_child[s]
+        end
+    end
+
+    # For centering butterfly: R = I, t = 0 for all sectors
+    # (the twiddle handles everything)
+    node.sector_rot = [Matrix{Float64}(I(D)) for _ in 1:n_sectors]
+    node.sector_trans = [zeros(Float64, D) for _ in 1:n_sectors]
+
+    # Create children: one per ALIVE sector, each is a leaf
+    n_children = length(alive_indices)
+    for ci in 1:n_children
+        si = alive_indices[ci]
+        parity = parities[si]
+        child = FractalNode(
+            subgrid_N=copy(child_N),
+            scale=node.scale .* S_diag,
+            offset=node.scale .* parity .+ node.offset,
+            ops=SymOp[],  # no remaining ops
+            parent=node,
+            is_leaf=true,
+        )
+        push!(node.children, child)
+    end
+
+    # Standard stride-2 packing is correct: centering periodicity within each
+    # sector means extinct sectors have zero FFT, handled by twiddle=0 in butterfly.
+    node.centering_pack_coeffs = Vector{Float64}[]
+    node.centering_pack_offsets = Vector{Int}[]
+    node.centering_pack_twiddle_h = Vector{Float64}[]
 end
 
 function _deduplicate_ops(ops::Vector{SymOp}, D::Int)
@@ -606,9 +765,15 @@ function _precompute_butterfly!(node::FractalNode, N)
 
     for s in 1:n_sectors
         parity = node.sector_parities[s]
+        child_idx = node.sector_rep_idx[s]
+        if child_idx == 0  # extinct sector (centering)
+            # Fill with zeros — no contribution to parent
+            node.butterfly_twiddles[s] = zeros(ComplexF64, parent_vol)
+            node.butterfly_rot_maps[s] = ones(Int32, parent_vol)  # dummy (won't matter)
+            continue
+        end
         R_g = round.(Int, node.sector_rot[s])
         t_g = node.sector_trans[s]
-        child_idx = node.sector_rep_idx[s]
         child = node.children[child_idx]
         child_N = child.subgrid_N
 
@@ -756,6 +921,7 @@ function _butterfly!(node::FractalNode)
 
     @inbounds for s in 1:node.n_total_sectors
         child_idx = node.sector_rep_idx[s]
+        child_idx == 0 && continue  # skip extinct sectors (centering)
         child_buf = node.children[child_idx].fft_buffer
         twiddles = node.butterfly_twiddles[s]
         rot_map = node.butterfly_rot_maps[s]
