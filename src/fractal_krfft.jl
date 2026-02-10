@@ -937,3 +937,336 @@ end
 # ────────────────────────────────────────────────────────────────────────────
 
 const calc_asu_tree = build_recursive_tree
+
+# ────────────────────────────────────────────────────────────────────────────
+# Optimized Execution: O(N_spec) pack + sparse butterfly
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    SparseButterflyOp
+
+Precomputed butterfly operation for one (node, sector) combination,
+operating only on needed frequency indices.
+Fields use ABSOLUTE indices into the unified buffer pool.
+"""
+struct SparseButterflyOp
+    twiddles::Vector{ComplexF64}    # [n_entries] twiddle factors
+    child_pool_idx::Vector{Int32}  # [n_entries] absolute pool index for child read
+    parent_pool_idx::Vector{Int32} # [n_entries] absolute pool index for parent write
+end
+
+"""
+    ButterflyGroup
+
+All butterfly operations for one inner node + the zero-fill for its parent buffer.
+"""
+struct ButterflyGroup
+    parent_zero_indices::Vector{Int32}  # pool indices that must be zeroed
+    ops::Vector{SparseButterflyOp}      # one per active sector
+end
+
+"""
+    LeafFFTInfo
+
+FFT info for a single leaf, storing its pool offset and dimensions.
+"""
+struct LeafFFTInfo
+    pool_offset::Int    # 0-based offset in buffer_pool
+    dims::Tuple         # subgrid dimensions
+end
+
+"""
+    OptimizedFractalPlan
+
+Optimized plan that achieves O(N_spec) pack + sparse butterfly.
+All buffers are flattened into a single contiguous pool.
+"""
+struct OptimizedFractalPlan
+    # ── Buffer pool ──
+    buffer_pool::Vector{ComplexF64}
+
+    # ── Pack (parallel src/dst arrays) ──
+    pack_src::Vector{Int32}    # [total_fft_pts] source index in flat u
+    pack_dst::Vector{Int32}    # [total_fft_pts] destination pool index (1-based)
+    total_fft_pts::Int
+
+    # ── FFT ──
+    leaf_fft_infos::Vector{LeafFFTInfo}
+    fft_plans::Dict{Tuple, Any}
+
+    # ── Butterfly (sparse, bottom-up) ──
+    butterfly_groups::Vector{ButterflyGroup}
+
+    # ── Extract ──
+    extract_pool_idx::Vector{Int32}  # pool indices for ASU extraction
+    output_buffer::Vector{ComplexF64}
+
+    # ── Metadata ──
+    grid_N::Vector{Int}
+    n_spec::Int
+end
+
+"""
+    plan_fractal_krfft_v2(spec_asu, ops) → OptimizedFractalPlan
+
+Build an optimized fractal KRFFT plan with O(N_spec) sparse butterfly.
+"""
+function plan_fractal_krfft_v2(spec_asu::SpectralIndexing, ops::Vector{SymOp})
+    N = spec_asu.N
+    D = length(N)
+
+    # Build tree (reuse existing logic)
+    root = build_recursive_tree(Tuple(N), ops)
+    _allocate_buffers!(root)
+    _precompute_butterfly!(root, N)
+
+    # Create FFT plans
+    fft_plans = Dict{Tuple, Any}()
+    _create_fft_plans!(fft_plans, root)
+
+    # ── Step 1: Flatten all buffers into a contiguous pool ──
+    all_nodes = _collect_all_nodes(root)
+    node_offsets = Dict{UInt, Int}()
+    total_pool_size = 0
+    for node in all_nodes
+        node_offsets[objectid(node)] = total_pool_size
+        total_pool_size += max(prod(node.subgrid_N), 1)
+    end
+    buffer_pool = zeros(ComplexF64, total_pool_size)
+
+    # ── Step 2: Build pack gather table (pack_src, pack_dst) ──
+    leaves = collect_leaves(root)
+    total_fft_pts = sum(prod(l.subgrid_N) for l in leaves)
+    pack_src = Vector{Int32}(undef, total_fft_pts)
+    pack_dst = Vector{Int32}(undef, total_fft_pts)
+    leaf_fft_infos = LeafFFTInfo[]
+
+    pack_idx = 0
+    N_tuple = Tuple(N)
+    li = LinearIndices(N_tuple)
+    for leaf in leaves
+        off = node_offsets[objectid(leaf)]
+        dims = Tuple(leaf.subgrid_N)
+        push!(leaf_fft_infos, LeafFFTInfo(off, dims))
+
+        for ci in CartesianIndices(dims)
+            pack_idx += 1
+            local_coord = Tuple(ci) .- 1
+            gi = ntuple(d -> mod(leaf.scale[d] * local_coord[d] + leaf.offset[d],
+                                 N[d]) + 1, D)
+            pack_src[pack_idx] = Int32(li[gi...])
+            pack_dst[pack_idx] = Int32(off + LinearIndices(dims)[ci])
+        end
+    end
+
+    # Create FFT plans (out-of-place, shared by size)
+    fft_plans = Dict{Tuple, Any}()
+    for info in leaf_fft_infos
+        dims = info.dims
+        if prod(dims) > 0 && !haskey(fft_plans, dims)
+            dummy = zeros(ComplexF64, dims)
+            fft_plans[dims] = plan_fft(dummy)
+        end
+    end
+
+    # ── Step 3: Compute needed indices top-down (sparse butterfly) ──
+    n_spec = length(spec_asu.points)
+    root_N = Tuple(root.subgrid_N)
+
+    asu_lin = Vector{Int32}(undef, n_spec)
+    for (i, pt) in enumerate(spec_asu.points)
+        raw_k = pt.idx
+        lin = 1; stride = 1
+        for d in 1:D
+            lin += raw_k[d] * stride
+            stride *= root_N[d]
+        end
+        asu_lin[i] = Int32(lin)
+    end
+
+    needed_map = Dict{UInt, Vector{Int32}}()
+    _compute_needed_sets!(root, asu_lin, needed_map)
+
+    # ── Step 4: Build sparse butterfly schedule ──
+    inner_nodes = collect_inner_nodes_bottomup(root)
+    butterfly_groups = ButterflyGroup[]
+
+    n_sparse = 0
+    n_full = 0
+
+    for node in inner_nodes
+        needed = get(needed_map, objectid(node), Int32[])
+        parent_off = node_offsets[objectid(node)]
+        parent_vol = prod(node.subgrid_N)
+        is_sparse = length(needed) < parent_vol
+
+        if is_sparse
+            n_sparse += 1
+        else
+            n_full += 1
+        end
+
+        # Build zero-fill index list
+        if is_sparse
+            zero_indices = Int32[parent_off + h for h in needed]
+        else
+            zero_indices = collect(Int32, (parent_off + 1):(parent_off + parent_vol))
+        end
+
+        # Build ops for each active sector
+        ops_for_node = SparseButterflyOp[]
+        active_h = is_sparse ? needed : collect(Int32, 1:parent_vol)
+
+        for s in 1:node.n_total_sectors
+            child_idx = node.sector_rep_idx[s]
+            child_idx == 0 && continue
+            child = node.children[child_idx]
+            child_off = node_offsets[objectid(child)]
+            tw_full = node.butterfly_twiddles[s]
+            rm_full = node.butterfly_rot_maps[s]
+
+            n_h = length(active_h)
+            tw = Vector{ComplexF64}(undef, n_h)
+            ci = Vector{Int32}(undef, n_h)
+            pi = Vector{Int32}(undef, n_h)
+
+            @inbounds for (j, h) in enumerate(active_h)
+                tw[j] = tw_full[h]
+                ci[j] = Int32(child_off + rm_full[h])
+                pi[j] = Int32(parent_off + h)
+            end
+
+            push!(ops_for_node, SparseButterflyOp(tw, ci, pi))
+        end
+
+        push!(butterfly_groups, ButterflyGroup(zero_indices, ops_for_node))
+    end
+
+    # ── Step 5: Extract indices (absolute pool positions) ──
+    root_off = node_offsets[objectid(root)]
+    extract_pool_idx = Int32[root_off + h for h in asu_lin]
+    output_buffer = zeros(ComplexF64, n_spec)
+
+    @info "Optimized KRFFT v2: n_spec=$n_spec, " *
+          "$(length(leaves)) leaves, $(length(inner_nodes)) inner " *
+          "($(n_sparse) sparse + $(n_full) full), " *
+          "pool=$total_pool_size, fft_pts=$total_fft_pts"
+
+    return OptimizedFractalPlan(
+        buffer_pool,
+        pack_src, pack_dst, total_fft_pts,
+        leaf_fft_infos, fft_plans,
+        butterfly_groups,
+        extract_pool_idx, output_buffer,
+        collect(N), n_spec)
+end
+
+"""Top-down computation of needed frequency indices for each node."""
+function _compute_needed_sets!(node::FractalNode, needed::Vector{Int32},
+                                needed_map::Dict{UInt, Vector{Int32}})
+    parent_vol = prod(node.subgrid_N)
+
+    if length(needed) >= parent_vol
+        needed_map[objectid(node)] = collect(Int32, 1:parent_vol)
+    else
+        needed_map[objectid(node)] = needed
+    end
+
+    if node.is_leaf
+        return
+    end
+
+    # For each representative child, collect which entries are needed
+    child_needed = Dict{Int, Set{Int32}}()
+    for s in 1:node.n_total_sectors
+        child_idx = node.sector_rep_idx[s]
+        child_idx == 0 && continue
+        if !haskey(child_needed, child_idx)
+            child_needed[child_idx] = Set{Int32}()
+        end
+        rm = node.butterfly_rot_maps[s]
+        actual_needed = length(needed) >= parent_vol ?
+                        (1:parent_vol) : needed
+        for h in actual_needed
+            push!(child_needed[child_idx], rm[h])
+        end
+    end
+
+    for (ci, child) in enumerate(node.children)
+        cn = get(child_needed, ci, Set{Int32}())
+        sorted_cn = sort!(collect(cn))
+        _compute_needed_sets!(child, sorted_cn, needed_map)
+    end
+end
+
+"""Collect all nodes in the tree (BFS order)."""
+function _collect_all_nodes(root::FractalNode)
+    nodes = FractalNode[]
+    queue = [root]
+    while !isempty(queue)
+        node = popfirst!(queue)
+        push!(nodes, node)
+        for child in node.children
+            push!(queue, child)
+        end
+    end
+    return nodes
+end
+
+"""
+    execute_fractal_krfft_v2!(plan, u) → spectral ASU values
+
+Optimized forward transform with O(N_spec) pack + sparse butterfly.
+"""
+function execute_fractal_krfft_v2!(plan::OptimizedFractalPlan, u::AbstractArray{<:Real})
+    pool = plan.buffer_pool
+    u_flat = vec(u)
+
+    # Step 1: Pack all leaves via gather table (O(N_spec))
+    ps = plan.pack_src
+    pd = plan.pack_dst
+    @inbounds @simd for i in eachindex(ps)
+        pool[pd[i]] = complex(u_flat[ps[i]])
+    end
+
+    # Step 2: FFT all leaves
+    for info in plan.leaf_fft_infos
+        dims = info.dims
+        vol = prod(dims)
+        vol == 0 && continue
+        off = info.pool_offset
+        fp = plan.fft_plans[dims]
+        buf = reshape(@view(pool[off+1:off+vol]), dims)
+        tmp = fp * buf
+        copyto!(@view(pool[off+1:off+vol]), vec(tmp))
+    end
+
+    # Step 3: Sparse butterfly (bottom-up)
+    for group in plan.butterfly_groups
+        # Zero-fill only needed positions
+        zi = group.parent_zero_indices
+        @inbounds @simd for i in eachindex(zi)
+            pool[zi[i]] = zero(ComplexF64)
+        end
+
+        # Accumulate contributions from all sectors
+        for op in group.ops
+            tw = op.twiddles
+            ci = op.child_pool_idx
+            pi = op.parent_pool_idx
+            @inbounds @simd for j in eachindex(tw)
+                pool[pi[j]] += tw[j] * pool[ci[j]]
+            end
+        end
+    end
+
+    # Step 4: Extract spectral ASU
+    out = plan.output_buffer
+    ei = plan.extract_pool_idx
+    @inbounds @simd for i in eachindex(out)
+        out[i] = pool[ei[i]]
+    end
+
+    return out
+end
+

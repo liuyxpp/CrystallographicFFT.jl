@@ -21,6 +21,7 @@ export plan_krfft_g0asu_backward, execute_g0asu_ikrfft!
 export FractalNode, FractalCFFTPlan, calc_asu_tree, build_recursive_tree
 export collect_leaves, collect_inner_nodes_bottomup, tree_summary
 export plan_fractal_krfft, execute_fractal_krfft!
+export OptimizedFractalPlan, plan_fractal_krfft_v2, execute_fractal_krfft_v2!
 
 """
     ActiveBlock
@@ -897,5 +898,6 @@ end
 include("recursive_blocks.jl")
 include("recursive_blocks_backward.jl")
 include("fractal_krfft.jl")
+include("fractal_krfft_v3.jl")
 
 end
