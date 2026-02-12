@@ -17,6 +17,19 @@ using LinearAlgebra
 # Data structures
 # ─────────────────────────────────────────────────────────────────────────
 
+"""yx recursion tree node. Each node represents one level of diagonal mirror decomposition.
+Splits stride-2 in x,y dimensions only (z untouched)."""
+struct YxNode
+    level::Int
+    size::NTuple{3,Int}           # (Mx, My, Mz) at this level
+    half_xy::NTuple{3,Int}        # (Mx÷2, My÷2, Mz)
+    gp_buf::Array{ComplexF64,3}   # f₀₁ real-space GP data
+    gp_fft::Array{ComplexF64,3}   # F₀₁ FFT output
+    sp_bufs::Vector{Array{ComplexF64,3}}     # [f₀₀, f₁₁]
+    fft_plan::FFTW.cFFTWPlan{ComplexF64, -1, false, 3, NTuple{3,Int}}
+    children::Vector{Union{YxNode, Nothing}}  # [child_00, child_11]
+end
+
 """P3c recursion tree node. Each node represents one level of C₃ decomposition."""
 struct P3cNode
     level::Int
@@ -24,6 +37,7 @@ struct P3cNode
     half::NTuple{3,Int}           # (M÷2, M÷2, M÷2)
     gp_bufs::Vector{Array{ComplexF64,3}}     # [f_001, f_110], real-space GP data
     gp_ffts::Vector{Array{ComplexF64,3}}     # [F_001, F_110], FFT outputs
+    gp_yx::Vector{Union{YxNode, Nothing}}    # yx trees for GP sub-subgrids
     sp_bufs::Vector{Array{ComplexF64,3}}     # [f_000, f_111], real-space SP data
     fft_plan::FFTW.cFFTWPlan{ComplexF64, -1, false, 3, NTuple{3,Int}}
     children::Vector{Union{P3cNode, Nothing}}  # [child_000, child_111]
@@ -42,33 +56,65 @@ end
 # Construction
 # ─────────────────────────────────────────────────────────────────────────
 
-"""Build a P3c recursion tree for C₃ decomposition of an M³ grid."""
-function build_p3c_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2)
+"""Build a yx recursion tree for diagonal mirror decomposition.
+Splits stride-2 in x,y only. Input grid is (Mx, My, Mz)."""
+function build_yx_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2)
+    M2 = (M[1] ÷ 2, M[2] ÷ 2, M[3])  # only split x,y
+    gp_buf = zeros(ComplexF64, M2)
+    gp_fft = zeros(ComplexF64, M2)
+    sp_bufs = [zeros(ComplexF64, M2) for _ in 1:2]
+    fft_plan = plan_fft(zeros(ComplexF64, M2), flags=FFTW.ESTIMATE)
+    
+    if M2[1] >= min_size && M2[1] % 2 == 0
+        children = Union{YxNode,Nothing}[
+            build_yx_tree(M2, level+1; min_size),
+            build_yx_tree(M2, level+1; min_size)]
+    else
+        children = Union{YxNode,Nothing}[nothing, nothing]
+    end
+    
+    return YxNode(level, M, M2, gp_buf, gp_fft, sp_bufs, fft_plan, children)
+end
+
+"""Build a P3c recursion tree for C₃ decomposition of an M³ grid.
+`use_yx`: if true, apply yx diagonal mirror reduction to GP sub-subgrids.
+  Default is false because FFTW is faster than yx forward+reconstruct at typical sizes."""
+function build_p3c_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2, use_yx::Bool=false)
     M2 = M .÷ 2
     gp_bufs = [zeros(ComplexF64, M2) for _ in 1:2]
     gp_ffts = [zeros(ComplexF64, M2) for _ in 1:2]
     sp_bufs = [zeros(ComplexF64, M2) for _ in 1:2]
     fft_plan = plan_fft(zeros(ComplexF64, M2), flags=FFTW.ESTIMATE)
     
+    # Build yx trees for GP sub-subgrids (only if enabled)
+    if use_yx && M2[1] >= min_size && M2[1] % 2 == 0
+        gp_yx = Union{YxNode,Nothing}[
+            build_yx_tree(M2; min_size),
+            build_yx_tree(M2; min_size)]
+    else
+        gp_yx = Union{YxNode,Nothing}[nothing, nothing]
+    end
+    
     if M2[1] >= min_size && M2[1] % 2 == 0
         children = Union{P3cNode,Nothing}[
-            build_p3c_tree(M2, level+1; min_size),
-            build_p3c_tree(M2, level+1; min_size)]
+            build_p3c_tree(M2, level+1; min_size, use_yx),
+            build_p3c_tree(M2, level+1; min_size, use_yx)]
     else
         children = Union{P3cNode,Nothing}[nothing, nothing]
     end
     
-    return P3cNode(level, M, M2, gp_bufs, gp_ffts, sp_bufs, fft_plan, children)
+    return P3cNode(level, M, M2, gp_bufs, gp_ffts, gp_yx, sp_bufs, fft_plan, children)
 end
 
-"""Create a staged KRFFT plan for Pm-3m."""
-function plan_staged_pm3m(N_full::NTuple{3,Int})
+"""Create a staged KRFFT plan for Pm-3m.
+`use_yx`: if true, apply yx diagonal mirror reduction to GP leaves (default: false)."""
+function plan_staged_pm3m(N_full::NTuple{3,Int}; use_yx::Bool=false)
     @assert all(n -> n % 2 == 0, N_full) "Grid dimensions must be even"
     @assert N_full[1] == N_full[2] == N_full[3] "Must be cubic"
     N_half = N_full .÷ 2
     a8_buf = zeros(ComplexF64, N_half)
     a8_fft = zeros(ComplexF64, N_half)
-    p3c_root = build_p3c_tree(N_half)
+    p3c_root = build_p3c_tree(N_half; use_yx)
     return StagedPm3mPlan(N_full, N_half, a8_buf, a8_fft, p3c_root)
 end
 
@@ -98,20 +144,119 @@ function extract_p3c_subgrids!(node::P3cNode, data::Array{ComplexF64,3})
     end
 end
 
-"""Recursively execute P3c decomposition: extract → FFT GP → recurse SP."""
+# ─────────────────────────────────────────────────────────────────────────
+# yx Forward: extraction + FFT
+# ─────────────────────────────────────────────────────────────────────────
+
+"""Extract 3 yx sub-subgrids from parent data (Mx×My×Mz).
+SP: (0,0) and (1,1) — yx-mirror invariant.
+GP: (0,1) — representative; (1,0) derived via F₁₀(h₁)=F₀₁(h_y,h_x,h_z)."""
+function extract_yx_subgrids!(node::YxNode, data::Array{ComplexF64,3})
+    M = node.size; M2 = node.half_xy
+    @inbounds for k in 1:M2[3], j in 1:M2[2], i in 1:M2[1]
+        node.sp_bufs[1][i,j,k] = data[2i-1, 2j-1, k]                    # (0,0)
+        node.sp_bufs[2][i,j,k] = data[mod1(2i,M[1]), mod1(2j,M[2]), k]  # (1,1)
+        node.gp_buf[i,j,k]     = data[2i-1, mod1(2j,M[2]), k]           # (0,1)
+    end
+end
+
+"""Recursively execute yx decomposition: extract → FFT GP → recurse SP."""
+function execute_yx_forward!(node::YxNode, data::Array{ComplexF64,3})
+    extract_yx_subgrids!(node, data)
+    
+    # FFT the GP representative (0,1)
+    mul!(node.gp_fft, node.fft_plan, node.gp_buf)
+    
+    # Recurse or leaf-FFT the 2 SP sub-subgrids
+    for (idx, child) in enumerate(node.children)
+        if child !== nothing
+            execute_yx_forward!(child, node.sp_bufs[idx])
+        else
+            tmp = copy(node.sp_bufs[idx])
+            mul!(node.sp_bufs[idx], node.fft_plan, tmp)
+        end
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────────────
+# yx Butterfly reconstruction
+# ─────────────────────────────────────────────────────────────────────────
+
+"""
+Bottom-up butterfly reconstruction for yx diagonal mirror.
+
+KRFFT V §3 eq (13):
+  F(h) = F₀₀(h₁) + tw₁₁·F₁₁(h₁) + tw₁₀·F₀₁(h_y,h_x,h_z) + tw₀₁·F₀₁(h₁)
+where tw_{pq} = exp(-2πi(p·h_x + q·h_y)/M_x)
+
+GP relation: F₁₀(h₁) = F₀₁(h_y, h_x, h_z)
+"""
+function reconstruct_yx!(result::Array{ComplexF64,3}, node::YxNode)
+    M = node.size; M2 = node.half_xy
+    
+    # Bottom-up: reconstruct SP children first
+    sp_freq = node.sp_bufs
+    for (idx, child) in enumerate(node.children)
+        if child !== nothing
+            reconstruct_yx!(sp_freq[idx], child)
+        end
+    end
+    
+    F00 = sp_freq[1]; F11 = sp_freq[2]
+    F01 = node.gp_fft
+    M2x = M2[1]; M2y = M2[2]; M2z = M2[3]
+    
+    # Build mirror-swapped copy: F01_swap[i,j,k] = F01[j,i,k] (= F₁₀)
+    F10 = similar(F01)
+    @inbounds for k in 1:M2z, j in 1:M2y, i in 1:M2x
+        F10[i,j,k] = F01[j,i,k]  # R_α^T: (h_x,h_y,h_z) → (h_y,h_x,h_z)
+    end
+    
+    # Precompute 1D twiddles for x,y (not z — z is not split)
+    tw1x = [cispi(-2i / M[1]) for i in 0:M2x-1]
+    tw1y = [cispi(-2j / M[2]) for j in 0:M2y-1]
+    
+    # Iterate by (h₀_x, h₀_y) quadrant: h_d = h₁_d + M2_d · h₀_d
+    @inbounds for m0 in 0:1, n0 in 0:1
+        sx = (-1)^n0; sy = (-1)^m0
+        for k in 1:M2z
+            for j in 1:M2y
+                twy = tw1y[j] * sy
+                for i in 1:M2x
+                    twx = tw1x[i] * sx
+                    val = F00[i,j,k] + twx*twy * F11[i,j,k] +
+                          twx * F10[i,j,k] + twy * F01[i,j,k]
+                    result[i + n0*M2x, j + m0*M2y, k] = val
+                end
+            end
+        end
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────────────
+# P3c Forward: extraction + FFT (with yx for GP leaves)
+# ─────────────────────────────────────────────────────────────────────────
+
+"""Recursively execute P3c decomposition: extract → yx+FFT GP → recurse SP."""
 function execute_p3c_forward!(node::P3cNode, data::Array{ComplexF64,3})
     extract_p3c_subgrids!(node, data)
     
-    # FFT the 2 GP representatives
-    mul!(node.gp_ffts[1], node.fft_plan, node.gp_bufs[1])
-    mul!(node.gp_ffts[2], node.fft_plan, node.gp_bufs[2])
+    # Process the 2 GP representatives through yx decomposition or plain FFT
+    for idx in 1:2
+        if node.gp_yx[idx] !== nothing
+            # yx decomposition: recursively decompose, then reconstruct to get FFT output
+            execute_yx_forward!(node.gp_yx[idx], node.gp_bufs[idx])
+            reconstruct_yx!(node.gp_ffts[idx], node.gp_yx[idx])
+        else
+            mul!(node.gp_ffts[idx], node.fft_plan, node.gp_bufs[idx])
+        end
+    end
     
     # Recurse or leaf-FFT the 2 SP sub-subgrids
     for (idx, child) in enumerate(node.children)
         if child !== nothing
             execute_p3c_forward!(child, node.sp_bufs[idx])
         else
-            # Leaf: FFT in place (copy needed as mul! doesn't allow aliasing)
             tmp = copy(node.sp_bufs[idx])
             mul!(node.sp_bufs[idx], node.fft_plan, tmp)
         end
