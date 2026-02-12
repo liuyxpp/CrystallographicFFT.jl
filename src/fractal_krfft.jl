@@ -425,7 +425,14 @@ function build_recursive_tree(N::Tuple, ops::Vector{SymOp})
                 end
                 !maps_to_self && continue
 
-                # Transform op to child coords: R_new = S⁻¹RS, t_new = S⁻¹(R*p + t_sh - p)
+                # Transform op to child coords: R_new = S⁻¹RS, t_new = S⁻¹(R*p + t_orig - p)
+                # IMPORTANT: Use ORIGINAL (unshifted) translation op.t, NOT t_sh.
+                # The shifted ops are used only for parity mapping above. Child ops
+                # must be in the unshifted frame so each recursion level can apply
+                # its own b=1/2 shift independently. Using t_sh here would cause a
+                # double-shift bug for ops where (I-R)·b ≠ 0 (e.g., 3-fold rotations
+                # composed with 2-fold axes in P23).
+                t_orig = round.(Int, op.t)
                 R_new = zeros(Float64, D, D)
                 t_new = zeros(Float64, D)
                 valid = true
@@ -438,7 +445,7 @@ function build_recursive_tree(N::Tuple, ops::Vector{SymOp})
                         R_new[i,j] = rv ÷ S_diag[i]
                     end
                     !valid && break
-                    tv = t_sh[i] - parity[i]
+                    tv = t_orig[i] - parity[i]
                     for j in 1:D
                         tv += R[i,j] * parity[j]
                     end
