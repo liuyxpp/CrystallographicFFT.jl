@@ -27,6 +27,7 @@ struct YxNode
     gp_fft::Array{ComplexF64,3}   # F₀₁ FFT output
     sp_bufs::Vector{Array{ComplexF64,3}}     # [f₀₀, f₁₁]
     fft_plan::FFTW.cFFTWPlan{ComplexF64, -1, false, 3, NTuple{3,Int}}
+    fft_work::Array{ComplexF64,3}  # preallocated work buffer for in-place FFT
     children::Vector{Union{YxNode, Nothing}}  # [child_00, child_11]
 end
 
@@ -40,6 +41,7 @@ struct P3cNode
     gp_yx::Vector{Union{YxNode, Nothing}}    # yx trees for GP sub-subgrids
     sp_bufs::Vector{Array{ComplexF64,3}}     # [f_000, f_111], real-space SP data
     fft_plan::FFTW.cFFTWPlan{ComplexF64, -1, false, 3, NTuple{3,Int}}
+    fft_work::Array{ComplexF64,3}  # preallocated work buffer for in-place FFT
     children::Vector{Union{P3cNode, Nothing}}  # [child_000, child_111]
 end
 
@@ -64,6 +66,7 @@ function build_yx_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2)
     gp_fft = zeros(ComplexF64, M2)
     sp_bufs = [zeros(ComplexF64, M2) for _ in 1:2]
     fft_plan = plan_fft(zeros(ComplexF64, M2), flags=FFTW.ESTIMATE)
+    fft_work = zeros(ComplexF64, M2)
     
     if M2[1] >= min_size && M2[1] % 2 == 0
         children = Union{YxNode,Nothing}[
@@ -73,7 +76,7 @@ function build_yx_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2)
         children = Union{YxNode,Nothing}[nothing, nothing]
     end
     
-    return YxNode(level, M, M2, gp_buf, gp_fft, sp_bufs, fft_plan, children)
+    return YxNode(level, M, M2, gp_buf, gp_fft, sp_bufs, fft_plan, fft_work, children)
 end
 
 """Build a P3c recursion tree for C₃ decomposition of an M³ grid.
@@ -85,6 +88,7 @@ function build_p3c_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2, use_yx:
     gp_ffts = [zeros(ComplexF64, M2) for _ in 1:2]
     sp_bufs = [zeros(ComplexF64, M2) for _ in 1:2]
     fft_plan = plan_fft(zeros(ComplexF64, M2), flags=FFTW.ESTIMATE)
+    fft_work = zeros(ComplexF64, M2)
     
     # Build yx trees for GP sub-subgrids (only if enabled)
     if use_yx && M2[1] >= min_size && M2[1] % 2 == 0
@@ -103,7 +107,7 @@ function build_p3c_tree(M::NTuple{3,Int}, level::Int=0; min_size::Int=2, use_yx:
         children = Union{P3cNode,Nothing}[nothing, nothing]
     end
     
-    return P3cNode(level, M, M2, gp_bufs, gp_ffts, gp_yx, sp_bufs, fft_plan, children)
+    return P3cNode(level, M, M2, gp_bufs, gp_ffts, gp_yx, sp_bufs, fft_plan, fft_work, children)
 end
 
 """Create a staged KRFFT plan for Pm-3m.
@@ -172,8 +176,8 @@ function execute_yx_forward!(node::YxNode, data::Array{ComplexF64,3})
         if child !== nothing
             execute_yx_forward!(child, node.sp_bufs[idx])
         else
-            tmp = copy(node.sp_bufs[idx])
-            mul!(node.sp_bufs[idx], node.fft_plan, tmp)
+            copyto!(node.fft_work, node.sp_bufs[idx])
+            mul!(node.sp_bufs[idx], node.fft_plan, node.fft_work)
         end
     end
 end
@@ -257,8 +261,8 @@ function execute_p3c_forward!(node::P3cNode, data::Array{ComplexF64,3})
         if child !== nothing
             execute_p3c_forward!(child, node.sp_bufs[idx])
         else
-            tmp = copy(node.sp_bufs[idx])
-            mul!(node.sp_bufs[idx], node.fft_plan, tmp)
+            copyto!(node.fft_work, node.sp_bufs[idx])
+            mul!(node.sp_bufs[idx], node.fft_plan, node.fft_work)
         end
     end
 end
@@ -330,6 +334,170 @@ function reconstruct_p3c!(result::Array{ComplexF64,3}, node::P3cNode)
                     result[i + n0*M2_1, j + m0*M2_2, k + l0*M2_3] = val
                 end
             end
+        end
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pruned butterfly reconstruction: only compute ASU-needed output points
+# ─────────────────────────────────────────────────────────────────────────
+
+"""Precomputed per-point data for pruned butterfly at a single P3c node."""
+struct PrunedPoint
+    i1p1::Int32   # h₁_x+1 (1-based index into sub-FFT)
+    j1p1::Int32   # h₁_y+1
+    k1p1::Int32   # h₁_z+1
+    oi::Int32     # output index x (1-based)
+    oj::Int32     # output index y
+    ok::Int32     # output index z
+    twx::ComplexF64  # precomputed twiddle × sign (includes (-1)^h₀)
+    twy::ComplexF64
+    twz::ComplexF64
+end
+
+"""Precomputed pruned reconstruction plan for a single P3c node."""
+struct PrecompPlan
+    node_ref::P3cNode
+    # Preallocated rotation buffers
+    F100::Array{ComplexF64,3}
+    F010::Array{ComplexF64,3}
+    F101::Array{ComplexF64,3}
+    F011::Array{ComplexF64,3}
+    # Precomputed 1D twiddles (for full butterfly fallback)
+    tw1x::Vector{ComplexF64}
+    tw1y::Vector{ComplexF64}
+    tw1z::Vector{ComplexF64}
+    # Pruning control
+    use_full::Bool
+    pruned_pts::Vector{PrunedPoint}
+    # Children plans (for SP recursive nodes)
+    children_plans::Vector{Union{PrecompPlan, Nothing}}
+end
+
+"""
+    build_precomp_plan(node, needed) -> PrecompPlan
+
+Build a precomputed pruned reconstruction plan for the P3c tree rooted at `node`.
+`needed` is the set of output points (0-indexed tuples) that must be computed.
+All twiddles, rotation buffers, and per-point data are precomputed for zero-allocation execution.
+"""
+function build_precomp_plan(node::P3cNode, needed::Vector{NTuple{3,Int}})
+    M = node.size; M2 = node.half
+    M2_1 = M2[1]; M2_2 = M2[2]; M2_3 = M2[3]
+    
+    # Preallocate rotation buffers
+    F100 = similar(node.gp_ffts[1])
+    F010 = similar(node.gp_ffts[1])
+    F101 = similar(node.gp_ffts[2])
+    F011 = similar(node.gp_ffts[2])
+    
+    # Precompute 1D twiddles
+    tw1x = [cispi(-2i / M[1]) for i in 0:M2_1-1]
+    tw1y = [cispi(-2j / M[2]) for j in 0:M2_2-1]
+    tw1z = [cispi(-2k / M[3]) for k in 0:M2_3-1]
+    
+    # Decide full vs pruned (full butterfly is faster when most points are needed)
+    use_full = length(needed) >= 0.8 * prod(M)
+    
+    # Precompute per-point data for pruned mode
+    pruned_pts = PrunedPoint[]
+    if !use_full
+        for h in needed
+            i1 = mod(h[1], M2_1); j1 = mod(h[2], M2_2); k1 = mod(h[3], M2_3)
+            n0 = h[1] ÷ M2_1; m0 = h[2] ÷ M2_2; l0 = h[3] ÷ M2_3
+            twx = tw1x[i1+1] * ((-1)^n0)
+            twy = tw1y[j1+1] * ((-1)^m0)
+            twz = tw1z[k1+1] * ((-1)^l0)
+            push!(pruned_pts, PrunedPoint(
+                Int32(i1+1), Int32(j1+1), Int32(k1+1),
+                Int32(h[1]+1), Int32(h[2]+1), Int32(h[3]+1),
+                twx, twy, twz))
+        end
+    end
+    
+    # Child needed set: {h mod M2 : h ∈ needed}
+    child_needed_set = Set{NTuple{3,Int}}()
+    for h in needed
+        push!(child_needed_set, mod.(h, M2))
+    end
+    child_needed = collect(child_needed_set)
+    
+    # Recurse on SP children
+    children_plans = Union{PrecompPlan, Nothing}[nothing, nothing]
+    for (idx, child) in enumerate(node.children)
+        if child !== nothing
+            children_plans[idx] = build_precomp_plan(child, child_needed)
+        end
+    end
+    
+    return PrecompPlan(node, F100, F010, F101, F011, tw1x, tw1y, tw1z, 
+                       use_full, pruned_pts, children_plans)
+end
+
+"""
+    execute_precomp_recon!(result, pp)
+
+Execute pruned P3c butterfly reconstruction using precomputed plan.
+Only computes the output points specified during `build_precomp_plan`.
+Assumes `execute_p3c_forward!` has been called on the P3c tree.
+"""
+function execute_precomp_recon!(result::Array{ComplexF64,3}, pp::PrecompPlan)
+    node = pp.node_ref
+    M = node.size; M2 = node.half
+    M2_1 = M2[1]; M2_2 = M2[2]; M2_3 = M2[3]
+    
+    # Recurse on SP children (bottom-up)
+    sp_freq = node.sp_bufs
+    for (idx, cp) in enumerate(pp.children_plans)
+        if cp !== nothing
+            execute_precomp_recon!(sp_freq[idx], cp)
+        end
+    end
+    
+    F000 = sp_freq[1]; F111 = sp_freq[2]
+    F001 = node.gp_ffts[1]; F110 = node.gp_ffts[2]
+    
+    if pp.use_full
+        # Full butterfly: build C₃-rotated copies for contiguous access
+        F100 = pp.F100; F010 = pp.F010; F101 = pp.F101; F011 = pp.F011
+        @inbounds for k in 1:M2_3, j in 1:M2_2, i in 1:M2_1
+            F100[i,j,k] = F001[j,k,i]; F010[i,j,k] = F001[k,i,j]
+            F101[i,j,k] = F110[k,i,j]; F011[i,j,k] = F110[j,k,i]
+        end
+        tw1x = pp.tw1x; tw1y = pp.tw1y; tw1z = pp.tw1z
+        @inbounds for l0 in 0:1, m0 in 0:1, n0 in 0:1
+            sx = (-1)^n0; sy = (-1)^m0; sz = (-1)^l0
+            for k in 1:M2_3
+                twz = tw1z[k] * sz
+                for j in 1:M2_2
+                    twy = tw1y[j] * sy; twyz = twy * twz
+                    for i in 1:M2_1
+                        twx = tw1x[i] * sx
+                        val = F000[i,j,k] + twz*F001[i,j,k] + twy*F010[i,j,k] + twx*F100[i,j,k] +
+                              twyz*F011[i,j,k] + twx*twz*F101[i,j,k] + twx*twy*F110[i,j,k] +
+                              twx*twyz*F111[i,j,k]
+                        result[i + n0*M2_1, j + m0*M2_2, k + l0*M2_3] = val
+                    end
+                end
+            end
+        end
+    else
+        # Pruned butterfly: inline C₃ rotation (no rotation copy needed)
+        # F100[i,j,k] = F001[j,k,i]   F010[i,j,k] = F001[k,i,j]
+        # F101[i,j,k] = F110[k,i,j]   F011[i,j,k] = F110[j,k,i]
+        pts = pp.pruned_pts
+        @inbounds for p in pts
+            ii = p.i1p1; jj = p.j1p1; kk = p.k1p1
+            twyz = p.twy * p.twz
+            val = F000[ii,jj,kk] + 
+                  p.twz * F001[ii,jj,kk] + 
+                  p.twy * F001[kk,ii,jj] +          # F010
+                  p.twx * F001[jj,kk,ii] +          # F100
+                  twyz * F110[jj,kk,ii] +            # F011
+                  p.twx*p.twz * F110[kk,ii,jj] +    # F101
+                  p.twx*p.twy * F110[ii,jj,kk] +
+                  p.twx*twyz * F111[ii,jj,kk]
+            result[p.oi, p.oj, p.ok] = val
         end
     end
 end
