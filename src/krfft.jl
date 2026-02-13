@@ -17,6 +17,7 @@ export fill_g0_butterfly!, reconstruct_from_g0!
 export plan_krfft_sparse, execute_sparse_krfft!, sparse_reconstruct!, detect_centering
 export plan_krfft_selective, execute_selective_krfft!
 export plan_krfft_g0asu, execute_g0asu_krfft!
+export plan_krfft_g0asu_general, execute_general_g0asu_krfft!, GeneralG0ASUPlan
 export plan_krfft_g0asu_backward, execute_g0asu_ikrfft!
 export FractalNode, FractalCFFTPlan, calc_asu_tree, build_recursive_tree
 export collect_leaves, collect_inner_nodes_bottomup, tree_summary

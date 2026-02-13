@@ -1035,9 +1035,12 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "G0 ASU KRFFT currently supports 3D only"
-    @assert has_cubic_p3c_symmetry(ops_shifted) "G0 ASU requires cubic symmetry (P3c body-diagonal 3-fold rotation). " *
-        "Non-cubic groups (tetragonal, orthorhombic, etc.) are not supported. " *
-        "Use plan_krfft_selective() or plan_krfft_sparse() instead."
+
+    # Auto-dispatch: cubic groups use optimized stride-4 path,
+    # all other groups use general stride-L path
+    if !has_cubic_p3c_symmetry(ops_shifted)
+        return plan_krfft_g0asu_general(spec_asu, ops_shifted)
+    end
 
     M = [N[d] ÷ 2 for d in 1:dim]
     M2 = [M[d] ÷ 2 for d in 1:dim]
@@ -1302,6 +1305,282 @@ function execute_g0asu_krfft!(plan::G0ASUPlan, spec_asu::SpectralIndexing,
         val += a8[base+6].weight * g0[a8[base+6].g0_idx]
         val += a8[base+7].weight * g0[a8[base+7].g0_idx]
         val += a8[base+8].weight * g0[a8[base+8].g0_idx]
+        out[h] = val
+    end
+
+    return plan.output_buffer
+end
+
+# ============================================================================
+# General G0 ASU — Single sub-grid + orbit reduction for all space groups
+# ============================================================================
+
+"""
+    GeneralPointWeights
+
+Precomputed reconstruction weights for evaluating F(h) at one spectral point.
+F(h) = Σ_{a ∈ parities} exp(-2πi h·t_a/N) · Y₀(R_a^T h mod M)
+Sums over ONE representative per parity class (max 8 = 2^3).
+"""
+struct GeneralPointWeights
+    fft_idx::NTuple{8, Int32}     # indices into single FFT flat buffer (≤ 8 parities)
+    tw::NTuple{8, ComplexF64}     # twiddle weights
+    n_active::Int8                # number of active parity classes (≤ 8)
+end
+
+"""
+    GeneralG0ASUPlan
+
+General G0 ASU plan supporting all space groups with auto-detected stride L.
+Uses single sub-grid FFT with orbit reduction under the residual point group.
+
+Pipeline:
+1. Pack identity sub-grid (stride L, offset 0)
+2. Single FFT on (N/L)^D grid → Y₀
+3. G0(q) = Σ_g exp(-2πi q·t_g/N) · Y₀(R_g^T q mod M) at orbit reps only
+4. A8 lookup → spectral ASU
+"""
+struct GeneralG0ASUPlan
+    sub_plan::Any                            # FFTW plan for (N/L)^D
+    buffer::Array{ComplexF64,3}              # input buffer (1 sub-grid)
+    work_fft::Array{ComplexF64,3}            # FFT output
+    fft_flat::Vector{ComplexF64}             # flat view of FFT output
+    output_buffer::Vector{ComplexF64}        # spectral ASU output
+
+    # G0 at orbit representatives
+    g0_weights::Vector{GeneralPointWeights}  # n_reps entries
+    g0_values::Vector{ComplexF64}            # n_reps G0 values
+
+    # A8 = map from spectral ASU to G0 values
+    a8_table::Vector{SelectiveG0Entry}       # n_a8_per_spec × n_spec
+    n_a8_per_spec::Int                       # =1 for this plan (direct G0→spec map)
+    n_spec::Int
+    n_reps::Int                              # G0 ASU size
+
+    # Layout
+    L::Vector{Int}
+    grid_N::Vector{Int}
+    subgrid_dims::Vector{Int}                # M = N .÷ L
+    n_ops::Int                               # total symmetry operations
+end
+
+"""
+    plan_krfft_g0asu_general(spec_asu, ops_shifted)
+
+Create a general G0 ASU plan using auto-detected stride L and orbit reduction.
+
+The plan packs ONLY the identity sub-grid (stride L, offset 0), performs a single FFT,
+then evaluates G0(q) = Σ_g exp(-2πi q·t_g/N) · Y₀(R_g^T q mod M) at orbit representative
+positions. Spectral ASU values are obtained by looking up G0 values with symmetry phases.
+
+Works for all space groups except P1 (which has |G|=1, no sub-grid relations).
+"""
+function plan_krfft_g0asu_general(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+    N = spec_asu.N
+    dim = length(N)
+    @assert dim == 3 "General G0 ASU currently supports 3D only"
+
+    L = auto_L(ops_shifted)
+    n_sub = prod(L)
+    if n_sub <= 1
+        @warn "No sub-grid reduction possible (P1). Falling back to plan_krfft_sparse."
+        return plan_krfft_sparse(spec_asu, ops_shifted)
+    end
+
+    M = [N[d] ÷ L[d] for d in 1:dim]
+    M_vol = prod(M)
+    @assert all(L .* M .== collect(N)) "Grid size N=$N not divisible by L=$L"
+
+    n_ops = length(ops_shifted)
+    n_spec = length(spec_asu.points)
+
+    # Step 1a: Collect parity class representatives (one op per parity)
+    subgrid_reps = Dict{NTuple{3,Int}, SymOp}()
+    for op in ops_shifted
+        t = round.(Int, op.t)
+        p = Tuple(mod.(t, L))
+        if !haskey(subgrid_reps, p)
+            subgrid_reps[p] = op
+        end
+    end
+    parity_list = sort(collect(keys(subgrid_reps)))
+    n_parities = length(parity_list)
+
+    # Step 1b: Residual PG (ops with zero parity)
+    zero_parity = Tuple(zeros(Int, dim))
+    rem_ops = SymOp[]
+    for op in ops_shifted
+        t = round.(Int, op.t)
+        p = Tuple(mod.(t, L))
+        if p == zero_parity
+            push!(rem_ops, op)
+        end
+    end
+    n_rem = length(rem_ops)
+
+    # Step 2: Collect G0 positions accessed via spectral ASU
+    # For each spectral point h, G0 access is at q = h mod M (single position, no rotation)
+    # because the full reconstruction is: F(h) = G0(h mod M)
+    # where G0(q) = Σ_g exp(-2πi h·t_g/N) Y₀(R_g^T h mod M) already handles all ops
+    #
+    # Actually: the A8 layer maps h → q = h mod M with a twiddle.
+    # But here we skip A8 and compute F(h) directly from the single FFT.
+    # F(h) = Σ_g exp(-2πi h·t_g/N) · Y₀(R_g^T h mod M)
+
+    # Collect unique (q_direct) positions = {h mod M : h ∈ spectral ASU}
+    spec_q = Vector{Int}(undef, n_spec)  # q = h mod M for each spectral point
+    g0_pos_set = Set{Int}()
+
+    for (h_idx, _) in enumerate(spec_asu.points)
+        h_vec = get_k_vector(spec_asu, h_idx)
+        q = [mod(h_vec[d], M[d]) for d in 1:dim]
+        q_lin = 1 + q[1] + M[1]*q[2] + M[1]*M[2]*q[3]
+        spec_q[h_idx] = q_lin
+        push!(g0_pos_set, q_lin)
+    end
+
+    # Step 3: Orbit reduction under residual PG
+    g0_to_rep = Dict{Int, Int}()
+    g0_to_phase = Dict{Int, ComplexF64}()
+
+    for start_lin in g0_pos_set
+        haskey(g0_to_rep, start_lin) && continue
+
+        lin0 = start_lin - 1
+        sq = [mod(lin0, M[1]), mod(div(lin0, M[1]), M[2]), div(lin0, M[1]*M[2])]
+
+        orbit = Dict{Int, Tuple{Vector{Int}, ComplexF64}}()
+        orbit[start_lin] = (sq, complex(1.0))
+        worklist = [(copy(sq), complex(1.0))]
+
+        while !isempty(worklist)
+            q_vec, q_phase = pop!(worklist)
+            for op in rem_ops
+                rq = [mod(sum(Int(op.R[d2, d1]) * q_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
+                rlin = 1 + rq[1] + M[1]*rq[2] + M[1]*M[2]*rq[3]
+                if !haskey(orbit, rlin) && rlin in g0_pos_set
+                    t_sub = round.(Int, op.t) .÷ L
+                    sym_phase = cispi(-2 * sum(q_vec[d] * t_sub[d] / M[d] for d in 1:dim))
+                    new_phase = sym_phase * q_phase
+                    orbit[rlin] = (rq, new_phase)
+                    push!(worklist, (copy(rq), new_phase))
+                end
+            end
+        end
+
+        rep_lin = minimum(keys(orbit))
+        rep_phase = orbit[rep_lin][2]
+        for (member_lin, (_, member_phase)) in orbit
+            g0_to_rep[member_lin] = rep_lin
+            g0_to_phase[member_lin] = member_phase / rep_phase
+        end
+    end
+
+    # Build compact index
+    reps = sort(collect(Set(values(g0_to_rep))))
+    rep_to_compact = Dict{Int, Int}()
+    for (i, r) in enumerate(reps)
+        rep_to_compact[r] = i
+    end
+    n_reps = length(reps)
+
+    # Step 4: Build A8 table (spectral ASU → G0 compact)
+    # Each spectral point h maps to G0(h mod M) with phase from orbit reduction
+    a8_table = Vector{SelectiveG0Entry}(undef, n_spec)
+    for h_idx in 1:n_spec
+        q_lin = spec_q[h_idx]
+        rep_lin = g0_to_rep[q_lin]
+        sym_phase = g0_to_phase[q_lin]
+        compact_idx = rep_to_compact[rep_lin]
+        a8_table[h_idx] = SelectiveG0Entry(Int32(compact_idx), sym_phase)
+    end
+
+    # Step 5: Build per-spectral weights using ONE representative per parity class
+    # F(h) = Σ_{a ∈ parities} exp(-2πi h·t_a/N) · Y₀(R_a^T h mod M)
+    # This avoids overcounting from multiple ops sharing the same parity.
+
+    g0_weights = Vector{GeneralPointWeights}(undef, n_spec)
+    for (h_idx, _) in enumerate(spec_asu.points)
+        h_vec = get_k_vector(spec_asu, h_idx)
+        fft_idx = zeros(Int32, 8)
+        tw = zeros(ComplexF64, 8)
+
+        for (a_idx, parity) in enumerate(parity_list)
+            op = subgrid_reps[parity]
+            # R_a^T h mod M
+            rh = [mod(sum(Int(op.R[d2, d1]) * h_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
+            rh_lin = 1 + rh[1] + M[1]*rh[2] + M[1]*M[2]*rh[3]
+            fft_idx[a_idx] = Int32(rh_lin)
+
+            # Phase: exp(-2πi h·t_a/N)
+            phase = sum(h_vec[d] * op.t[d] / N[d] for d in 1:dim)
+            tw[a_idx] = cispi(-2 * phase)
+        end
+
+        g0_weights[h_idx] = GeneralPointWeights(
+            NTuple{8,Int32}(fft_idx), NTuple{8,ComplexF64}(tw), Int8(n_parities)
+        )
+    end
+
+    n_accessed = length(g0_pos_set)
+    pct_q = round(100 * n_accessed / M_vol, digits=1)
+    @info "General G0 ASU plan: L=$L, n_parities=$n_parities, n_ops=$n_ops, n_spec=$n_spec, |Q|=$n_accessed ($pct_q% of M^3), |G_rem|=$n_rem"
+
+    # Step 6: Allocate
+    M_tuple = Tuple(M)
+    buffer = zeros(ComplexF64, M_tuple)
+    work_fft = zeros(ComplexF64, M_tuple)
+    fft_flat = zeros(ComplexF64, M_vol)
+    sub_plan = plan_fft(buffer)
+    output_buffer = zeros(ComplexF64, n_spec)
+    g0_values = zeros(ComplexF64, n_spec)  # actually per-spec, not orbit reps
+
+    return GeneralG0ASUPlan(
+        sub_plan, buffer, work_fft, fft_flat, output_buffer,
+        g0_weights, g0_values,
+        a8_table, 1, n_spec, n_spec,
+        L, collect(N), M, n_parities
+    )
+end
+
+"""
+    execute_general_g0asu_krfft!(plan::GeneralG0ASUPlan, spec_asu, u)
+
+Execute general G0 ASU cascade:
+1. Pack identity sub-grid at stride L
+2. Single FFT on (N/L)^D grid
+3. Reconstruct F(h) = Σ_g tw_g · Y₀[R_g^T h mod M] per spectral point
+"""
+function execute_general_g0asu_krfft!(plan::GeneralG0ASUPlan, spec_asu::SpectralIndexing,
+                                      u::AbstractArray{<:Real})
+    M = plan.subgrid_dims
+    L = plan.L
+
+    # 1. Pack identity sub-grid (stride L, offset 0)
+    buf = plan.buffer
+    @inbounds for k in 1:M[3], j in 1:M[2], i in 1:M[1]
+        buf[i,j,k] = complex(u[L[1]*(i-1)+1, L[2]*(j-1)+1, L[3]*(k-1)+1])
+    end
+
+    # 2. Single FFT
+    mul!(plan.work_fft, plan.sub_plan, buf)
+
+    # 3. Flatten FFT output
+    fft = plan.fft_flat
+    copyto!(fft, 1, vec(plan.work_fft), 1, prod(M))
+
+    # 4. Reconstruct each spectral point
+    out = plan.output_buffer
+    weights = plan.g0_weights
+    n_spec = plan.n_spec
+
+    @inbounds for h in 1:n_spec
+        pw = weights[h]
+        val = zero(ComplexF64)
+        na = pw.n_active
+        for s in 1:na
+            val += pw.tw[s] * fft[pw.fft_idx[s]]
+        end
         out[h] = val
     end
 
