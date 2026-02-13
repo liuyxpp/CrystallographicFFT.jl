@@ -95,10 +95,30 @@ function find_optimal_shift(ops::Vector{SymOp}, N::Tuple)
     valid, deltas = check_shift_invariance(ops, shift, N)
     if valid
         best_ops = [SymOp(op.R, op.t .+ deltas[i]) for (i, op) in enumerate(ops)]
-        return shift, best_ops
     else
-        return zeros(Float64, D), ops
+        shift = zeros(Float64, D)
+        best_ops = ops
     end
+    
+    # Half-integer shift: b = 0.5 grid spacing (shift = 0.5/N per dimension).
+    # For reflections R_ii = -1, this adds delta_i = -1 to translations, making
+    # even translations odd. This enables auto_L to detect reflections/glides
+    # (17 space groups benefit, e.g. Fddd: [1,1,1] → [2,2,2]).
+    # Must be evaluated at actual N since parity effects are N-dependent.
+    shift_half = fill(0.5, D) ./ collect(N)
+    valid_half, deltas_half = check_shift_invariance(ops, shift_half, N)
+    if valid_half
+        ops_half = [SymOp(op.R, op.t .+ deltas_half[i]) for (i, op) in enumerate(ops)]
+        # Inline L-product check: count dimensions with any odd translation
+        L_prod_half = prod(d -> any(isodd(round(Int, op.t[d])) for op in ops_half) ? 2 : 1, 1:D)
+        L_prod_best = prod(d -> any(isodd(round(Int, op.t[d])) for op in best_ops) ? 2 : 1, 1:D)
+        if L_prod_half > L_prod_best
+            shift = shift_half
+            best_ops = ops_half
+        end
+    end
+    
+    return shift, best_ops
 end
 
 """
