@@ -25,4 +25,8 @@ using CrystallographicFFT
     @testset "G0 ASU Backward Transform" begin
         include("test_g0_asu_backward.jl")
     end
+
+    @testset "Centering Fold on Stride-2 Subgrid" begin
+        include("test_centering_fold.jl")
+    end
 end

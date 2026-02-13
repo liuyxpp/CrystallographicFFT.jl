@@ -8,7 +8,8 @@ using SparseArrays
 using ..ASU: CrystallographicASU, ASUBlock
 using ..ASU
 using ..SpectralIndexing: SpectralIndexing, get_k_vector
-using ..SymmetryOps: SymOp, apply_op!
+using ..SymmetryOps: SymOp, apply_op!, CenteringType, CentP, CentC, CentA, CentI, CentF
+using ..SymmetryOps: detect_centering_type
 
 export GeneralCFFTPlan, map_fft!, map_ifft!, build_recombination_map, plan_krfft
 export fast_reconstruct!, pack_stride!, execute_krfft!, ReconEntry, fft_reconstruct!
@@ -24,6 +25,9 @@ export FractalNode, FractalCFFTPlan, calc_asu_tree, build_recursive_tree
 export collect_leaves, collect_inner_nodes_bottomup, tree_summary
 export plan_fractal_krfft, execute_fractal_krfft!
 export OptimizedFractalPlan, plan_fractal_krfft_v2, execute_fractal_krfft_v2!
+export SubgridCenteringFoldPlan, CenteredKRFFTPlan
+export plan_krfft_centered, execute_centered_krfft!, fft_reconstruct_centered!
+export plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
 
 
 """
@@ -903,6 +907,7 @@ include("recursive_blocks_backward.jl")
 include("fractal_krfft.jl")
 include("fractal_krfft_v3.jl")
 include("centering_prefold.jl")
+include("centering_fold.jl")
 
 
 end
