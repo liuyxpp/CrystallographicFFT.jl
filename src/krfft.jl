@@ -902,6 +902,7 @@ include("recursive_blocks.jl")
 include("recursive_blocks_backward.jl")
 include("fractal_krfft.jl")
 include("fractal_krfft_v3.jl")
+include("centering_prefold.jl")
 
 
 end

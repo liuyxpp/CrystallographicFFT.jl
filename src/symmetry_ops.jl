@@ -4,6 +4,8 @@ using LinearAlgebra
 using Crystalline
 
 export SymOp, apply_op, apply_op!, get_ops, convert_op, check_shift_invariance, dual_ops
+export CenteringType, CentP, CentC, CentA, CentI, CentF
+export detect_centering_type, strip_centering
 
 struct SymOp
     R::Matrix{Int}
@@ -94,6 +96,116 @@ function dual_ops(ops::Vector{SymOp})
         push!(dual, SymOp(collect(R_dual), t_dual))
     end
     return dual
+end
+
+# ============================================================================
+# Centering Type Detection & Stripping
+# ============================================================================
+
+"""
+    CenteringType
+
+Enumeration of Bravais lattice centering types.
+"""
+@enum CenteringType CentP CentC CentA CentI CentF
+
+"""
+    detect_centering_type(ops::Vector{SymOp}, N::Tuple) → CenteringType
+
+Detect lattice centering from symmetry operations by identifying
+pure translations (R = I) with half-cell translation vectors.
+
+Recognizes: P (primitive), C (ab-face), A (bc-face), I (body), F (all-face).
+"""
+function detect_centering_type(ops::Vector{SymOp}, N::Tuple)
+    dim = length(N)
+    I_mat = Matrix{Int}(I, dim, dim)
+
+    # Collect fractional translation vectors of pure translations
+    pure_translations = NTuple{3,Bool}[]
+
+    for op in ops
+        # Check if R is identity
+        op.R != I_mat && continue
+        all(abs.(op.t) .< 0.1) && continue  # skip zero translation
+
+        # Classify each component as ~N/2 or ~0
+        halves = ntuple(dim) do d
+            t_frac = abs(op.t[d]) / N[d]
+            abs(t_frac - 0.5) < 0.01
+        end
+        push!(pure_translations, halves)
+    end
+
+    isempty(pure_translations) && return CentP
+
+    has_xyz = any(t -> all(t), pure_translations)  # (½,½,½)
+    has_0yz = any(t -> !t[1] && t[2] && t[3], pure_translations)  # (0,½,½)
+    has_x0z = any(t -> t[1] && !t[2] && t[3], pure_translations)  # (½,0,½)
+    has_xy0 = any(t -> t[1] && t[2] && !t[3], pure_translations)  # (½,½,0)
+
+    # F-centering: has at least 2 of {(0,½,½), (½,0,½), (½,½,0)}
+    n_face = has_0yz + has_x0z + has_xy0
+    n_face >= 2 && return CentF
+
+    # I-centering: (½,½,½)
+    has_xyz && return CentI
+
+    # C-centering: (½,½,0) only
+    has_xy0 && return CentC
+
+    # A-centering: (0,½,½) only
+    has_0yz && return CentA
+
+    # B-centering (½,0,½) — rare, treated similarly
+    has_x0z && return CentA
+
+    return CentP
+end
+
+"""
+    strip_centering(ops::Vector{SymOp}, centering::CenteringType, N::Tuple)
+        → (ops_sub::Vector{SymOp}, N_sub::Tuple)
+
+Remove centering translations from ops and remap to the half-grid.
+
+Returns unique point-group operations on the sub-grid `N_sub = N .÷ 2`
+(in centered dimensions), with translations reduced `mod N_sub`.
+
+The returned ops are suitable for `plan_krfft` on the sub-grid.
+"""
+function strip_centering(ops::Vector{SymOp}, centering::CenteringType, N::Tuple)
+    dim = length(N)
+
+    # Determine which dimensions are halved
+    halve = if centering == CentI || centering == CentF
+        ntuple(_ -> true, dim)   # all dimensions halved
+    elseif centering == CentC
+        ntuple(d -> d <= 2, dim) # x,y halved, z kept
+    elseif centering == CentA
+        ntuple(d -> d >= 2, dim) # y,z halved, x kept
+    else
+        ntuple(_ -> false, dim)  # CentP: nothing halved
+    end
+
+    N_sub = ntuple(dim) do d
+        halve[d] ? N[d] ÷ 2 : N[d]
+    end
+
+    # Map each op to sub-grid coordinates: t_sub = mod(t, N_sub)
+    seen = Set{Tuple{Matrix{Int}, Vector{Int}}}()
+    ops_sub = SymOp[]
+
+    for op in ops
+        t_sub = [mod(op.t[d], N_sub[d]) for d in 1:dim]
+        key = (op.R, t_sub)
+        if !(key in seen)
+            push!(seen, key)
+            push!(ops_sub, SymOp(op.R, t_sub))
+        end
+    end
+
+    return ops_sub, N_sub
 end
 
 end
