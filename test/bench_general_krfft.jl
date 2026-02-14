@@ -150,10 +150,14 @@ function run_benchmarks()
         (25,  "Pmm2",     "orthorhombic"),  # |G|=4,  L=(2,2,1)
         (16,  "P222",     "orthorhombic"),  # |G|=4,  L=(2,2,1)
         (70,  "Fddd",     "orthorhombic"),  # |G|=32, L=(2,2,2), F-centering
+        (63,  "Cmcm",     "orthorhombic"),  # |G|=16, L=(2,2,2), C-centering
+        (72,  "Ibam",     "orthorhombic"),  # |G|=16, L=(2,2,2), I-centering
+        (74,  "Imma",     "orthorhombic"),  # |G|=16, L=(2,2,2), I-centering
 
         # --- Tetragonal ---
         (123, "P4/mmm",   "tetragonal"),    # |G|=16, L=(2,2,2)
         (136, "P42/mnm",  "tetragonal"),    # |G|=16, L=(2,2,2)
+        (139, "I4/mmm",   "tetragonal"),    # |G|=32, L=(2,2,2), I-centering
 
         # --- Cubic ---
         (200, "Pm-3",     "cubic"),         # |G|=24, L=(2,2,2)

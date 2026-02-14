@@ -35,6 +35,8 @@ then FFT-ing each channel and assembling the non-zero entries of G₀.
 - `channel_bufs`: pre-allocated H³ complex buffers for folded data
 - `channel_fft_plans`: FFTW plans for each channel
 - `channel_fft_out`: pre-allocated H³ complex buffers for FFT output
+- `twiddle_1d`: precomputed 1D twiddle tables, `twiddle_1d[c][d][n+1]`
+- `sign_table`: precomputed 8-element sign arrays per channel
 """
 struct SubgridCenteringFoldPlan
     centering::CenteringType
@@ -45,6 +47,8 @@ struct SubgridCenteringFoldPlan
     channel_bufs::Vector{Array{ComplexF64,3}}
     channel_fft_plans::Vector{FFTW.cFFTWPlan{ComplexF64,-1,false,3,UnitRange{Int64}}}
     channel_fft_out::Vector{Array{ComplexF64,3}}
+    twiddle_1d::Vector{NTuple{3,Vector{ComplexF64}}}  # [channel][dim][n+1]
+    sign_table::Vector{NTuple{8,Int}}                  # [channel][(ez*4+ey*2+ex)+1]
 end
 
 """
@@ -63,8 +67,38 @@ function plan_centering_fold(centering::CenteringType, M::NTuple{3,Int})
     channel_fft_out = [zeros(ComplexF64, H...) for _ in 1:n_ch]
     channel_fft_plans = [plan_fft(channel_bufs[c], 1:3) for c in 1:n_ch]
 
+    # P1: Precompute separable 1D twiddle tables
+    # tw_d[n+1] = cispi(-2 * off_d * n / M_d) for n in 0:H_d-1
+    twiddle_1d = Vector{NTuple{3,Vector{ComplexF64}}}(undef, n_ch)
+    for c in 1:n_ch
+        off = offsets[c]
+        tw = ntuple(3) do d
+            if off[d] == 0
+                ones(ComplexF64, H[d])
+            else
+                [cispi(-2 * off[d] * n / M[d]) for n in 0:H[d]-1]
+            end
+        end
+        twiddle_1d[c] = tw
+    end
+
+    # P5: Precompute sign table per channel
+    # signs[(ez*4+ey*2+ex)+1] = (-1)^(off·ε)
+    sign_table = Vector{NTuple{8,Int}}(undef, n_ch)
+    for c in 1:n_ch
+        off = offsets[c]
+        signs = ntuple(8) do idx
+            ex = (idx - 1) & 1
+            ey = ((idx - 1) >> 1) & 1
+            ez = ((idx - 1) >> 2) & 1
+            1 - 2 * ((off[1]*ex + off[2]*ey + off[3]*ez) & 1)
+        end
+        sign_table[c] = signs
+    end
+
     return SubgridCenteringFoldPlan(centering, M, H, n_ch, offsets,
-        channel_bufs, channel_fft_plans, channel_fft_out)
+        channel_bufs, channel_fft_plans, channel_fft_out,
+        twiddle_1d, sign_table)
 end
 
 """
@@ -96,29 +130,125 @@ end
 Fold the subgrid f₀ into n_channels alias-folded channels on H³.
 Each channel c gets:
   g_off(n₀) = Σ_{ε∈{0,1}³} (-1)^(off·ε) · f₀(n₀ + H·ε) · twiddle(off, n₀)
+
+For 4-channel centering (I/C/A), uses a fused single-pass Walsh-Hadamard
+butterfly to compute all sign sums in 24 add/sub (vs 60 per-channel),
+reading f₀ only once instead of 4 times.
 """
 function centering_fold!(plan::SubgridCenteringFoldPlan,
                           f0::AbstractArray{<:Real,3})
+    if plan.n_channels == 4
+        _centering_fold_4ch!(plan, f0)
+    else
+        _centering_fold_2ch!(plan, f0)
+    end
+end
+
+"""
+2-channel kernel for F-centering: channel 0 (sum) + channel 1 (1,1,1) with twiddle.
+"""
+function _centering_fold_2ch!(plan::SubgridCenteringFoldPlan,
+                               f0::AbstractArray{<:Real,3})
     H1, H2, H3 = plan.H
-    M1, M2, M3 = plan.M
+    buf0 = plan.channel_bufs[1]
+    buf1 = plan.channel_bufs[2]
+    tw1, tw2, tw3 = plan.twiddle_1d[2]
+    signs = plan.sign_table[2]
 
-    @inbounds for c in 1:plan.n_channels
-        off = plan.offsets[c]
-        buf = plan.channel_bufs[c]
+    @inbounds for iz in 0:H3-1
+        tw_z = tw3[iz+1]
+        for iy in 0:H2-1
+            tw_yz = tw2[iy+1] * tw_z
+            for ix in 0:H1-1
+                v000 = f0[ix+1,     iy+1,     iz+1]
+                v100 = f0[ix+H1+1,  iy+1,     iz+1]
+                v010 = f0[ix+1,     iy+H2+1,  iz+1]
+                v110 = f0[ix+H1+1,  iy+H2+1,  iz+1]
+                v001 = f0[ix+1,     iy+1,     iz+H3+1]
+                v101 = f0[ix+H1+1,  iy+1,     iz+H3+1]
+                v011 = f0[ix+1,     iy+H2+1,  iz+H3+1]
+                v111 = f0[ix+H1+1,  iy+H2+1,  iz+H3+1]
 
-        for iz in 0:H3-1, iy in 0:H2-1, ix in 0:H1-1
-            # 8-alias sum with centering simplification
-            val = ComplexF64(0)
-            for ez in 0:1, ey in 0:1, ex in 0:1
-                sgn = 1 - 2 * ((off[1]*ex + off[2]*ey + off[3]*ez) & 1)
-                val += sgn * f0[ix + ex*H1 + 1, iy + ey*H2 + 1, iz + ez*H3 + 1]
+                buf0[ix+1, iy+1, iz+1] = v000+v100+v010+v110+v001+v101+v011+v111
+
+                val1 = (signs[1]*v000 + signs[2]*v100 +
+                        signs[3]*v010 + signs[4]*v110 +
+                        signs[5]*v001 + signs[6]*v101 +
+                        signs[7]*v011 + signs[8]*v111)
+                buf1[ix+1, iy+1, iz+1] = val1 * (tw1[ix+1] * tw_yz)
             end
-            # Twiddle factor: exp(-2πi off·n/M)
-            if off == (0,0,0)
-                buf[ix+1, iy+1, iz+1] = val
-            else
-                tw = cispi(-2 * (off[1]*ix/M1 + off[2]*iy/M2 + off[3]*iz/M3))
-                buf[ix+1, iy+1, iz+1] = val * tw
+        end
+    end
+end
+
+"""
+4-channel fused WHT kernel for I/C/A centering.
+
+Reads 8 f₀ aliases ONCE per spatial point and computes all 8 Walsh-Hadamard
+coefficients via a 3-stage butterfly (24 add/sub). Then selects the 4 alive
+channels by precomputed WHT index mapping and applies separable twiddle.
+"""
+function _centering_fold_4ch!(plan::SubgridCenteringFoldPlan,
+                               f0::AbstractArray{<:Real,3})
+    H1, H2, H3 = plan.H
+    buf1 = plan.channel_bufs[1]
+    buf2 = plan.channel_bufs[2]
+    buf3 = plan.channel_bufs[3]
+    buf4 = plan.channel_bufs[4]
+
+    # WHT index: offset (o1,o2,o3) → index o1+o2*2+o3*4+1 in the WHT tuple
+    # (o1 varies fastest because stage-1 butterfly is over ε₁)
+    off2 = plan.offsets[2]; idx2 = off2[1] + off2[2]*2 + off2[3]*4 + 1
+    off3 = plan.offsets[3]; idx3 = off3[1] + off3[2]*2 + off3[3]*4 + 1
+    off4 = plan.offsets[4]; idx4 = off4[1] + off4[2]*2 + off4[3]*4 + 1
+
+    tw1_2, tw2_2, tw3_2 = plan.twiddle_1d[2]
+    tw1_3, tw2_3, tw3_3 = plan.twiddle_1d[3]
+    tw1_4, tw2_4, tw3_4 = plan.twiddle_1d[4]
+
+    @inbounds for iz in 0:H3-1
+        tz2 = tw3_2[iz+1]; tz3 = tw3_3[iz+1]; tz4 = tw3_4[iz+1]
+        for iy in 0:H2-1
+            tyz2 = tw2_2[iy+1] * tz2
+            tyz3 = tw2_3[iy+1] * tz3
+            tyz4 = tw2_4[iy+1] * tz4
+            for ix in 0:H1-1
+                # ── Read 8 f₀ aliases ONCE ──
+                v000 = f0[ix+1,     iy+1,     iz+1]
+                v100 = f0[ix+H1+1,  iy+1,     iz+1]
+                v010 = f0[ix+1,     iy+H2+1,  iz+1]
+                v110 = f0[ix+H1+1,  iy+H2+1,  iz+1]
+                v001 = f0[ix+1,     iy+1,     iz+H3+1]
+                v101 = f0[ix+H1+1,  iy+1,     iz+H3+1]
+                v011 = f0[ix+1,     iy+H2+1,  iz+H3+1]
+                v111 = f0[ix+H1+1,  iy+H2+1,  iz+H3+1]
+
+                # ── 3-stage WHT butterfly (24 add/sub) ──
+                # Stage 1: transform over ε₁
+                a0_00 = v000 + v100;  a1_00 = v000 - v100
+                a0_10 = v010 + v110;  a1_10 = v010 - v110
+                a0_01 = v001 + v101;  a1_01 = v001 - v101
+                a0_11 = v011 + v111;  a1_11 = v011 - v111
+                # Stage 2: transform over ε₂
+                b00_0 = a0_00 + a0_10;  b01_0 = a0_00 - a0_10
+                b10_0 = a1_00 + a1_10;  b11_0 = a1_00 - a1_10
+                b00_1 = a0_01 + a0_11;  b01_1 = a0_01 - a0_11
+                b10_1 = a1_01 + a1_11;  b11_1 = a1_01 - a1_11
+                # Stage 3: transform over ε₃ → WHT coefficients c_{o1,o2,o3}
+                wht = (b00_0 + b00_1,   # c₀₀₀  idx=1
+                       b10_0 + b10_1,   # c₁₀₀  idx=2
+                       b01_0 + b01_1,   # c₀₁₀  idx=3
+                       b11_0 + b11_1,   # c₁₁₀  idx=4
+                       b00_0 - b00_1,   # c₀₀₁  idx=5
+                       b10_0 - b10_1,   # c₁₀₁  idx=6
+                       b01_0 - b01_1,   # c₀₁₁  idx=7
+                       b11_0 - b11_1)   # c₁₁₁  idx=8
+
+                # ── Write alive channels ──
+                buf1[ix+1, iy+1, iz+1] = wht[1]  # (0,0,0): no twiddle
+                buf2[ix+1, iy+1, iz+1] = wht[idx2] * (tw1_2[ix+1] * tyz2)
+                buf3[ix+1, iy+1, iz+1] = wht[idx3] * (tw1_3[ix+1] * tyz3)
+                buf4[ix+1, iy+1, iz+1] = wht[idx4] * (tw1_4[ix+1] * tyz4)
             end
         end
     end
@@ -180,6 +310,7 @@ struct CenteredKRFFTPlan
     krfft_plan::GeneralCFFTPlan          # inner KRFFT plan
     fold_plan::SubgridCenteringFoldPlan  # centering fold plan
     f0_buffer::Array{Float64,3}          # M³ real buffer for stride-2 subgrid
+    G0_view::Array{ComplexF64,3}         # pre-stored reshape of work_buffer
 end
 
 """
@@ -227,7 +358,10 @@ function plan_krfft_centered(spec_asu::SpectralIndexing, ops_shifted::Vector{Sym
     # Allocate f₀ buffer
     f0_buffer = zeros(Float64, M_sub...)
 
-    return CenteredKRFFTPlan(krfft_plan, fold_plan, f0_buffer)
+    # P3: Pre-store G0 reshape view (avoids runtime Tuple(Vector{Int}) type instability)
+    G0_view = reshape(krfft_plan.work_buffer, M_sub)
+
+    return CenteredKRFFTPlan(krfft_plan, fold_plan, f0_buffer, G0_view)
 end
 
 """
@@ -267,9 +401,8 @@ function execute_centered_krfft!(plan::CenteredKRFFTPlan,
     # 3. FFT each channel
     fft_channels!(fold)
 
-    # 4. Assemble G₀ into the KRFFT work_buffer
-    G0_view = reshape(krfft.work_buffer, Tuple(krfft.subgrid_dims))
-    assemble_G0!(G0_view, fold)
+    # 4. Assemble G₀ into the KRFFT work_buffer (pre-stored view)
+    assemble_G0!(plan.G0_view, fold)
 
     # 5. Reconstruct spectral ASU from G₀
     fast_reconstruct!(krfft)
@@ -289,8 +422,7 @@ function fft_reconstruct_centered!(plan::CenteredKRFFTPlan)
 
     centering_fold!(fold, plan.f0_buffer)
     fft_channels!(fold)
-    G0_view = reshape(krfft.work_buffer, Tuple(krfft.subgrid_dims))
-    assemble_G0!(G0_view, fold)
+    assemble_G0!(plan.G0_view, fold)
     fast_reconstruct!(krfft)
 
     return krfft.output_buffer
