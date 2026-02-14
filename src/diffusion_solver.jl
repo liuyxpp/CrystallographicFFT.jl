@@ -7,8 +7,10 @@ using ..ASU
 using ..SpectralIndexing
 using ..MatrixQ
 using ..KRFFT: GeneralCFFTPlan, map_fft!, map_ifft!, plan_krfft, flatten_to_buffer!, unflatten_from_buffer!
+using ..QFusedKRFFT: M2QPlan, plan_m2_q, execute_m2_q!, fullgrid_to_subgrid!, subgrid_to_fullgrid!
 
-export AbstractDiffusionSolver, MatrixDiffusionSolver, KRFFTDiffusionSolver, plan_diffusion, step_diffusion!, apply_diffusion_operator!
+export AbstractDiffusionSolver, MatrixDiffusionSolver, KRFFTDiffusionSolver, QFusedDiffusionSolver
+export plan_diffusion, step_diffusion!, apply_diffusion_operator!
 
 abstract type AbstractDiffusionSolver end
 
@@ -66,6 +68,26 @@ function apply_diffusion_operator!(solver::MatrixDiffusionSolver, u_real::Vector
      u_spec = solver.Q * u_spec
      u_temp = solver.M * u_spec
      @. u_real = real(u_temp)
+end
+
+# =========================================================================
+# 1b. Q-Fused Diffusion Solver (ASU-native, O(M³ log M + d·M³))
+# =========================================================================
+"""
+    QFusedDiffusionSolver
+
+ASU-native diffusion solver using the M2 Q-fused kernel.
+Operates entirely on stride-L subgrid data (M³ = N³/∏L).
+"""
+struct QFusedDiffusionSolver{D, FP, IP} <: AbstractDiffusionSolver
+    plan::M2QPlan{D, FP, IP}
+    f0::Array{Float64}  # subgrid work buffer (M₁×M₂×M₃)
+end
+
+function apply_diffusion_operator!(solver::QFusedDiffusionSolver, u_subgrid::AbstractArray{<:Real})
+    copyto!(solver.f0, u_subgrid)
+    execute_m2_q!(solver.plan, solver.f0)
+    copyto!(u_subgrid, solver.f0)
 end
 
 # =========================================================================
@@ -218,8 +240,14 @@ function plan_diffusion(N::Tuple, lattice::AbstractMatrix, sg_num::Int, dim::Int
         u_spec_buf = zeros(ComplexF64, length(spec_asu.points))
         
         return KRFFTDiffusionSolver(real_asu, spec_asu, Q, plan, weights_asu, u_spec_buf)
+    elseif method == :qfused
+        # Q-fused solver: operates on stride-L subgrid data (M³)
+        qplan = plan_m2_q(N, sg_num, dim, Δs, lattice)
+        M = Tuple(qplan.M)
+        f0_buf = zeros(Float64, M)
+        return QFusedDiffusionSolver(qplan, f0_buf)
     else
-        error("Unknown method: $method")
+        error("Unknown method: $method. Supported: :matrix, :krfft, :qfused")
     end
 end
 
