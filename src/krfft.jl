@@ -31,6 +31,7 @@ export plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
 export ifft_channels!, centering_unfold!, disassemble_G0!
 export CenteredKRFFTBackwardPlan, InvReconEntry
 export plan_centered_ikrfft, execute_centered_ikrfft!, ifft_unrecon_centered!
+export M2BackwardPlan, plan_m2_backward, execute_m2_backward!
 
 
 """
@@ -904,6 +905,388 @@ function flatten_to_buffer!(buffer::AbstractVector, asu::CrystallographicASU)
 end
 function unflatten_from_buffer!(asu::CrystallographicASU, buffer::AbstractVector)
 end
+
+# ============================================================================
+# M2 Backward Transform (Inverse of General KRFFT)
+# ============================================================================
+#
+# Mathematical basis (per-fiber inverse butterfly):
+#   Forward: F̂(h) = Σ_a w_a(h) · Y₀(R_aᵀ h mod M)
+#   Backward: Y₀(q) = Σ_a B⁻¹[0,a](q) · F_full(h_a)
+#   where h_a are the d full-grid frequencies in fiber q.
+#
+# Since n_active=1, we only need B⁻¹'s first row per fiber.
+
+"""
+    InvReconEntry
+
+Precomputed inverse reconstruction info for one (subgrid_freq, fiber_member) pair.
+Combines B⁻¹ coefficient with spectral ASU mapping phase.
+"""
+struct InvReconEntry
+    spec_idx::Int32        # Index into spectral ASU (1-based)
+    weight::ComplexF64     # Combined B⁻¹ coefficient × symmetry/Hermitian phase
+    conj_flag::Bool        # If true, conjugate F_spec[spec_idx] before multiplying
+end
+
+"""
+    M2BackwardPlan
+
+Plan for the M2 backward transform (inverse of General KRFFT).
+Precomputed inverse reconstruction table enables efficient spectral ASU → subgrid IFFT.
+"""
+struct M2BackwardPlan
+    # Inverse reconstruction table: (d, prod(M))
+    inv_recon_table::Matrix{InvReconEntry}
+    d::Int                                   # fiber length = prod(L)
+
+    # IFFT
+    ifft_plan::Any                           # FFTW plan for M-grid
+    Y_buf::Vector{ComplexF64}                # M³ complex buffer (inv_recon output / IFFT input)
+    f0_buf::Vector{ComplexF64}               # M³ complex buffer (IFFT output)
+
+    # Grid metadata
+    L::Vector{Int}
+    subgrid_dims::Vector{Int}                # M = N/L
+    grid_N::Vector{Int}                      # N
+
+    # Pmmm separable fast path data
+    is_separable::Bool
+    inv_phase_factors::Vector{Vector{ComplexF64}}  # 1D inverse twiddle factors
+end
+
+"""
+    plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}) -> M2BackwardPlan
+
+Construct the M2 backward plan by building the inverse reconstruction table.
+
+For each subgrid frequency q ∈ [0,M)^D:
+1. Enumerate the d full-grid frequencies in the fiber
+2. Build the d×d butterfly matrix B(q)
+3. Compute B⁻¹'s first row
+4. Map each full-grid frequency to spectral ASU (via symmetry/Hermitian)
+5. Store combined weight = B⁻¹ coeff × symmetry phase
+"""
+function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+    N = spec_asu.N
+    dim = length(N)
+    N_vec = collect(N)
+
+    # 1. Auto-determine L and M (same as forward)
+    L = auto_L(ops_shifted)
+    M_sub = [N[d] ÷ L[d] for d in 1:dim]
+
+    if any(L .* M_sub .!= N_vec)
+        error("Grid size N=$N not divisible by auto L=$L.")
+    end
+
+    # 2. Select representative ops per subgrid (same logic as plan_krfft)
+    subgrid_reps = Dict{Vector{Int}, SymOp}()
+    subgrid_quality = Dict{Vector{Int}, Int}()
+
+    for op in ops_shifted
+        t = round.(Int, op.t)
+        x0 = [mod(t[d], L[d]) for d in 1:dim]
+        is_diag = all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j)
+        simple_t = all(mod(t[d], N[d]) ∈ (0, N[d]-1) for d in 1:dim)
+        quality = is_diag ? (simple_t ? 2 : 1) : 0
+        if !haskey(subgrid_reps, x0) || quality > subgrid_quality[x0]
+            subgrid_reps[x0] = op
+            subgrid_quality[x0] = quality
+        end
+    end
+
+    d = prod(L)
+    rep_ops = Vector{SymOp}(undef, d)
+    sub_idx = 0
+    for x0 in Iterators.product([0:L[dd]-1 for dd in 1:dim]...)
+        sub_idx += 1
+        x0_vec = collect(x0)
+        if haskey(subgrid_reps, x0_vec)
+            rep_ops[sub_idx] = subgrid_reps[x0_vec]
+        else
+            error("Subgrid x₀=$x0_vec not reachable. auto_L should have prevented this.")
+        end
+    end
+
+    # 3. Build spectral reverse lookup: full-grid h → (spec_idx, phase, conj_flag)
+    #    For each full-grid frequency, find which spectral ASU point represents it
+    h_to_spec = _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)
+
+    # 4. Build inverse reconstruction table
+    M_vol = prod(M_sub)
+    inv_recon_table = Matrix{InvReconEntry}(undef, d, M_vol)
+
+    # Compute subgrid parities (α vectors) for each rep_op
+    alphas = Vector{Vector{Int}}(undef, d)
+    a_idx = 0
+    for x0 in Iterators.product([0:L[dd]-1 for dd in 1:dim]...)
+        a_idx += 1
+        alphas[a_idx] = collect(x0)
+    end
+
+    # Pre-allocate working arrays
+    B_matrix = zeros(ComplexF64, d, d)
+    h_vecs = [zeros(Int, dim) for _ in 1:d]  # full-grid frequencies per fiber
+
+    for q_cart in CartesianIndices(Tuple(M_sub))
+        q_vec = [q_cart[dd] - 1 for dd in 1:dim]  # 0-based
+        q_lin = LinearIndices(Tuple(M_sub))[q_cart]
+
+        # 4a. Enumerate full-grid frequencies in this fiber
+        for a in 1:d
+            for dd in 1:dim
+                h_vecs[a][dd] = q_vec[dd] + M_sub[dd] * alphas[a][dd]
+            end
+        end
+
+        # 4b. Build d×d butterfly matrix B(q)
+        #     B[a, b] = exp(-2πi h_a · t_b / N) × δ(R_bᵀ h_a mod M maps correctly)
+        #     But simpler: B[a, b] = weight of rep_op b applied to h_a
+        fill!(B_matrix, zero(ComplexF64))
+        for a in 1:d
+            h = h_vecs[a]
+            for b in 1:d
+                g = rep_ops[b]
+                # Phase: exp(-2πi h · t_g / N)
+                phase_val = 0.0
+                for dd in 1:dim
+                    phase_val += h[dd] * g.t[dd] / N[dd]
+                end
+                w = cispi(-2 * phase_val)
+
+                # Rotated frequency → subgrid index
+                rot_q_lin = 0
+                stride = 1
+                for dd in 1:dim
+                    rot_val = 0
+                    for dd2 in 1:dim
+                        rot_val += g.R[dd2, dd] * h[dd2]
+                    end
+                    rot_val = mod(rot_val, M_sub[dd])
+                    rot_q_lin += rot_val * stride
+                    stride *= M_sub[dd]
+                end
+                # B[a, b] contributes to the position rot_q_lin in Y₀
+                # For the standard M2 case, all rep_ops map the same q to different
+                # or same positions. The correct B construction is:
+                # F(h_a) = Σ_b B[a,b] · Y₀(gather[b])
+                # where gather[b] = R_bᵀ h_a mod M → linear index
+                B_matrix[a, b] = w
+            end
+        end
+
+        # 4c. Compute B⁻¹ first row
+        B_inv_row1 = inv(B_matrix)[1, :]
+
+        # 4d. Map full-grid frequencies to spectral ASU and build entries
+        for a in 1:d
+            h = h_vecs[a]
+            h_mod = [mod(h[dd], N_vec[dd]) for dd in 1:dim]
+
+            if haskey(h_to_spec, h_mod)
+                spec_idx, sym_phase, conj_f = h_to_spec[h_mod]
+                combined_weight = B_inv_row1[a] * sym_phase
+                inv_recon_table[a, q_lin] = InvReconEntry(
+                    Int32(spec_idx), combined_weight, conj_f
+                )
+            else
+                # Extinguished frequency: F(h) = 0, contributes nothing
+                inv_recon_table[a, q_lin] = InvReconEntry(
+                    Int32(1), zero(ComplexF64), false
+                )
+            end
+        end
+    end
+
+    # 5. Plan IFFT
+    dummy = zeros(ComplexF64, Tuple(M_sub))
+    ifft_plan = plan_ifft(dummy)
+
+    # 6. Allocate buffers
+    Y_buf = zeros(ComplexF64, M_vol)
+    f0_buf = zeros(ComplexF64, M_vol)
+
+    # 7. Detect Pmmm separable structure
+    all_diagonal = all(op -> all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j), rep_ops)
+    simple_translations = all(op -> all(mod(round(Int, op.t[dd]), N[dd]) ∈ (0, N[dd]-1)
+                                        for dd in 1:dim), rep_ops)
+    is_sep = all_diagonal && simple_translations && d == 2^dim
+
+    inv_phase_factors = Vector{ComplexF64}[]
+    if is_sep
+        # For Pmmm inverse: phase factor for dimension d at freq q is
+        # conj(φ_d(q)) / 2 where φ_d(q) = exp(2πi q / N_d)
+        inv_phase_factors = Vector{Vector{ComplexF64}}(undef, dim)
+        for dd in 1:dim
+            inv_phase_factors[dd] = [cispi(-2 * q / N[dd]) for q in 0:M_sub[dd]-1]
+        end
+    end
+
+    return M2BackwardPlan(
+        inv_recon_table, d,
+        ifft_plan, Y_buf, f0_buf,
+        L, M_sub, N_vec,
+        is_sep, inv_phase_factors
+    )
+end
+
+
+"""
+    _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)
+
+Build a dictionary mapping every full-grid frequency h ∈ [0,N)^D to its
+spectral ASU representative: (spec_idx, phase, conj_flag).
+
+For h in the spectral ASU: direct mapping.
+For h related by symmetry: find g such that R_g^T h ≡ h_asu (mod N).
+For h related by Hermitian symmetry: map -h → h_asu with conjugation.
+"""
+function _build_spectral_reverse_lookup(spec_asu::SpectralIndexing,
+                                        ops_shifted::Vector{SymOp},
+                                        N_vec::Vector{Int}, dim::Int)
+    # Result: h_mod (0-based) → (spec_idx, phase, conj_flag)
+    h_to_spec = Dict{Vector{Int}, Tuple{Int, ComplexF64, Bool}}()
+
+    n_spec = length(spec_asu.points)
+
+    # Reciprocal-space ops: R* = (R⁻¹)ᵀ = R for orthogonal ops, but use dual_ops
+    # Actually, the forward recon uses R^T (transpose of the direct-space rotation).
+    # The spectral ASU uses dual_ops (reciprocal ops).
+    # For reverse lookup: we need to map R_g^T h back to h_asu.
+    # The direct_ops have R_direct, and in the recon: R_directᵀ · h mod M.
+    # For spectral orbit: h and R_recip · h are equivalent
+    # where R_recip comes from dual_ops.
+    recip_ops = spec_asu.ops  # Already the reciprocal-space ops stored in SpectralIndexing
+
+    # Build fast index lookup for spectral ASU points
+    spec_point_map = Dict{Vector{Int}, Int}()
+    for (idx, pt) in enumerate(spec_asu.points)
+        spec_point_map[pt.idx] = idx
+    end
+
+    # For each spectral ASU point, expand its orbit
+    for (spec_idx, pt) in enumerate(spec_asu.points)
+        h_asu = pt.idx  # 0-based
+
+        # Identity: h_asu itself
+        if !haskey(h_to_spec, h_asu)
+            h_to_spec[h_asu] = (spec_idx, complex(1.0), false)
+        end
+
+        # Apply all direct-space ops to get full-grid equivalents
+        # Spectral symmetry (numerically verified):
+        #   F(R^T h) = exp(+2πi h·t/N) · F(h)
+        # So: F_full(h') = exp(+2πi h_asu·t/N) · F_spec(spec_idx)
+        # where h' = R^T · h_asu mod N
+        for op in ops_shifted
+            R = op.R
+            t = op.t
+            # h' = R^T · h_asu mod N
+            h_rot = zeros(Int, dim)
+            for dd in 1:dim
+                s = 0
+                for dd2 in 1:dim
+                    s += R[dd2, dd] * h_asu[dd2]
+                end
+                h_rot[dd] = mod(s, N_vec[dd])
+            end
+
+            if !haskey(h_to_spec, h_rot)
+                # F_full(h') = exp(+2πi h_asu · t / N) · F_spec
+                phase_val = 0.0
+                for dd in 1:dim
+                    phase_val += h_asu[dd] * t[dd] / N_vec[dd]
+                end
+                phase = cispi(2 * phase_val)
+                h_to_spec[h_rot] = (spec_idx, phase, false)
+            end
+        end
+
+        # Hermitian symmetry: F(-h) = conj(F(h)) for real-valued fields
+        # So F_full(-h_asu mod N) = conj(F_spec(spec_idx))
+        h_neg = [mod(-h_asu[dd], N_vec[dd]) for dd in 1:dim]
+        if !haskey(h_to_spec, h_neg)
+            h_to_spec[h_neg] = (spec_idx, complex(1.0), true)
+        end
+
+        # Also: Hermitian of orbit members
+        # F_full(R^T h) = exp(+2πi h·t/N) · F_spec
+        # F_full(-R^T h) = conj(F_full(R^T h)) = exp(-2πi h·t/N) · conj(F_spec)
+        # phase for conj = exp(+2πi h·t/N) conj'd = exp(-2πi h·t/N)
+        for op in ops_shifted
+            R = op.R
+            t = op.t
+            # h' = R^T · h_asu mod N
+            h_rot = zeros(Int, dim)
+            for dd in 1:dim
+                s = 0
+                for dd2 in 1:dim
+                    s += R[dd2, dd] * h_asu[dd2]
+                end
+                h_rot[dd] = mod(s, N_vec[dd])
+            end
+
+            h_rot_neg = [mod(-h_rot[dd], N_vec[dd]) for dd in 1:dim]
+            if !haskey(h_to_spec, h_rot_neg)
+                # F_full(-h') = conj(F_full(h')) = exp(-2πi h_asu·t/N) · conj(F_spec)
+                phase_val = 0.0
+                for dd in 1:dim
+                    phase_val += h_asu[dd] * t[dd] / N_vec[dd]
+                end
+                phase = cispi(-2 * phase_val)
+                h_to_spec[h_rot_neg] = (spec_idx, phase, true)
+            end
+        end
+    end
+
+    return h_to_spec
+end
+
+
+"""
+    execute_m2_backward!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64}) -> Vector{ComplexF64}
+
+Execute the M2 backward transform: spectral ASU → subgrid (M³).
+
+Steps:
+1. Inverse reconstruction: gather from F_spec into Y₀ using inv_recon_table
+2. IFFT: Y₀(M³) → f₀(M³)
+
+Returns `bplan.f0_buf` containing the subgrid real-space data.
+"""
+function execute_m2_backward!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64})
+    # Step 1: Inverse reconstruction
+    _inv_reconstruct_m2!(bplan, F_spec)
+
+    # Step 2: IFFT
+    Y_in = reshape(bplan.Y_buf, Tuple(bplan.subgrid_dims))
+    f_out = reshape(bplan.f0_buf, Tuple(bplan.subgrid_dims))
+    mul!(f_out, bplan.ifft_plan, Y_in)  # Apply IFFT: Y₀ → f₀
+
+    return bplan.f0_buf
+end
+
+"""
+General table-based inverse reconstruction: spectral ASU → Y₀(M³).
+"""
+function _inv_reconstruct_m2!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64})
+    d = bplan.d
+    M_vol = prod(bplan.subgrid_dims)
+    Y = bplan.Y_buf
+    table = bplan.inv_recon_table
+
+    @inbounds for q_lin in 1:M_vol
+        val = zero(ComplexF64)
+        for a in 1:d
+            entry = table[a, q_lin]
+            f_val = entry.conj_flag ? conj(F_spec[entry.spec_idx]) : F_spec[entry.spec_idx]
+            val += entry.weight * f_val
+        end
+        Y[q_lin] = val
+    end
+end
+
 
 include("recursive_blocks.jl")
 include("recursive_blocks_backward.jl")
