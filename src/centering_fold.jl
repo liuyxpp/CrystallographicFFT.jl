@@ -591,14 +591,25 @@ Backward plan for centered KRFFT: spectral ASU → f₀(M³).
 Uses M2-style per-fiber B⁻¹ inversion (always d×d square) to recover G₀,
 then centering unfold chain (disassemble → IFFT channels → centering unfold).
 
-The forward mapping is rank-deficient when prod(L) < |G|, but for symmetric
-input f₀ the system is always consistent and the B⁻¹ inverse is exact.
-This matches the M2 backward design exactly.
+Optimized with:
+- **CSR compact table**: skips zero-weight entries, pre-applies conjugation
+- **Orbit reduction**: computes inv_recon at orbit reps only, expands via
+  G₀(R^T q) = e^{2πi q·s/M} × G₀(q)
 """
 struct CenteredKRFFTBackwardPlan
-    # M2-style inverse reconstruction table: (d, M_vol)
-    inv_recon_table::Matrix{InvReconEntry}
-    d::Int                                      # fiber length = prod(L)
+    # CSR compact inv_recon: nnz entries for orbit reps only
+    inv_offsets::Vector{Int32}       # (n_orbits + 1,) CSR row pointers
+    inv_spec_idx::Vector{Int32}      # (nnz,) spectral indices
+    inv_weight::Vector{ComplexF64}   # (nnz,) weights (conj pre-applied)
+    n_orbits::Int
+
+    # Orbit expand: rep → all M_vol positions
+    orbit_rep_pos::Vector{Int32}     # (n_orbits,) linear index of each rep
+    orbit_member_oid::Vector{Int32}  # (M_vol,) orbit index for each position
+    orbit_member_phase::Vector{ComplexF64}  # (M_vol,) phase factor per position
+
+    # Workspace for orbit-level values
+    G0_reps::Vector{ComplexF64}      # (n_orbits,) inv_recon output per rep
 
     # Centering unfold chain
     fold_plan::SubgridCenteringFoldPlan
@@ -611,14 +622,10 @@ end
 """
     plan_centered_ikrfft(spec_asu, ops_shifted, fwd_plan)
 
-Create a centered KRFFT backward plan from the forward plan.
+Create an optimized centered KRFFT backward plan.
 
-Uses `plan_m2_backward` to build the inverse reconstruction table
-(per-fiber d×d B⁻¹ inversion), and reuses the forward plan's centering
-unfold infrastructure.
-
-For symmetric input f₀, the backward is exact (machine precision).
-For non-symmetric input, behavior is undefined (rank-deficient system).
+Builds CSR compact inv_recon table (zero entries removed, conj pre-applied)
+and spatial orbit structure for orbit-based reduction.
 """
 function plan_centered_ikrfft(spec_asu::SpectralIndexing,
                                ops_shifted::Vector{SymOp},
@@ -626,15 +633,99 @@ function plan_centered_ikrfft(spec_asu::SpectralIndexing,
     krfft = fwd_plan.krfft_plan
     fold = fwd_plan.fold_plan
     M = Tuple(krfft.subgrid_dims)
+    dim = length(M)
+    M_vol = prod(M)
     n_spec = length(spec_asu.points)
 
-    # Build M2-style inverse reconstruction table
+    # ── 1. Build M2-style inv_recon_table ──
     m2bwd = plan_m2_backward(spec_asu, ops_shifted)
+    d = m2bwd.d
+    table = m2bwd.inv_recon_table
+
+    # ── 2. Build spatial orbits under G_rem (even-translation ops) ──
+    rem_ops = [(round.(Int, op.R), round.(Int, op.t) .÷ 2)
+               for op in ops_shifted
+               if all(mod.(round.(Int, op.t), 2) .== 0)]
+
+    orbit_id = zeros(Int32, M_vol)    # position → orbit index
+    orbit_phase = zeros(ComplexF64, M_vol)  # position → phase factor
+    orbits_rep = Int32[]              # orbit index → representative position
+
+    for m in 1:M_vol
+        orbit_id[m] != 0 && continue
+        # New orbit: m is the representative
+        push!(orbits_rep, Int32(m))
+        oid = Int32(length(orbits_rep))
+        orbit_id[m] = oid
+        orbit_phase[m] = complex(1.0)
+
+        # BFS to find all orbit members with phase tracking
+        # Phase relation: G₀(R^T q mod M) = e^{2πi q·s/M} × G₀(q)
+        queue = [m]
+        while !isempty(queue)
+            cur = popfirst!(queue)
+            cur0 = cur - 1
+            qv = (mod(cur0, M[1]), mod(div(cur0, M[1]), M[2]),
+                  div(cur0, M[1] * M[2]))
+            cur_phase = orbit_phase[cur]
+
+            for (R, s) in rem_ops
+                # Apply R^T to frequency q
+                rq = ntuple(d1 -> mod(sum(R[d2, d1] * qv[d2] for d2 in 1:dim),
+                                      M[d1]), Val(3))
+                rq_lin = 1 + rq[1] + M[1] * rq[2] + M[1] * M[2] * rq[3]
+
+                if orbit_id[rq_lin] == 0
+                    # Phase: G₀(R^T q) = e^{2πi q·s/M} × G₀(q)
+                    ph = cispi(2 * sum(qv[dd] * s[dd] / M[dd] for dd in 1:dim))
+                    orbit_id[rq_lin] = oid
+                    orbit_phase[rq_lin] = ph * cur_phase
+                    push!(queue, rq_lin)
+                end
+            end
+        end
+    end
+
+    n_orbits = length(orbits_rep)
+
+    # ── 3. Build CSR compact table for orbit reps only ──
+    # Count non-zero entries per rep
+    offsets = Vector{Int32}(undef, n_orbits + 1)
+    offsets[1] = Int32(1)
+    for i in 1:n_orbits
+        q = orbits_rep[i]
+        cnt = Int32(0)
+        for a in 1:d
+            abs(table[a, q].weight) > 1e-15 && (cnt += 1)
+        end
+        offsets[i + 1] = offsets[i] + cnt
+    end
+
+    nnz = Int(offsets[n_orbits + 1] - 1)
+    spec_idx = Vector{Int32}(undef, nnz)
+    weight = Vector{ComplexF64}(undef, nnz)
+
+    for i in 1:n_orbits
+        q = orbits_rep[i]
+        j = Int(offsets[i])
+        for a in 1:d
+            e = table[a, q]
+            abs(e.weight) > 1e-15 || continue
+            weight[j] = e.weight
+            # Use negative spec_idx to signal conjugation at runtime
+            spec_idx[j] = e.conj_flag ? -e.spec_idx : e.spec_idx
+            j += 1
+        end
+    end
+
 
     G0_view = reshape(krfft.work_buffer, M)
+    G0_reps = Vector{ComplexF64}(undef, n_orbits)
 
     return CenteredKRFFTBackwardPlan(
-        m2bwd.inv_recon_table, m2bwd.d,
+        offsets, spec_idx, weight, n_orbits,
+        orbits_rep, orbit_id, orbit_phase,
+        G0_reps,
         fold, fwd_plan.f0_buffer, G0_view,
         M, n_spec)
 end
@@ -645,27 +736,28 @@ end
 Centered KRFFT backward: F̂[n_spec] → f₀[M³].
 
 Steps:
-1. Inverse reconstruction: gather F̂ → G₀ via per-fiber B⁻¹ weights
-2. Disassemble G₀ → channel FFT outputs
-3. IFFT channels
-4. Centering unfold → f₀
+1. CSR inv_recon at orbit reps only: F̂ → G₀_reps
+2. Orbit expand: G₀_reps → G₀ (all M_vol positions)
+3. Disassemble G₀ → channel FFT outputs
+4. IFFT channels
+5. Centering unfold → f₀
 """
 function execute_centered_ikrfft!(bplan::CenteredKRFFTBackwardPlan,
                                    F_spec::AbstractVector{ComplexF64},
                                    f0_out::AbstractArray{Float64, 3})
     G0 = bplan.G0_view
 
-    # Step 1: Inverse reconstruction (M2-style per-fiber B⁻¹)
-    _inv_recon_centered!(G0, F_spec, bplan.inv_recon_table, bplan.d)
+    # Step 1+2: Optimized inv_recon with orbit reduction
+    _inv_recon_orbit!(G0, F_spec, bplan)
 
-    # Step 2: Disassemble G₀ → channel FFT outputs
+    # Step 3: Disassemble G₀ → channel FFT outputs
     fold = bplan.fold_plan
     disassemble_G0!(fold, G0)
 
-    # Step 3: IFFT channels
+    # Step 4: IFFT channels
     ifft_channels!(fold)
 
-    # Step 4: Centering unfold → f₀
+    # Step 5: Centering unfold → f₀
     centering_unfold!(fold, f0_out)
 
     return f0_out
@@ -682,20 +774,41 @@ function ifft_unrecon_centered!(bplan::CenteredKRFFTBackwardPlan,
     execute_centered_ikrfft!(bplan, F_spec, bplan.f0_buffer)
 end
 
-"""Per-fiber B⁻¹ inverse reconstruction: F̂[n_spec] → G₀[M³]."""
-function _inv_recon_centered!(G0::AbstractArray{ComplexF64, 3},
-                               F_spec::AbstractVector{ComplexF64},
-                               table::Matrix{InvReconEntry},
-                               d::Int)
-    G0_flat = vec(G0)
-    M_vol = length(G0_flat)
-    @inbounds for q_lin in 1:M_vol
+"""
+Optimized inv_recon: CSR gather at orbit reps + phase-expand to M_vol.
+
+Uses negative spec_idx to signal conjugation (branchless sign trick).
+"""
+function _inv_recon_orbit!(G0::AbstractArray{ComplexF64, 3},
+                            F_spec::AbstractVector{ComplexF64},
+                            bplan::CenteredKRFFTBackwardPlan)
+    offsets = bplan.inv_offsets
+    sidx = bplan.inv_spec_idx
+    wt = bplan.inv_weight
+    reps = bplan.orbit_rep_pos
+    G0_reps = bplan.G0_reps
+    n_orbits = bplan.n_orbits
+
+    # Step 1: CSR gather at orbit reps only
+    @inbounds for i in 1:n_orbits
         val = zero(ComplexF64)
-        for a in 1:d
-            entry = table[a, q_lin]
-            f_val = entry.conj_flag ? conj(F_spec[entry.spec_idx]) : F_spec[entry.spec_idx]
-            val += entry.weight * f_val
+        for j in offsets[i]:(offsets[i + 1] - Int32(1))
+            h = sidx[j]
+            if h > 0
+                val += wt[j] * F_spec[h]
+            else
+                val += wt[j] * conj(F_spec[-h])
+            end
         end
-        G0_flat[q_lin] = val
+        G0_reps[i] = val
+    end
+
+    # Step 2: Orbit expand to all M_vol positions
+    G0_flat = vec(G0)
+    oid = bplan.orbit_member_oid
+    oph = bplan.orbit_member_phase
+    @inbounds for q in eachindex(G0_flat)
+        G0_flat[q] = oph[q] * G0_reps[oid[q]]
     end
 end
+
