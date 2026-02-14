@@ -37,4 +37,8 @@ using CrystallographicFFT
     @testset "Q-Fused KRFFT" begin
         include("test_q_fused.jl")
     end
+
+    @testset "Centered KRFFT Backward" begin
+        include("test_centered_backward.jl")
+    end
 end

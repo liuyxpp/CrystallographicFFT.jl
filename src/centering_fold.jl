@@ -579,3 +579,528 @@ function _centering_unfold_4ch!(plan::SubgridCenteringFoldPlan,
     end
 end
 
+# ============================================================================
+# Centered KRFFT Backward Transform
+# ============================================================================
+
+"""Compact inverse entry: maps orbit rep to weighted F̂ gather."""
+struct InvCompactEntry
+    h_idx::Int32           # Spectral index to gather from
+    weight::ComplexF64     # Inverse weight A⁻¹[r, h]
+end
+
+"""Orbit expansion entry: maps G₀ position to its orbit representative."""
+struct OrbitExpandEntry
+    rep_idx::Int32         # Compact orbit rep index (1-based), 0 = dead
+    phase::ComplexF64      # Phase factor conj(sym_phase)
+end
+
+"""
+    CenteredKRFFTBackwardPlan
+
+Backward plan for centered KRFFT: spectral ASU → f₀(M³).
+
+Two paths:
+- **Two-step** (fast, use_dense==false):
+  Step 1: Compact gather F̂ → G₀_reps via block-diagonal A⁻¹.
+  Step 2: Orbit expansion G₀_reps → full G₀ (sequential write).
+  Then: disassemble_G₀ → IFFT → unfold.
+- **Factored orbit** (use_dense==true):
+  Step 1: c = B_sym_inv × F̂   (n_spec² ops)
+  Step 2: f₀[m] = Re(c[orbit_id[m]]) / √|orbit|  (M³ lookups)
+"""
+struct CenteredKRFFTBackwardPlan
+    use_dense::Bool
+
+    # ── Two-step path ──
+    inv_compact_table::Matrix{InvCompactEntry}  # (max_block_size, n_reps)
+    block_sizes::Vector{Int32}                  # entries per rep
+    orbit_expand::Vector{OrbitExpandEntry}       # (M_vol,) maps G₀→rep
+    n_reps::Int
+    G0_reps::Vector{ComplexF64}                 # workspace (n_reps,)
+
+    # ── Factored orbit path (non-symmorphic groups) ──
+    B_sym_inv::Matrix{ComplexF64}               # (n_spec, n_spec) inverse
+    dense_orbit_id::Vector{Int32}               # (M_vol,) orbit index per position
+    dense_orbit_norm::Vector{Float64}           # (n_orbits,) = 1/√|orbit|
+    dense_coeffs::Vector{ComplexF64}            # (n_spec,) workspace
+
+    # Shared state
+    fold_plan::SubgridCenteringFoldPlan
+    f0_buffer::Array{Float64, 3}
+    G0_view::Array{ComplexF64, 3}
+    subgrid_dims::NTuple{3,Int}
+    n_spec::Int
+end
+
+"""
+    plan_centered_ikrfft(spec_asu, ops_shifted, fwd_plan)
+
+Create a centered KRFFT backward plan from the forward plan.
+
+Algorithm (following M6 backward approach):
+1. Extract representative ops (A8-like, one per parity class) and remaining
+   point-group ops (G_rem, even-translation ops) from the full ops
+2. Build orbits of G₀ positions under G_rem, mapping each position to its
+   orbit representative with a phase factor
+3. Build merged A matrix: A[h, r] = Σ_k a8_tw × sym_phase, where r is an
+   orbit representative (compact index). This matrix is block-diagonal with
+   square blocks (n_reps == n_spec)
+4. Block-diagonal inversion of A → A⁻¹
+5. Two-stage scatter fused into a single inv_recon_table:
+   For each h, for each orbit rep r with A⁻¹[r,h] ≠ 0, expand r to its full
+   orbit and scatter F̂[h] × A⁻¹[r,h] × conj(sym_phase) to all G₀ positions.
+"""
+function plan_centered_ikrfft(spec_asu::SpectralIndexing,
+                               ops_shifted::Vector{SymOp},
+                               fwd_plan::CenteredKRFFTPlan)
+    krfft = fwd_plan.krfft_plan
+    fold = fwd_plan.fold_plan
+    N = Tuple(spec_asu.N)
+    M = Tuple(krfft.subgrid_dims)
+    dim = length(M)
+    n_spec = length(spec_asu.points)
+    n_ops = krfft.n_ops  # number of representative ops (parity classes)
+    fwd_table = krfft.recon_table
+
+    # ── 1. Extract remaining point-group ops (even translation) ──
+    rem_ops = [op for op in ops_shifted if all(mod.(round.(Int, op.t), 2) .== 0)]
+
+    # ── 2. Build set of ALL alive G₀ positions ──
+    alive_parities = Set(Tuple(mod.(off, 2)) for off in fold.offsets)
+    alive_set = Set{Int}()
+    for k3 in 0:M[3]-1, k2 in 0:M[2]-1, k1 in 0:M[1]-1
+        parity = (mod(k1, 2), mod(k2, 2), mod(k3, 2))
+        if parity in alive_parities
+            lin = 1 + k1 + M[1]*k2 + M[1]*M[2]*k3
+            push!(alive_set, lin)
+        end
+    end
+
+    # Collect positions referenced by spectral ASU (for seeding orbits)
+    g0_pos_set = Set{Int}()
+    for h in 1:n_spec, g in 1:n_ops
+        push!(g0_pos_set, Int(fwd_table[g, h].buffer_idx))
+    end
+
+    # ── 3. Build orbits under G_rem ──
+    g0_to_rep = Dict{Int, Int}()
+    g0_to_phase = Dict{Int, ComplexF64}()
+
+    for start_lin in g0_pos_set
+        haskey(g0_to_rep, start_lin) && continue
+        lin0 = start_lin - 1
+        sq = [mod(lin0, M[1]), mod(div(lin0, M[1]), M[2]), div(lin0, M[1]*M[2])]
+
+        orbit = Dict{Int, Tuple{Vector{Int}, ComplexF64}}()
+        orbit[start_lin] = (sq, complex(1.0))
+        worklist = [(sq, complex(1.0))]
+
+        while !isempty(worklist)
+            q_vec, q_phase = pop!(worklist)
+            for op in rem_ops
+                R = op.R
+                t_half = round.(Int, op.t) .÷ 2
+                rq = [mod(sum(Int(R[d2, d1]) * q_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
+                rlin = 1 + rq[1] + M[1]*rq[2] + M[1]*M[2]*rq[3]
+                if !haskey(orbit, rlin) && rlin ∈ alive_set
+                    sym_phase = cispi(-2 * sum(q_vec[d] * t_half[d] / M[d] for d in 1:dim))
+                    new_phase = sym_phase * q_phase
+                    orbit[rlin] = (rq, new_phase)
+                    push!(worklist, (rq, new_phase))
+                end
+            end
+        end
+
+        rep_lin = minimum(keys(orbit))
+        rep_phase = orbit[rep_lin][2]
+        for (member_lin, (_, member_phase)) in orbit
+            g0_to_rep[member_lin] = rep_lin
+            g0_to_phase[member_lin] = member_phase / rep_phase
+        end
+    end
+
+    # Build compact indexing for orbit representatives
+    reps = sort(collect(Set(values(g0_to_rep))))
+    rep_to_compact = Dict(r => i for (i, r) in enumerate(reps))
+    n_reps = length(reps)
+
+    # ── 4. Build per-h list of (compact_r, weight) entries ──
+    # h_entries[h] = [(compact_r, weight), ...] — pre-indexed, no Dict scanning
+    h_entries = [Vector{Tuple{Int, ComplexF64}}() for _ in 1:n_spec]
+    for h in 1:n_spec
+        # Accumulate A[h, compact_r] from forward table
+        local_acc = Dict{Int, ComplexF64}()
+        for g in 1:n_ops
+            e = fwd_table[g, h]
+            q_lin = Int(e.buffer_idx)
+            rep_lin = g0_to_rep[q_lin]
+            sym_phase = g0_to_phase[q_lin]
+            compact_r = rep_to_compact[rep_lin]
+            local_acc[compact_r] = get(local_acc, compact_r, zero(ComplexF64)) + e.weight * sym_phase
+        end
+        for (r, w) in local_acc
+            push!(h_entries[h], (r, w))
+        end
+    end
+
+    # Also build rep → list of specs (for union-find blocks)
+    rep_to_specs = [Vector{Int}() for _ in 1:n_reps]
+    for h in 1:n_spec
+        for (r, _) in h_entries[h]
+            push!(rep_to_specs[r], h)
+        end
+    end
+
+    # ── 5. Union-find on spectral points sharing orbit reps ──
+    parent2 = collect(1:n_spec)
+    find2(x) = begin
+        while parent2[x] != x
+            parent2[x] = parent2[parent2[x]]
+            x = parent2[x]
+        end
+        x
+    end
+    function unite2(a, b)
+        a, b = find2(a), find2(b)
+        a != b && (parent2[a] = b)
+    end
+    for r in 1:n_reps
+        u_specs = unique(rep_to_specs[r])
+        for i in 2:length(u_specs)
+            unite2(u_specs[1], u_specs[i])
+        end
+    end
+
+    block_map = Dict{Int, Vector{Int}}()
+    for h in 1:n_spec
+        root = find2(h)
+        push!(get!(Vector{Int}, block_map, root), h)
+    end
+
+    # ── 6. Per-block inversion (array-indexed, O(Σ block²)) ──
+    # inv_h_entries[h] = [(compact_r, inv_weight), ...]
+    inv_h_entries = [Vector{Tuple{Int, ComplexF64}}() for _ in 1:n_spec]
+
+    for (_, h_idxs) in block_map
+        sort!(h_idxs)
+
+        # Collect the set of reps used by this block
+        rep_set = Set{Int}()
+        for h in h_idxs
+            for (r, _) in h_entries[h]
+                push!(rep_set, r)
+            end
+        end
+        rep_list = sort(collect(rep_set))
+
+        n_h = length(h_idxs)
+        n_r = length(rep_list)
+        if n_h != n_r
+            return _plan_centered_ikrfft_dense(spec_asu, fwd_plan, rem_ops)
+        end
+
+        rep_to_local = Dict(r => i for (i, r) in enumerate(rep_list))
+        A_sub = zeros(ComplexF64, n_h, n_r)
+        for (local_h, h) in enumerate(h_idxs)
+            for (r, w) in h_entries[h]
+                A_sub[local_h, rep_to_local[r]] += w
+            end
+        end
+
+        A_inv = inv(A_sub)
+
+        for (local_r, compact_r) in enumerate(rep_list)
+            for (local_h, h) in enumerate(h_idxs)
+                w = A_inv[local_r, local_h]
+                abs(w) < 1e-15 && continue
+                push!(inv_h_entries[h], (compact_r, w))
+            end
+        end
+    end
+
+    # ── 7. Fuse into single scatter table (array-indexed) ──
+    # Build orbit membership: compact_r → [(q_lin, conj_phase), ...]
+    rep_members = [Vector{Tuple{Int, ComplexF64}}() for _ in 1:n_reps]
+    for (q_lin, rep_lin) in g0_to_rep
+        compact_r = rep_to_compact[rep_lin]
+        push!(rep_members[compact_r], (q_lin, conj(g0_to_phase[q_lin])))
+    end
+
+    # ── Build two-step tables ──
+
+    # Step 1 table: inv_compact_table[g, r] = InvCompactEntry(h_idx, weight)
+    # For each rep r, gather from the h values in its block with A⁻¹ weights.
+    # inv_h_entries[h] = [(compact_r, inv_w), ...] → transpose to per-rep.
+    rep_inv_entries = [Vector{Tuple{Int, ComplexF64}}() for _ in 1:n_reps]
+    for h in 1:n_spec
+        for (r, w) in inv_h_entries[h]
+            push!(rep_inv_entries[r], (h, w))
+        end
+    end
+
+    max_block = maximum(length(rep_inv_entries[r]) for r in 1:n_reps)
+    inv_compact_table = Matrix{InvCompactEntry}(undef, max_block, n_reps)
+    block_sizes_vec = Vector{Int32}(undef, n_reps)
+    for r in 1:n_reps
+        entries = rep_inv_entries[r]
+        block_sizes_vec[r] = Int32(length(entries))
+        for (g, (h, w)) in enumerate(entries)
+            inv_compact_table[g, r] = InvCompactEntry(Int32(h), w)
+        end
+        # Fill remaining slots (unused but must be initialized)
+        for g in (length(entries)+1):max_block
+            inv_compact_table[g, r] = InvCompactEntry(Int32(1), zero(ComplexF64))
+        end
+    end
+
+    # Step 2 table: orbit_expand[q_lin] = OrbitExpandEntry(rep_idx, phase)
+    M_vol = prod(M)
+    orbit_expand_vec = Vector{OrbitExpandEntry}(undef, M_vol)
+    for q in 1:M_vol
+        orbit_expand_vec[q] = OrbitExpandEntry(Int32(0), zero(ComplexF64))
+    end
+    for (q_lin, rep_lin) in g0_to_rep
+        compact_r = rep_to_compact[rep_lin]
+        orbit_expand_vec[q_lin] = OrbitExpandEntry(Int32(compact_r),
+                                                   conj(g0_to_phase[q_lin]))
+    end
+
+    G0_view = reshape(krfft.work_buffer, M)
+    empty_dense = Matrix{ComplexF64}(undef, 0, 0)
+    G0_reps_buf = Vector{ComplexF64}(undef, n_reps)
+
+    return CenteredKRFFTBackwardPlan(
+        false,  # use_dense
+        inv_compact_table, block_sizes_vec, orbit_expand_vec, n_reps, G0_reps_buf,
+        empty_dense, Int32[], Float64[], ComplexF64[],
+        fold, fwd_plan.f0_buffer, G0_view,
+        M, n_spec)
+end
+
+"""
+    execute_centered_ikrfft!(bplan, F_spec, f0_out)
+
+Centered KRFFT backward: F̂[n_spec] → f₀[M³].
+
+Dispatches to orbit-scatter path or dense-matrix path based on plan.
+"""
+function execute_centered_ikrfft!(bplan::CenteredKRFFTBackwardPlan,
+                                   F_spec::AbstractVector{ComplexF64},
+                                   f0_out::AbstractArray{Float64, 3})
+    if bplan.use_dense
+        # Factored orbit path: c = B_sym_inv × F̂, then orbit expand to f₀
+        _factored_orbit_inv!(f0_out, F_spec, bplan.B_sym_inv,
+                             bplan.dense_coeffs, bplan.dense_orbit_id,
+                             bplan.dense_orbit_norm)
+        return f0_out
+    end
+
+    # Two-step path
+    fold = bplan.fold_plan
+    G0 = bplan.G0_view
+
+    # Step 1: Compact gather F̂ → G₀_reps (block-diagonal A⁻¹)
+    _inv_recon_compact!(bplan.G0_reps, F_spec,
+                        bplan.inv_compact_table, bplan.block_sizes, bplan.n_reps)
+
+    # Step 2: Orbit expand G₀_reps → full G₀ (sequential write)
+    _orbit_expand!(G0, bplan.G0_reps, bplan.orbit_expand)
+
+    # Step 3: Disassemble G₀ → channel FFT outputs
+    disassemble_G0!(fold, G0)
+
+    # Step 4: IFFT channels
+    ifft_channels!(fold)
+
+    # Step 5: Centering unfold → f₀
+    centering_unfold!(fold, f0_out)
+
+    return f0_out
+end
+
+"""
+    ifft_unrecon_centered!(bplan, F_spec)
+
+SCFT fast path: F̂ → f₀. Result written to bplan.f0_buffer.
+Symmetric counterpart of `fft_reconstruct_centered!`.
+"""
+function ifft_unrecon_centered!(bplan::CenteredKRFFTBackwardPlan,
+                                 F_spec::AbstractVector{ComplexF64})
+    execute_centered_ikrfft!(bplan, F_spec, bplan.f0_buffer)
+end
+
+"""Step 1: Compact gather F̂ → G₀_reps via block-diagonal A⁻¹."""
+function _inv_recon_compact!(G0_reps::Vector{ComplexF64},
+                              F_spec::AbstractVector{ComplexF64},
+                              table::Matrix{InvCompactEntry},
+                              block_sizes::Vector{Int32},
+                              n_reps::Int)
+    @inbounds for r in 1:n_reps
+        val = zero(ComplexF64)
+        for g in 1:block_sizes[r]
+            e = table[g, r]
+            val += e.weight * F_spec[e.h_idx]
+        end
+        G0_reps[r] = val
+    end
+end
+
+"""Step 2: Orbit expand G₀_reps → full G₀ (sequential write by linear index)."""
+function _orbit_expand!(G0::AbstractArray{ComplexF64,3},
+                         G0_reps::Vector{ComplexF64},
+                         orbit_expand::Vector{OrbitExpandEntry})
+    G0_flat = vec(G0)
+    @inbounds for q in eachindex(orbit_expand)
+        e = orbit_expand[q]
+        if e.rep_idx > 0
+            G0_flat[q] = e.phase * G0_reps[e.rep_idx]
+        else
+            G0_flat[q] = zero(ComplexF64)
+        end
+    end
+end
+
+"""Factored orbit inverse: c = B_sym_inv × F̂, then f₀[m] = Re(c[orbit_id[m]]) × norm."""
+function _factored_orbit_inv!(f0_out::AbstractArray{Float64, 3},
+                               F_spec::AbstractVector{ComplexF64},
+                               B_sym_inv::Matrix{ComplexF64},
+                               coeffs::Vector{ComplexF64},
+                               orbit_id::Vector{Int32},
+                               orbit_norm::Vector{Float64})
+    # Step 1: c = B_sym_inv × F̂  (n_spec² ops)
+    mul!(coeffs, B_sym_inv, F_spec)
+
+    # Step 2: f₀[m] = Re(c[orbit_id[m]]) × orbit_norm[orbit_id[m]]
+    f0_flat = vec(f0_out)
+    @inbounds for m in eachindex(f0_flat)
+        k = orbit_id[m]
+        if k > 0
+            f0_flat[m] = real(coeffs[k]) * orbit_norm[k]
+        else
+            f0_flat[m] = 0.0
+        end
+    end
+end
+
+"""
+    _plan_centered_ikrfft_dense(spec_asu, fwd_plan, rem_ops)
+
+Dense symmetric-subspace fallback for groups where orbit blocks are non-square
+(e.g., Ia-3d SG 230 with non-symmorphic ops).
+
+Algorithm (scalable version using orbit enumeration):
+1. Enumerate orbits of M-grid points under G_M = {(R, t÷2) : (R,t) ∈ rem_ops}
+2. Build V_sym sparse-like: each orbit gives one column (normalized indicator)
+3. Build pipeline matrix B restricted to orbit representatives (n_sym columns)
+4. B_sym = B_restricted (square, n_spec × n_sym)
+5. Precompute F̂→f₀: dense_inv = V_sym × B_sym⁻¹ (M³ × n_spec)
+"""
+function _plan_centered_ikrfft_dense(spec_asu::SpectralIndexing,
+                                      fwd_plan::CenteredKRFFTPlan,
+                                      rem_ops::Vector{SymOp})
+    krfft = fwd_plan.krfft_plan
+    fold = fwd_plan.fold_plan
+    M = Tuple(krfft.subgrid_dims)
+    dim = length(M)
+    M_vol = prod(M)
+    n_spec = length(spec_asu.points)
+
+    # ── 1. Enumerate M-grid orbits under G_M ──
+    G_M_ops = [(round.(Int, op.R), round.(Int, op.t) .÷ 2) for op in rem_ops]
+
+    orbit_id = zeros(Int, M_vol)  # orbit_id[m] = which orbit does m belong to
+    orbits = Vector{Vector{Int}}()  # orbits[k] = list of M-grid flat indices
+
+    for m_flat in 1:M_vol
+        orbit_id[m_flat] != 0 && continue  # already assigned
+
+        # BFS to find the full orbit of m_flat
+        orbit = [m_flat]
+        orbit_set = Set{Int}([m_flat])
+        queue = [m_flat]
+        while !isempty(queue)
+            cur = popfirst!(queue)
+            cur0 = cur - 1
+            mv = [mod(cur0, M[1]), mod(div(cur0, M[1]), M[2]),
+                  div(cur0, M[1]*M[2])]
+            for (R_m, s_m) in G_M_ops
+                gm = [mod(sum(R_m[d, :] .* mv) + s_m[d], M[d]) for d in 1:dim]
+                gm_flat = 1 + gm[1] + M[1]*gm[2] + M[1]*M[2]*gm[3]
+                if gm_flat ∉ orbit_set
+                    push!(orbit_set, gm_flat)
+                    push!(orbit, gm_flat)
+                    push!(queue, gm_flat)
+                end
+            end
+        end
+
+        push!(orbits, orbit)
+        k = length(orbits)
+        for idx in orbit
+            orbit_id[idx] = k
+        end
+    end
+
+    n_sym = length(orbits)
+    @assert n_sym == n_spec (
+        "Symmetric subspace dim ($n_sym) ≠ n_spec ($n_spec). " *
+        "Cannot build dense inverse for this group.")
+
+    # ── 2. Build V_sym via orbit-representative approach ──
+    # V_sym[m, k] = 1/√|orbit_k|  if m ∈ orbit_k, else 0
+    # Instead of dense V_sym (M_vol × n_sym), we build the product V_sym × X
+    # directly. But for the dense_inv = V_sym × B_sym⁻¹, we need V_sym.
+    # For moderate M_vol this is feasible as a dense matrix.
+    V_sym = zeros(Float64, M_vol, n_sym)
+    for (k, orbit) in enumerate(orbits)
+        norm_k = 1.0 / sqrt(length(orbit))
+        for idx in orbit
+            V_sym[idx, k] = norm_k
+        end
+    end
+
+    # ── 3. Build B_sym directly (pipeline applied to symmetrized unit vectors) ──
+    # B_sym[h, k] = Σ_{m ∈ orbit_k} (1/√|orbit_k|) × B[h, m]
+    # We compute this by running the forward pipeline on each orbit's
+    # representative vector (uniform over orbit members).
+    G0_view = reshape(krfft.work_buffer, M)
+    B_sym = zeros(ComplexF64, n_spec, n_sym)
+    for (k, orbit) in enumerate(orbits)
+        fill!(fwd_plan.f0_buffer, 0.0)
+        norm_k = 1.0 / sqrt(length(orbit))
+        for idx in orbit
+            fwd_plan.f0_buffer[idx] = norm_k
+        end
+        centering_fold!(fold, fwd_plan.f0_buffer)
+        fft_channels!(fold)
+        assemble_G0!(G0_view, fold)
+        fast_reconstruct!(krfft)
+        B_sym[:, k] = krfft.output_buffer
+    end
+
+    # ── 4. Build factored inverse: B_sym_inv + orbit tables ──
+    B_sym_inv = ComplexF64.(inv(B_sym))  # (n_spec × n_spec)
+
+    # Build orbit_id and orbit_norm vectors for f₀-level expansion
+    orbit_id_vec = Vector{Int32}(undef, M_vol)
+    for m in 1:M_vol
+        orbit_id_vec[m] = Int32(orbit_id[m])
+    end
+    orbit_norm_vec = [1.0 / sqrt(length(orbit)) for orbit in orbits]
+    coeffs_buf = Vector{ComplexF64}(undef, n_spec)
+
+    # Build return plan with empty two-step tables
+    empty_compact = Matrix{InvCompactEntry}(undef, 0, 0)
+    empty_blocks = Int32[]
+    empty_expand = OrbitExpandEntry[]
+
+    return CenteredKRFFTBackwardPlan(
+        true,   # use_dense
+        empty_compact, empty_blocks, empty_expand, 0, ComplexF64[],
+        B_sym_inv, orbit_id_vec, orbit_norm_vec, coeffs_buf,
+        fold, fwd_plan.f0_buffer, G0_view,
+        M, n_spec)
+end
+
+

@@ -29,6 +29,8 @@ export SubgridCenteringFoldPlan, CenteredKRFFTPlan
 export plan_krfft_centered, execute_centered_krfft!, fft_reconstruct_centered!
 export plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
 export ifft_channels!, centering_unfold!, disassemble_G0!
+export CenteredKRFFTBackwardPlan, InvReconEntry
+export plan_centered_ikrfft, execute_centered_ikrfft!, ifft_unrecon_centered!
 
 
 """
