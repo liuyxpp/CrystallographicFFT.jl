@@ -30,6 +30,10 @@ using CrystallographicFFT
         include("test_centering_fold.jl")
     end
 
+    @testset "M7 SCFT Round-Trip" begin
+        include("test_m7_scft.jl")
+    end
+
     @testset "Q-Fused KRFFT" begin
         include("test_q_fused.jl")
     end

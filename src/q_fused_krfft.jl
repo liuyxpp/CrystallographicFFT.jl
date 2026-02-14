@@ -2,11 +2,15 @@ module QFusedKRFFT
 
 using LinearAlgebra
 using FFTW
-using ..SymmetryOps: SymOp, get_ops, check_shift_invariance, dual_ops
+using ..SymmetryOps: SymOp, get_ops, check_shift_invariance, dual_ops,
+    detect_centering_type, CentP
 using ..ASU: find_optimal_shift
-using ..KRFFT: auto_L
+using ..KRFFT: auto_L, SubgridCenteringFoldPlan,
+    plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!,
+    ifft_channels!, centering_unfold!, disassemble_G0!
 
 export M2QPlan, plan_m2_q, execute_m2_q!
+export M7SCFTPlan, plan_m7_scft, execute_m7_scft!
 export subgrid_to_fullgrid!, fullgrid_to_subgrid!
 
 # ============================================================================
@@ -751,6 +755,118 @@ function _build_fill_map(shifted_ops, L, M_sub, N, D)
     end
 
     return fill_map
+end
+
+# ============================================================================
+# M7 SCFT Plan: fold → FFT → assemble G₀ → Q-multiply → disassemble → IFFT → unfold
+# ============================================================================
+
+"""
+    M7SCFTPlan
+
+Plan for M7 SCFT diffusion step with centering fold acceleration.
+
+Pipeline: f₀(M³) → centering_fold → n_ch × H³ → FFT → assemble G₀(M³)
+          → Q-multiply G₀ → disassemble → n_ch × H³ → IFFT → unfold → f₀'(M³)
+
+The centering fold reduces FFT/IFFT cost by 2× (I/C/A) or 4× (F) by decomposing
+into smaller channel FFTs. The Q-multiply handles stride-2 aliasing on the M³ grid,
+identical to M2's Q operation.
+
+# Fields
+- `m2q_plan`: The underlying M2QPlan (provides Q matrices, gather indices, buffers)
+- `fold_plan`: SubgridCenteringFoldPlan for fold/unfold and channel FFTs
+- `G0_view`: Reshaped view of m2q_plan.Y_buf for assemble/disassemble
+- `M`: subgrid dimensions (M₁, M₂, M₃)
+"""
+struct M7SCFTPlan
+    m2q_plan::M2QPlan
+    fold_plan::SubgridCenteringFoldPlan
+    G0_view::Array{ComplexF64,3}
+    M::NTuple{3,Int}
+end
+
+"""
+    plan_m7_scft(N, sg_num, dim, Δs, lattice) -> M7SCFTPlan
+
+Create an M7 SCFT plan for the given space group and grid.
+Combines centering fold (FFT acceleration) with M2's Q-multiply (aliasing).
+
+Throws an error if the space group is P-centering (use M2+Q instead).
+"""
+function plan_m7_scft(N::NTuple{3,Int}, sg_num::Int, dim::Int,
+                      Δs::Float64, lattice::AbstractMatrix)
+    # First create the M2QPlan (handles Q matrices, buffers, etc.)
+    m2q = plan_m2_q(N, sg_num, dim, Δs, lattice)
+
+    M = NTuple{3,Int}(m2q.M)
+
+    # Detect centering
+    ops = get_ops(sg_num, dim, N)
+    _, shifted_ops = find_optimal_shift(ops, N)
+    cent = detect_centering_type(shifted_ops, N)
+    if cent == CentP
+        error("M7 SCFT requires centered lattice (I/F/C/A). " *
+              "For P-centering, use M2+Q (plan_m2_q) instead.")
+    end
+
+    if !all(iseven, M)
+        error("M sub-grid dimensions $M must be even for centering fold.")
+    end
+
+    # Create fold plan
+    fold_plan = plan_centering_fold(cent, M)
+
+    # Create G₀ view into M2Q's Y_buf
+    G0_view = reshape(m2q.Y_buf, M)
+
+    return M7SCFTPlan(m2q, fold_plan, G0_view, M)
+end
+
+"""
+    execute_m7_scft!(plan::M7SCFTPlan, f0::Array{Float64,3})
+
+Apply diffusion operator to subgrid data f₀ in-place using M7 SCFT pipeline.
+
+Hot path:
+  1. centering_fold: f₀(M³) → n_ch × H³
+  2. fft_channels: n_ch × H³ → n_ch × Ĥ³
+  3. assemble_G₀: n_ch × Ĥ³ → G₀(M³)     [write into Y_buf]
+  4. Q-multiply: G₀ → G₀'                 [M2's Q on M³, result in Y_new_buf]
+  5. copy: Y_new_buf → Y_buf (for disassemble)
+  6. disassemble_G₀: G₀'(M³) → n_ch × Ĥ³
+  7. ifft_channels: n_ch × Ĥ³ → n_ch × H³
+  8. centering_unfold: n_ch × H³ → f₀'(M³)
+
+Steps 1-3 replace M2's forward FFT (fewer FFT points via centering fold).
+Step 4 is identical to M2's Q-multiply.
+Steps 5-8 replace M2's inverse FFT.
+"""
+function execute_m7_scft!(plan::M7SCFTPlan, f0::Array{Float64,3})
+    m2q = plan.m2q_plan
+    fold = plan.fold_plan
+
+    # Steps 1-2: Centering fold + channel FFTs
+    centering_fold!(fold, f0)
+    fft_channels!(fold)
+
+    # Step 3: Assemble into M2Q's Y_buf (viewed as M³)
+    assemble_G0!(plan.G0_view, fold)
+
+    # Step 4: Q multiply (operates on M³ Y_buf → Y_new_buf)
+    if m2q.is_separable
+        _q_multiply_separable!(m2q.Y_new_buf, m2q.Y_buf, m2q)
+    else
+        _q_multiply_generic!(m2q.Y_new_buf, m2q.Y_buf, m2q)
+    end
+
+    # Step 5: Copy result for disassembly
+    copyto!(m2q.Y_buf, m2q.Y_new_buf)
+
+    # Steps 6-8: Disassemble + channel IFFTs + centering unfold
+    disassemble_G0!(fold, plan.G0_view)
+    ifft_channels!(fold)
+    centering_unfold!(fold, f0)
 end
 
 end  # module QFusedKRFFT

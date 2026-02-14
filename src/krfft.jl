@@ -28,6 +28,7 @@ export OptimizedFractalPlan, plan_fractal_krfft_v2, execute_fractal_krfft_v2!
 export SubgridCenteringFoldPlan, CenteredKRFFTPlan
 export plan_krfft_centered, execute_centered_krfft!, fft_reconstruct_centered!
 export plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
+export ifft_channels!, centering_unfold!, disassemble_G0!
 
 
 """

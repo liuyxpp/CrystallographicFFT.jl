@@ -46,6 +46,7 @@ struct SubgridCenteringFoldPlan
     offsets::Vector{NTuple{3,Int}}
     channel_bufs::Vector{Array{ComplexF64,3}}
     channel_fft_plans::Vector{FFTW.cFFTWPlan{ComplexF64,-1,false,3,UnitRange{Int64}}}
+    channel_ifft_plans::Vector{Any}  # ScaledPlan{ComplexF64, cFFTWPlan{...,1,...}, Float64}
     channel_fft_out::Vector{Array{ComplexF64,3}}
     twiddle_1d::Vector{NTuple{3,Vector{ComplexF64}}}  # [channel][dim][n+1]
     sign_table::Vector{NTuple{8,Int}}                  # [channel][(ez*4+ey*2+ex)+1]
@@ -66,6 +67,7 @@ function plan_centering_fold(centering::CenteringType, M::NTuple{3,Int})
     channel_bufs = [zeros(ComplexF64, H...) for _ in 1:n_ch]
     channel_fft_out = [zeros(ComplexF64, H...) for _ in 1:n_ch]
     channel_fft_plans = [plan_fft(channel_bufs[c], 1:3) for c in 1:n_ch]
+    channel_ifft_plans = [plan_ifft(channel_fft_out[c], 1:3) for c in 1:n_ch]
 
     # P1: Precompute separable 1D twiddle tables
     # tw_d[n+1] = cispi(-2 * off_d * n / M_d) for n in 0:H_d-1
@@ -97,7 +99,7 @@ function plan_centering_fold(centering::CenteringType, M::NTuple{3,Int})
     end
 
     return SubgridCenteringFoldPlan(centering, M, H, n_ch, offsets,
-        channel_bufs, channel_fft_plans, channel_fft_out,
+        channel_bufs, channel_fft_plans, channel_ifft_plans, channel_fft_out,
         twiddle_1d, sign_table)
 end
 
@@ -427,3 +429,153 @@ function fft_reconstruct_centered!(plan::CenteredKRFFTPlan)
 
     return krfft.output_buffer
 end
+
+# ============================================================================
+# Inverse Operations
+# ============================================================================
+
+"""
+    ifft_channels!(plan::SubgridCenteringFoldPlan)
+
+Execute IFFT on all folded channels (out-of-place: channel_fft_out → channel_bufs).
+"""
+function ifft_channels!(plan::SubgridCenteringFoldPlan)
+    @inbounds for c in 1:plan.n_channels
+        mul!(plan.channel_bufs[c], plan.channel_ifft_plans[c], plan.channel_fft_out[c])
+    end
+end
+
+"""
+    disassemble_G0!(plan::SubgridCenteringFoldPlan, G0::AbstractArray{ComplexF64,3})
+
+Inverse of `assemble_G0!`: reads G₀(M³) and fills channel_fft_out arrays.
+Extracts alive-parity entries from G₀ into the per-channel FFT output buffers.
+"""
+function disassemble_G0!(plan::SubgridCenteringFoldPlan,
+                          G0::AbstractArray{ComplexF64,3})
+    H1, H2, H3 = plan.H
+
+    @inbounds for c in 1:plan.n_channels
+        off = plan.offsets[c]
+        fft_out = plan.channel_fft_out[c]
+
+        for iz in 0:H3-1, iy in 0:H2-1, ix in 0:H1-1
+            h1 = 2*ix + off[1]
+            h2 = 2*iy + off[2]
+            h3 = 2*iz + off[3]
+            fft_out[ix+1, iy+1, iz+1] = G0[h1+1, h2+1, h3+1]
+        end
+    end
+end
+
+"""
+    centering_unfold!(plan::SubgridCenteringFoldPlan, f0::AbstractArray{<:Real,3})
+
+Inverse of `centering_fold!`: reconstruct f₀(M³) from n_ch channels on H³.
+
+The inverse WHT is WHT/8 (self-inverse up to normalization). For alive channels,
+extinct WHT coefficients are implicitly zero (centering symmetry guarantee).
+
+    f₀(n₀ + Hε) = (1/8) Σ_off (-1)^(off·ε) · g_off(n₀) / twiddle(off, n₀)
+"""
+function centering_unfold!(plan::SubgridCenteringFoldPlan,
+                            f0::AbstractArray{<:Real,3})
+    if plan.n_channels == 4
+        _centering_unfold_4ch!(plan, f0)
+    elseif plan.n_channels == 2
+        _centering_unfold_2ch!(plan, f0)
+    end
+end
+
+"""
+2-channel inverse kernel for F-centering.
+Reconstructs f₀ from channel 0 (off=(0,0,0)) and channel 1 (off=(1,1,1)).
+"""
+function _centering_unfold_2ch!(plan::SubgridCenteringFoldPlan,
+                                 f0::AbstractArray{<:Real,3})
+    H1, H2, H3 = plan.H
+    buf0 = plan.channel_bufs[1]  # g_{(0,0,0)}(n0)
+    buf1 = plan.channel_bufs[2]  # g_{(1,1,1)}(n0) · twiddle
+    tw1, tw2, tw3 = plan.twiddle_1d[2]
+    signs = plan.sign_table[2]
+
+    @inbounds for iz in 0:H3-1
+        tw_z_conj = conj(tw3[iz+1])
+        for iy in 0:H2-1
+            tw_yz_conj = conj(tw2[iy+1]) * tw_z_conj
+            for ix in 0:H1-1
+                # Undo twiddle to get raw WHT coefficient
+                tw_conj = conj(tw1[ix+1]) * tw_yz_conj
+                g0 = real(buf0[ix+1, iy+1, iz+1])
+                g1 = real(buf1[ix+1, iy+1, iz+1] * tw_conj)
+
+                # Inverse WHT: f0(n0 + H*eps) = (1/8) sum_off (-1)^(off.eps) * g_off
+                # Only 2 alive: off=(0,0,0) with g0, off=(1,1,1) with g1
+                # All 6 extinct channels are zero
+                for eps_idx in 1:8
+                    s = signs[eps_idx]  # (-1)^((1,1,1)·eps)
+                    val = (g0 + s * g1) / 8.0
+
+                    ex = (eps_idx - 1) & 1
+                    ey = ((eps_idx - 1) >> 1) & 1
+                    ez = ((eps_idx - 1) >> 2) & 1
+                    f0[ix+ex*H1+1, iy+ey*H2+1, iz+ez*H3+1] = val
+                end
+            end
+        end
+    end
+end
+
+"""
+4-channel inverse kernel for I/C/A centering.
+Reconstructs f₀ from 4 alive channels using inverse WHT.
+"""
+function _centering_unfold_4ch!(plan::SubgridCenteringFoldPlan,
+                                 f0::AbstractArray{<:Real,3})
+    H1, H2, H3 = plan.H
+
+    # Build alive WHT indices (same mapping as forward)
+    alive_wht_idx = [off[1] + off[2]*2 + off[3]*4 + 1 for off in plan.offsets]
+
+    @inbounds for iz in 0:H3-1
+        # Precompute twiddle conjugates for dim 3
+        tw_z = [conj(plan.twiddle_1d[c][3][iz+1]) for c in 1:4]
+        for iy in 0:H2-1
+            # Precompute twiddle conjugates for dim 2*3
+            tw_yz = [conj(plan.twiddle_1d[c][2][iy+1]) * tw_z[c] for c in 1:4]
+            for ix in 0:H1-1
+                # Get raw WHT coefficients by undoing twiddle
+                # wht_coeff[wht_idx] = g_off(n0) / twiddle(off, n0)
+                wht_coeffs = zeros(8)  # all 8 WHT slots, extinct = 0
+                for c in 1:4
+                    tw_full = conj(plan.twiddle_1d[c][1][ix+1]) * tw_yz[c]
+                    wht_coeffs[alive_wht_idx[c]] = real(
+                        plan.channel_bufs[c][ix+1, iy+1, iz+1] * tw_full)
+                end
+
+                # Inverse WHT (3-stage butterfly, same as forward since WHT = WHT^-1 up to scale)
+                # Stage 1: dim 1 (stride=1)
+                a0_00 = wht_coeffs[1] + wht_coeffs[2]; a1_00 = wht_coeffs[1] - wht_coeffs[2]
+                a0_10 = wht_coeffs[3] + wht_coeffs[4]; a1_10 = wht_coeffs[3] - wht_coeffs[4]
+                a0_01 = wht_coeffs[5] + wht_coeffs[6]; a1_01 = wht_coeffs[5] - wht_coeffs[6]
+                a0_11 = wht_coeffs[7] + wht_coeffs[8]; a1_11 = wht_coeffs[7] - wht_coeffs[8]
+                # Stage 2: dim 2 (stride=2)
+                b00_0 = a0_00 + a0_10; b01_0 = a0_00 - a0_10
+                b10_0 = a1_00 + a1_10; b11_0 = a1_00 - a1_10
+                b00_1 = a0_01 + a0_11; b01_1 = a0_01 - a0_11
+                b10_1 = a1_01 + a1_11; b11_1 = a1_01 - a1_11
+                # Stage 3: dim 3 (stride=4) -> f0 values / 8
+                inv8 = 1.0 / 8.0
+                f0[ix+1,     iy+1,     iz+1]     = (b00_0 + b00_1) * inv8 # eps=(0,0,0)
+                f0[ix+H1+1,  iy+1,     iz+1]     = (b10_0 + b10_1) * inv8 # eps=(1,0,0)
+                f0[ix+1,     iy+H2+1,  iz+1]     = (b01_0 + b01_1) * inv8 # eps=(0,1,0)
+                f0[ix+H1+1,  iy+H2+1,  iz+1]     = (b11_0 + b11_1) * inv8 # eps=(1,1,0)
+                f0[ix+1,     iy+1,     iz+H3+1]  = (b00_0 - b00_1) * inv8 # eps=(0,0,1)
+                f0[ix+H1+1,  iy+1,     iz+H3+1]  = (b10_0 - b10_1) * inv8 # eps=(1,0,1)
+                f0[ix+1,     iy+H2+1,  iz+H3+1]  = (b01_0 - b01_1) * inv8 # eps=(0,1,0)
+                f0[ix+H1+1,  iy+H2+1,  iz+H3+1]  = (b11_0 - b11_1) * inv8 # eps=(1,1,1)
+            end
+        end
+    end
+end
+
