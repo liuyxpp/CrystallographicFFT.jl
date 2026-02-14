@@ -24,7 +24,7 @@ using Random
 using Printf
 using Statistics
 
-"""Generate symmetric field for the given ops (optimized: no allocations in inner loop)."""
+"""Generate symmetric field via scatter (sequential reads, random writes → cache friendly)."""
 function make_symmetric(ops, N)
     Random.seed!(42)
     u = randn(N...)
@@ -33,18 +33,20 @@ function make_symmetric(ops, N)
     R_mats = [Int.(op.R) for op in ops]
     t_vecs = [round.(Int, op.t) for op in ops]
     @inbounds for k in 1:N3, j in 1:N2, i in 1:N1
-        x1, x2, x3 = i-1, j-1, k-1
+        v = u[i, j, k]
+        x1, x2, x3 = i - 1, j - 1, k - 1
         for g in eachindex(ops)
             R = R_mats[g]; t = t_vecs[g]
             y1 = mod(R[1,1]*x1 + R[1,2]*x2 + R[1,3]*x3 + t[1], N1) + 1
             y2 = mod(R[2,1]*x1 + R[2,2]*x2 + R[2,3]*x3 + t[2], N2) + 1
             y3 = mod(R[3,1]*x1 + R[3,2]*x2 + R[3,3]*x3 + t[3], N3) + 1
-            u_sym[i,j,k] += u[y1, y2, y3]
+            u_sym[y1, y2, y3] += v
         end
     end
     u_sym ./= length(ops)
     return u_sym
 end
+
 
 function benchmark_one(sg, name, N_size, fft_plan, fft_out; n_warmup=2, n_trials=10)
     N = (N_size, N_size, N_size)
@@ -100,17 +102,15 @@ function benchmark_one(sg, name, N_size, fft_plan, fft_out; n_warmup=2, n_trials
     speedup_bwd = t_fft / t_bwd
     ratio_bwd_fwd = t_bwd / t_fwd
 
-    dense_tag = bwd.dense_mode !== :twostep ? " [$(bwd.dense_mode)]" : ""
-
-    @printf("%-10s SG%-3d  %s  %dch  N=%d  fft=%.2fms  fwd=%.2fms(%5.1f×)  bwd=%.2fms(%5.1f×)  bwd/fwd=%.2f  rt_err=%.1e%s\n",
+    @printf("%-10s SG%-3d  %s  %dch  N=%d  fft=%.2fms  fwd=%.2fms(%5.1f×)  bwd=%.2fms(%5.1f×)  bwd/fwd=%.2f  rt_err=%.1e\n",
             name, sg, cent, n_ch, N_size,
             t_fft*1e3, t_fwd*1e3, speedup_fwd,
-            t_bwd*1e3, speedup_bwd, ratio_bwd_fwd, rt_err, dense_tag)
+            t_bwd*1e3, speedup_bwd, ratio_bwd_fwd, rt_err)
 
     return (name=name, sg=sg, cent=string(cent), n_ch=n_ch, N=N_size,
             t_fft=t_fft, t_fwd=t_fwd, t_bwd=t_bwd,
             speedup_fwd=speedup_fwd, speedup_bwd=speedup_bwd,
-            ratio=ratio_bwd_fwd, rt_err=rt_err, dense_mode=bwd.dense_mode)
+            ratio=ratio_bwd_fwd, rt_err=rt_err)
 end
 
 function main()
@@ -149,8 +149,7 @@ function main()
         fft_plan = plan_fft(u_tmp)
 
         for (sg, name) in test_cases
-            # Skip Ia-3d at N≥128 (dense path infeasible)
-            sg == 230 && N_size >= 128 && continue
+
             r = benchmark_one(sg, name, N_size, fft_plan, fft_out;
                               n_warmup=2, n_trials=n_trials)
             r !== nothing && push!(all_results, r)
