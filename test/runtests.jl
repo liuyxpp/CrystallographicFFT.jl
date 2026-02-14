@@ -29,4 +29,8 @@ using CrystallographicFFT
     @testset "Centering Fold on Stride-2 Subgrid" begin
         include("test_centering_fold.jl")
     end
+
+    @testset "Q-Fused KRFFT" begin
+        include("test_q_fused.jl")
+    end
 end

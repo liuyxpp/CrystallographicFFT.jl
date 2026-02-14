@@ -11,6 +11,8 @@ using .MatrixQ
 include("cfft_plan.jl")
 include("krfft.jl")
 using .KRFFT
+include("q_fused_krfft.jl")
+using .QFusedKRFFT
 include("diffusion_solver.jl")
 using .DiffusionSolver
 include("optimal_L.jl")
@@ -18,5 +20,6 @@ include("execution.jl")
 export CFFTPlan, plan_cfft
 export optimal_L, optimal_L_isotropic, recommended_N, group_order
 export auto_L
+export M2QPlan, plan_m2_q, execute_m2_q!, subgrid_to_fullgrid!, fullgrid_to_subgrid!
 
 end
