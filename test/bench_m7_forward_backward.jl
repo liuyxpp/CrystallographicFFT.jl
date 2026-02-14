@@ -100,7 +100,7 @@ function benchmark_one(sg, name, N_size, fft_plan, fft_out; n_warmup=2, n_trials
     speedup_bwd = t_fft / t_bwd
     ratio_bwd_fwd = t_bwd / t_fwd
 
-    dense_tag = bwd.use_dense ? " [dense]" : ""
+    dense_tag = bwd.dense_mode !== :twostep ? " [$(bwd.dense_mode)]" : ""
 
     @printf("%-10s SG%-3d  %s  %dch  N=%d  fft=%.2fms  fwd=%.2fms(%5.1f×)  bwd=%.2fms(%5.1f×)  bwd/fwd=%.2f  rt_err=%.1e%s\n",
             name, sg, cent, n_ch, N_size,
@@ -110,7 +110,7 @@ function benchmark_one(sg, name, N_size, fft_plan, fft_out; n_warmup=2, n_trials
     return (name=name, sg=sg, cent=string(cent), n_ch=n_ch, N=N_size,
             t_fft=t_fft, t_fwd=t_fwd, t_bwd=t_bwd,
             speedup_fwd=speedup_fwd, speedup_bwd=speedup_bwd,
-            ratio=ratio_bwd_fwd, rt_err=rt_err, dense=bwd.use_dense)
+            ratio=ratio_bwd_fwd, rt_err=rt_err, dense_mode=bwd.dense_mode)
 end
 
 function main()

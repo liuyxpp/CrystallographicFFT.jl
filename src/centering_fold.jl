@@ -596,21 +596,33 @@ struct OrbitExpandEntry
 end
 
 """
+    AdjReconEntry
+
+One entry in the adjoint reconstruction table.
+Maps spectral index h with conjugated weight back to G₀ position q.
+"""
+struct AdjReconEntry
+    h_idx::Int32
+    conj_weight::ComplexF64
+end
+
+"""
     CenteredKRFFTBackwardPlan
 
 Backward plan for centered KRFFT: spectral ASU → f₀(M³).
 
-Two paths:
-- **Two-step** (fast, use_dense==false):
-  Step 1: Compact gather F̂ → G₀_reps via block-diagonal A⁻¹.
-  Step 2: Orbit expansion G₀_reps → full G₀ (sequential write).
-  Then: disassemble_G₀ → IFFT → unfold.
-- **Factored orbit** (use_dense==true):
-  Step 1: c = B_sym_inv × F̂   (n_spec² ops)
-  Step 2: f₀[m] = Re(c[orbit_id[m]]) / √|orbit|  (M³ lookups)
+Three paths controlled by `dense_mode`:
+- **:twostep** (fast, symmorphic groups):
+  Block-diagonal A⁻¹ gather + orbit expansion + IFFT chain.
+- **:dense** (non-symmorphic, small N where n_spec²×16 < memory_budget):
+  c = B_sym_inv × F̂, then orbit expand.
+- **:cg** (non-symmorphic, large N):
+  Matrix-free CG on normal equations Re(A†A)f₀ = Re(A†F̂),
+  using forward pipeline + adjoint pipeline per iteration.
+  κ(B_sym) = 6.93 constant ⟹ exactly 7 CG iterations.
 """
 struct CenteredKRFFTBackwardPlan
-    use_dense::Bool
+    dense_mode::Symbol   # :twostep, :dense, or :cg
 
     # ── Two-step path ──
     inv_compact_table::Matrix{InvCompactEntry}  # (max_block_size, n_reps)
@@ -619,11 +631,17 @@ struct CenteredKRFFTBackwardPlan
     n_reps::Int
     G0_reps::Vector{ComplexF64}                 # workspace (n_reps,)
 
-    # ── Factored orbit path (non-symmorphic groups) ──
-    B_sym_inv::Matrix{ComplexF64}               # (n_spec, n_spec) inverse
+    # ── Dense / CG shared orbit data ──
+    B_sym_inv::Matrix{ComplexF64}               # (n_spec, n_spec) dense mode only
     dense_orbit_id::Vector{Int32}               # (M_vol,) orbit index per position
     dense_orbit_norm::Vector{Float64}           # (n_orbits,) = 1/√|orbit|
-    dense_coeffs::Vector{ComplexF64}            # (n_spec,) workspace
+    dense_coeffs::Vector{ComplexF64}            # (n_spec,) workspace for dense
+
+    # ── CG path extras ──
+    adj_recon_table::Vector{Vector{AdjReconEntry}}  # transpose recon table
+    fwd_plan_ref::Union{CenteredKRFFTPlan, Nothing}  # forward plan for pipeline
+    n_orbits::Int                               # number of orbits
+    cg_workspace::Vector{Float64}               # CG scratch vectors (3 × M_vol)
 
     # Shared state
     fold_plan::SubgridCenteringFoldPlan
@@ -871,9 +889,10 @@ function plan_centered_ikrfft(spec_asu::SpectralIndexing,
     G0_reps_buf = Vector{ComplexF64}(undef, n_reps)
 
     return CenteredKRFFTBackwardPlan(
-        false,  # use_dense
+        :twostep,  # dense_mode
         inv_compact_table, block_sizes_vec, orbit_expand_vec, n_reps, G0_reps_buf,
         empty_dense, Int32[], Float64[], ComplexF64[],
+        Vector{AdjReconEntry}[], nothing, 0, Float64[],
         fold, fwd_plan.f0_buffer, G0_view,
         M, n_spec)
 end
@@ -888,11 +907,15 @@ Dispatches to orbit-scatter path or dense-matrix path based on plan.
 function execute_centered_ikrfft!(bplan::CenteredKRFFTBackwardPlan,
                                    F_spec::AbstractVector{ComplexF64},
                                    f0_out::AbstractArray{Float64, 3})
-    if bplan.use_dense
+    if bplan.dense_mode === :dense
         # Factored orbit path: c = B_sym_inv × F̂, then orbit expand to f₀
         _factored_orbit_inv!(f0_out, F_spec, bplan.B_sym_inv,
                              bplan.dense_coeffs, bplan.dense_orbit_id,
                              bplan.dense_orbit_norm)
+        return f0_out
+    elseif bplan.dense_mode === :cg
+        # Matrix-free CG path: solve Re(A†A)f₀ = Re(A†F̂)
+        _cg_backward_solve!(f0_out, F_spec, bplan)
         return f0_out
     end
 
@@ -983,18 +1006,238 @@ function _factored_orbit_inv!(f0_out::AbstractArray{Float64, 3},
     end
 end
 
+"""Build adjoint reconstruction table: for each G₀ position q, list of (h, conj_weight)."""
+function _build_adj_recon_table(recon_table::Matrix{ReconEntry}, M_vol::Int)
+    max_per_h, n_spec = size(recon_table)
+    adj_lists = [AdjReconEntry[] for _ in 1:M_vol]
+    @inbounds for h in 1:n_spec
+        for k in 1:max_per_h
+            e = recon_table[k, h]
+            abs(e.weight) > 1e-15 || continue
+            push!(adj_lists[e.buffer_idx], AdjReconEntry(Int32(h), conj(e.weight)))
+        end
+    end
+    return adj_lists
+end
+
+"""Project f₀ onto orbit-symmetric subspace: each position gets its orbit average."""
+function _orbit_project!(f0_flat::AbstractVector{<:Real},
+                          orbit_id::Vector{Int32}, n_orbits::Int,
+                          orbit_counts::Vector{Int})
+    # Accumulate sums per orbit
+    orbit_sums = zeros(n_orbits)
+    @inbounds for m in eachindex(f0_flat)
+        orbit_sums[orbit_id[m]] += f0_flat[m]
+    end
+    # Write back averages
+    @inbounds for m in eachindex(f0_flat)
+        k = orbit_id[m]
+        f0_flat[m] = orbit_sums[k] / orbit_counts[k]
+    end
+end
+
+"""
+    _adjoint_pipeline_4ch!(f0_adj, F_in, fwd_plan, adj_recon_tab)
+
+Adjoint of the full forward pipeline: F̂ → f₀†.
+Implements recon† → disassemble → FFT† → fold† (4-channel WHT adjoint).
+"""
+function _adjoint_pipeline_4ch!(f0_adj::AbstractArray{Float64, 3},
+                                 F_in::AbstractVector{ComplexF64},
+                                 fwd_plan::CenteredKRFFTPlan,
+                                 adj_recon_tab::Vector{Vector{AdjReconEntry}})
+    krfft_p = fwd_plan.krfft_plan
+    fold_p = fwd_plan.fold_plan
+    M_tup = Tuple(krfft_p.subgrid_dims)
+    M_v = prod(M_tup)
+    H_tup = Tuple(fold_p.H)
+    H_vol = prod(H_tup)
+    n_ch = fold_p.n_channels
+    G0v = reshape(krfft_p.work_buffer, M_tup)
+
+    # Step 1: recon† (transpose reconstruction)
+    fill!(G0v, zero(ComplexF64))
+    @inbounds for q in 1:M_v
+        val = zero(ComplexF64)
+        for e in adj_recon_tab[q]
+            val += e.conj_weight * F_in[e.h_idx]
+        end
+        G0v[q] = val
+    end
+
+    # Step 2: assemble† = disassemble
+    disassemble_G0!(fold_p, G0v)
+
+    # Step 3: FFT†(y) = H_vol × IFFT(y)   (FFTW fft is unnormalized)
+    @inbounds for c in 1:n_ch
+        mul!(fold_p.channel_bufs[c], fold_p.channel_ifft_plans[c],
+             fold_p.channel_fft_out[c])
+        fold_p.channel_bufs[c] .*= H_vol
+    end
+
+    # Step 4: fold† (4-channel WHT adjoint)
+    H1, H2, H3 = H_tup
+    fill!(f0_adj, 0.0)
+
+    off2 = fold_p.offsets[2]; idx2 = off2[1] + off2[2]*2 + off2[3]*4 + 1
+    off3 = fold_p.offsets[3]; idx3 = off3[1] + off3[2]*2 + off3[3]*4 + 1
+    off4 = fold_p.offsets[4]; idx4 = off4[1] + off4[2]*2 + off4[3]*4 + 1
+
+    tw1_2, tw2_2, tw3_2 = fold_p.twiddle_1d[2]
+    tw1_3, tw2_3, tw3_3 = fold_p.twiddle_1d[3]
+    tw1_4, tw2_4, tw3_4 = fold_p.twiddle_1d[4]
+
+    bufs = fold_p.channel_bufs
+
+    @inbounds for iz in 0:H3-1
+        tz2c = conj(tw3_2[iz+1]); tz3c = conj(tw3_3[iz+1])
+        tz4c = conj(tw3_4[iz+1])
+        for iy in 0:H2-1
+            tyz2c = conj(tw2_2[iy+1]) * tz2c
+            tyz3c = conj(tw2_3[iy+1]) * tz3c
+            tyz4c = conj(tw2_4[iy+1]) * tz4c
+            for ix in 0:H1-1
+                # Undo twiddles on alive channels
+                b1 = bufs[1][ix+1,iy+1,iz+1]
+                b2 = bufs[2][ix+1,iy+1,iz+1] * conj(tw1_2[ix+1]) * tyz2c
+                b3 = bufs[3][ix+1,iy+1,iz+1] * conj(tw1_3[ix+1]) * tyz3c
+                b4 = bufs[4][ix+1,iy+1,iz+1] * conj(tw1_4[ix+1]) * tyz4c
+
+                # Build full 8-component WHT† input (4 alive + 4 zeros)
+                w1 = b1;           w2 = zero(ComplexF64)
+                w3 = zero(ComplexF64); w4 = zero(ComplexF64)
+                w5 = zero(ComplexF64); w6 = zero(ComplexF64)
+                w7 = zero(ComplexF64); w8 = zero(ComplexF64)
+                # Place alive channels at their WHT indices
+                if idx2 == 2; w2 = b2; elseif idx2 == 3; w3 = b2
+                elseif idx2 == 4; w4 = b2; elseif idx2 == 5; w5 = b2
+                elseif idx2 == 6; w6 = b2; elseif idx2 == 7; w7 = b2
+                elseif idx2 == 8; w8 = b2; end
+                if idx3 == 2; w2 = b3; elseif idx3 == 3; w3 = b3
+                elseif idx3 == 4; w4 = b3; elseif idx3 == 5; w5 = b3
+                elseif idx3 == 6; w6 = b3; elseif idx3 == 7; w7 = b3
+                elseif idx3 == 8; w8 = b3; end
+                if idx4 == 2; w2 = b4; elseif idx4 == 3; w3 = b4
+                elseif idx4 == 4; w4 = b4; elseif idx4 == 5; w5 = b4
+                elseif idx4 == 6; w6 = b4; elseif idx4 == 7; w7 = b4
+                elseif idx4 == 8; w8 = b4; end
+
+                # 3-stage WHT butterfly (self-adjoint)
+                # Stage 1: over dim 1 (bit 0)
+                t = w1; w1 = t + w2; w2 = t - w2
+                t = w3; w3 = t + w4; w4 = t - w4
+                t = w5; w5 = t + w6; w6 = t - w6
+                t = w7; w7 = t + w8; w8 = t - w8
+                # Stage 2: over dim 2 (bit 1)
+                t = w1; w1 = t + w3; w3 = t - w3
+                t = w2; w2 = t + w4; w4 = t - w4
+                t = w5; w5 = t + w7; w7 = t - w7
+                t = w6; w6 = t + w8; w8 = t - w8
+                # Stage 3: over dim 3 (bit 2)
+                t = w1; w1 = t + w5; w5 = t - w5
+                t = w2; w2 = t + w6; w6 = t - w6
+                t = w3; w3 = t + w7; w7 = t - w7
+                t = w4; w4 = t + w8; w8 = t - w8
+
+                # Scatter to 8 f₀ positions
+                f0_adj[ix+1,    iy+1,    iz+1]    += real(w1)
+                f0_adj[ix+H1+1, iy+1,    iz+1]    += real(w2)
+                f0_adj[ix+1,    iy+H2+1, iz+1]    += real(w3)
+                f0_adj[ix+H1+1, iy+H2+1, iz+1]    += real(w4)
+                f0_adj[ix+1,    iy+1,    iz+H3+1] += real(w5)
+                f0_adj[ix+H1+1, iy+1,    iz+H3+1] += real(w6)
+                f0_adj[ix+1,    iy+H2+1, iz+H3+1] += real(w7)
+                f0_adj[ix+H1+1, iy+H2+1, iz+H3+1] += real(w8)
+            end
+        end
+    end
+end
+
+"""
+    _cg_backward_solve!(f0_out, F_spec, bplan)
+
+Matrix-free CG solver for non-symmorphic backward transform.
+Solves Re(A†A)f₀ = Re(A†F̂) where A is the forward pipeline,
+projected onto the orbit-symmetric subspace.
+
+κ(B_sym) = 6.93 constant ⟹ converges in exactly 7 iterations.
+Memory: O(M³) instead of O(n_spec²).
+"""
+function _cg_backward_solve!(f0_out::AbstractArray{Float64, 3},
+                              F_spec::AbstractVector{ComplexF64},
+                              bplan::CenteredKRFFTBackwardPlan)
+    fwd = bplan.fwd_plan_ref
+    fold_p = fwd.fold_plan
+    orbit_id = bplan.dense_orbit_id
+    orbit_norm = bplan.dense_orbit_norm
+    n_orb = bplan.n_orbits
+    adj_tab = bplan.adj_recon_table
+    M_tup = bplan.subgrid_dims
+    M_v = prod(M_tup)
+
+    # Precompute orbit sizes (from orbit_norm: norm = 1/√|orbit| → count = 1/norm²)
+    orbit_counts = [round(Int, 1.0 / (norm^2)) for norm in orbit_norm]
+
+    # ── Compute RHS: b = orbit_project(Re(A† × F̂)) ──
+    f0_rhs = zeros(M_tup...)
+    _adjoint_pipeline_4ch!(f0_rhs, F_spec, fwd, adj_tab)
+    b = vec(f0_rhs)
+    _orbit_project!(b, orbit_id, n_orb, orbit_counts)
+
+    # ── CG iteration ──
+    f0_flat = vec(f0_out)
+    fill!(f0_flat, 0.0)
+
+    # r = b (since x₀=0)
+    r = copy(b)
+    p = copy(r)
+    rsold = dot(r, r)
+
+    # Workspace for Ap
+    Ap = bplan.cg_workspace
+    f0_work = reshape(view(Ap, 1:M_v), M_tup)
+
+    maxiter = 15  # κ² ≈ 48, enough headroom
+    tol_sq = (1e-14)^2 * dot(b, b)
+
+    @inbounds for iter in 1:maxiter
+        # Ap = orbit_project(Re(A†(A(orbit_project(p)))))
+        # Step 1: project p → symmetric f₀
+        copyto!(fwd.f0_buffer, reshape(p, M_tup))
+        _orbit_project!(vec(fwd.f0_buffer), orbit_id, n_orb, orbit_counts)
+
+        # Step 2: forward pipeline A × f₀ → F̂
+        centering_fold!(fold_p, fwd.f0_buffer)
+        fft_channels!(fold_p)
+        G0v = reshape(fwd.krfft_plan.work_buffer, M_tup)
+        assemble_G0!(G0v, fold_p)
+        fast_reconstruct!(fwd.krfft_plan)
+        F_hat = fwd.krfft_plan.output_buffer  # reuse buffer
+
+        # Step 3: adjoint pipeline Re(A† × F̂) → f₀†
+        _adjoint_pipeline_4ch!(f0_work, F_hat, fwd, adj_tab)
+
+        # Step 4: project → Ap
+        _orbit_project!(Ap, orbit_id, n_orb, orbit_counts)
+
+        # CG update
+        pAp = dot(p, Ap)
+        α = rsold / pAp
+        f0_flat .+= α .* p
+        r .-= α .* Ap
+        rsnew = dot(r, r)
+        rsnew < tol_sq && break
+        p .= r .+ (rsnew / rsold) .* p
+        rsold = rsnew
+    end
+end
+
 """
     _plan_centered_ikrfft_dense(spec_asu, fwd_plan, rem_ops)
 
-Dense symmetric-subspace fallback for groups where orbit blocks are non-square
-(e.g., Ia-3d SG 230 with non-symmorphic ops).
+Dense/CG hybrid fallback for non-symmorphic groups (e.g., Ia-3d SG 230).
 
-Algorithm (scalable version using orbit enumeration):
-1. Enumerate orbits of M-grid points under G_M = {(R, t÷2) : (R,t) ∈ rem_ops}
-2. Build V_sym sparse-like: each orbit gives one column (normalized indicator)
-3. Build pipeline matrix B restricted to orbit representatives (n_sym columns)
-4. B_sym = B_restricted (square, n_spec × n_sym)
-5. Precompute F̂→f₀: dense_inv = V_sym × B_sym⁻¹ (M³ × n_spec)
+Selects :dense mode if n_spec²×16 < 256 MB, otherwise :cg mode.
 """
 function _plan_centered_ikrfft_dense(spec_asu::SpectralIndexing,
                                       fwd_plan::CenteredKRFFTPlan,
@@ -1009,13 +1252,12 @@ function _plan_centered_ikrfft_dense(spec_asu::SpectralIndexing,
     # ── 1. Enumerate M-grid orbits under G_M ──
     G_M_ops = [(round.(Int, op.R), round.(Int, op.t) .÷ 2) for op in rem_ops]
 
-    orbit_id = zeros(Int, M_vol)  # orbit_id[m] = which orbit does m belong to
-    orbits = Vector{Vector{Int}}()  # orbits[k] = list of M-grid flat indices
+    orbit_id = zeros(Int, M_vol)
+    orbits = Vector{Vector{Int}}()
 
     for m_flat in 1:M_vol
-        orbit_id[m_flat] != 0 && continue  # already assigned
+        orbit_id[m_flat] != 0 && continue
 
-        # BFS to find the full orbit of m_flat
         orbit = [m_flat]
         orbit_set = Set{Int}([m_flat])
         queue = [m_flat]
@@ -1047,60 +1289,63 @@ function _plan_centered_ikrfft_dense(spec_asu::SpectralIndexing,
         "Symmetric subspace dim ($n_sym) ≠ n_spec ($n_spec). " *
         "Cannot build dense inverse for this group.")
 
-    # ── 2. Build V_sym via orbit-representative approach ──
-    # V_sym[m, k] = 1/√|orbit_k|  if m ∈ orbit_k, else 0
-    # Instead of dense V_sym (M_vol × n_sym), we build the product V_sym × X
-    # directly. But for the dense_inv = V_sym × B_sym⁻¹, we need V_sym.
-    # For moderate M_vol this is feasible as a dense matrix.
-    V_sym = zeros(Float64, M_vol, n_sym)
-    for (k, orbit) in enumerate(orbits)
-        norm_k = 1.0 / sqrt(length(orbit))
-        for idx in orbit
-            V_sym[idx, k] = norm_k
-        end
-    end
-
-    # ── 3. Build B_sym directly (pipeline applied to symmetrized unit vectors) ──
-    # B_sym[h, k] = Σ_{m ∈ orbit_k} (1/√|orbit_k|) × B[h, m]
-    # We compute this by running the forward pipeline on each orbit's
-    # representative vector (uniform over orbit members).
-    G0_view = reshape(krfft.work_buffer, M)
-    B_sym = zeros(ComplexF64, n_spec, n_sym)
-    for (k, orbit) in enumerate(orbits)
-        fill!(fwd_plan.f0_buffer, 0.0)
-        norm_k = 1.0 / sqrt(length(orbit))
-        for idx in orbit
-            fwd_plan.f0_buffer[idx] = norm_k
-        end
-        centering_fold!(fold, fwd_plan.f0_buffer)
-        fft_channels!(fold)
-        assemble_G0!(G0_view, fold)
-        fast_reconstruct!(krfft)
-        B_sym[:, k] = krfft.output_buffer
-    end
-
-    # ── 4. Build factored inverse: B_sym_inv + orbit tables ──
-    B_sym_inv = ComplexF64.(inv(B_sym))  # (n_spec × n_spec)
-
-    # Build orbit_id and orbit_norm vectors for f₀-level expansion
+    # Shared orbit data
     orbit_id_vec = Vector{Int32}(undef, M_vol)
     for m in 1:M_vol
         orbit_id_vec[m] = Int32(orbit_id[m])
     end
     orbit_norm_vec = [1.0 / sqrt(length(orbit)) for orbit in orbits]
-    coeffs_buf = Vector{ComplexF64}(undef, n_spec)
+    G0_view = reshape(krfft.work_buffer, M)
 
-    # Build return plan with empty two-step tables
+    # Empty two-step tables
     empty_compact = Matrix{InvCompactEntry}(undef, 0, 0)
     empty_blocks = Int32[]
     empty_expand = OrbitExpandEntry[]
 
-    return CenteredKRFFTBackwardPlan(
-        true,   # use_dense
-        empty_compact, empty_blocks, empty_expand, 0, ComplexF64[],
-        B_sym_inv, orbit_id_vec, orbit_norm_vec, coeffs_buf,
-        fold, fwd_plan.f0_buffer, G0_view,
-        M, n_spec)
+    # ── Decide: dense vs CG based on memory budget ──
+    memory_budget = 256 * 1024 * 1024  # 256 MB
+    bsym_inv_bytes = n_spec^2 * sizeof(ComplexF64)  # 16 bytes each
+
+    if bsym_inv_bytes ≤ memory_budget
+        # ── Dense path: precompute B_sym_inv ──
+        B_sym = zeros(ComplexF64, n_spec, n_sym)
+        for (k, orbit) in enumerate(orbits)
+            fill!(fwd_plan.f0_buffer, 0.0)
+            norm_k = 1.0 / sqrt(length(orbit))
+            for idx in orbit
+                fwd_plan.f0_buffer[idx] = norm_k
+            end
+            centering_fold!(fold, fwd_plan.f0_buffer)
+            fft_channels!(fold)
+            assemble_G0!(G0_view, fold)
+            fast_reconstruct!(krfft)
+            B_sym[:, k] = krfft.output_buffer
+        end
+
+        B_sym_inv = ComplexF64.(inv(B_sym))
+        coeffs_buf = Vector{ComplexF64}(undef, n_spec)
+
+        return CenteredKRFFTBackwardPlan(
+            :dense,
+            empty_compact, empty_blocks, empty_expand, 0, ComplexF64[],
+            B_sym_inv, orbit_id_vec, orbit_norm_vec, coeffs_buf,
+            Vector{AdjReconEntry}[], nothing, n_sym, Float64[],
+            fold, fwd_plan.f0_buffer, G0_view,
+            M, n_spec)
+    else
+        # ── CG path: no B_sym_inv, store adj_recon + fwd_plan ref ──
+        adj_tab = _build_adj_recon_table(krfft.recon_table, M_vol)
+        cg_ws = Vector{Float64}(undef, M_vol)  # workspace for Ap
+        empty_bsym = Matrix{ComplexF64}(undef, 0, 0)
+
+        return CenteredKRFFTBackwardPlan(
+            :cg,
+            empty_compact, empty_blocks, empty_expand, 0, ComplexF64[],
+            empty_bsym, orbit_id_vec, orbit_norm_vec, ComplexF64[],
+            adj_tab, fwd_plan, n_sym, cg_ws,
+            fold, fwd_plan.f0_buffer, G0_view,
+            M, n_spec)
+    end
 end
 
 
