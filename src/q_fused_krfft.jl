@@ -46,6 +46,10 @@ struct M2QPlan{D, FP, IP}
     M::Vector{Int}
     N::Vector{Int}
     fill_map::Array{Int32}  # N1×N2×N3, maps full-grid to subgrid linear index
+    # --- Pmmm separable butterfly fast path ---
+    is_separable::Bool                    # true if Pmmm-like (diagonal R, L=[2,2,2])
+    K_fiber::Array{Float64, 4}            # (d, M1, M2, M3) — real K values per fiber
+    twiddle_1d::Vector{Vector{ComplexF64}} # twiddle_1d[dim][q_d+1] = exp(2πi q_d/N_d)
 end
 
 # ============================================================================
@@ -139,11 +143,21 @@ function plan_m2_q(N::Tuple, sg_num::Int, dim::Int, Δs::Float64,
     # 7. Build fill_map for subgrid_to_fullgrid!
     fill_map = _build_fill_map(shifted_ops, L, M_sub, collect(N), D)
 
+    # 8. Detect Pmmm-like separable structure and precompute fast-path data
+    is_sep = _is_pmmm_like(rep_ops, L, D)
+    K_fiber = zeros(Float64, 0, 0, 0, 0)  # placeholder
+    tw_1d = Vector{ComplexF64}[]
+    if is_sep
+        K_fiber, tw_1d = _build_separable_data(rep_ops, L, M_sub, collect(N), D,
+                                                kernel_func)
+    end
+
     return M2QPlan{D, typeof(sub_fft_plan), typeof(sub_ifft_plan)}(
                       Q_first_row, gather_idx,
                       sub_fft_plan, sub_ifft_plan,
                       Y_buf, Y_new_buf,
-                      rep_ops, L, M_sub, collect(N), fill_map)
+                      rep_ops, L, M_sub, collect(N), fill_map,
+                      is_sep, K_fiber, tw_1d)
 end
 
 # ============================================================================
@@ -391,6 +405,106 @@ function _build_q_matrices!(Q_first_row, gather_idx,
 end
 
 # ============================================================================
+# Separable Detection & Precomputation
+# ============================================================================
+
+"""
+Check if the representative operations form a Pmmm-like structure:
+  - All rotation matrices are diagonal (mirrors/inversions only)
+  - L = [2, 2, ...] in all dimensions
+"""
+function _is_pmmm_like(rep_ops::Vector{SymOp}, L::Vector{Int}, D::Int)
+    # L must be [2, 2, ..., 2]
+    all(l == 2 for l in L) || return false
+    # All R must be diagonal
+    for op in rep_ops
+        for i in 1:D, j in 1:D
+            i != j && op.R[i, j] != 0 && return false
+        end
+    end
+    return true
+end
+
+"""
+Precompute K_fiber values and 1D twiddle factors for the separable fast path.
+
+For Pmmm-like groups with L=[2,2,2], d=8, the B matrix factors as:
+    B = WHT₈ · diag(twiddle)
+where WHT₈ = H⊗H⊗H (Hadamard), and twiddle depends only on q.
+
+Returns:
+  - `K_fiber`: (d, M₁, M₂, M₃) array of real kernel values K(h_a)
+  - `twiddle_1d`: 1D twiddle arrays, twiddle_1d[dim][q+1] = exp(2πi q/N_d)
+"""
+function _build_separable_data(rep_ops, L, M_sub, N, D, kernel_func)
+    d = prod(L)
+
+    # Build alphas (canonical ordering matching rep_ops)
+    alphas = Vector{Vector{Int}}(undef, d)
+    idx = 0
+    for x0 in Iterators.product([0:L[dd]-1 for dd in 1:D]...)
+        idx += 1
+        alphas[idx] = collect(x0)
+    end
+
+    # K_fiber[a, q1, q2, q3] = K(h_a) where h_a = q + M*α_a
+    K_fiber = zeros(Float64, d, M_sub...)
+    h_centered = zeros(Int, D)
+
+    for q_cart in CartesianIndices(Tuple(M_sub))
+        q_vec = [q_cart[dd] - 1 for dd in 1:D]
+        for a in 1:d
+            α = alphas[a]
+            for dd in 1:D
+                h = q_vec[dd] + M_sub[dd] * α[dd]
+                h_centered[dd] = h >= N[dd] ÷ 2 ? h - N[dd] : h
+            end
+            K_fiber[a, q_cart] = kernel_func(h_centered)
+        end
+    end
+
+    # 1D twiddle factors: twiddle_1d[dim][q+1] = exp(2πi q / N_d)
+    twiddle_1d = [zeros(ComplexF64, M_sub[dd]) for dd in 1:D]
+    for dd in 1:D
+        for q in 0:M_sub[dd]-1
+            twiddle_1d[dd][q+1] = exp(im * 2π * q / N[dd])
+        end
+    end
+
+    return K_fiber, twiddle_1d
+end
+
+# ============================================================================
+# Separable WHT Butterfly (8-point, in-place on length-8 buffer)
+# ============================================================================
+
+"""
+Apply the 8-point Walsh-Hadamard Transform (WHT₈ = H⊗H⊗H) in-place.
+H = [1 1; 1 -1]. The buffer `z` has length 8 indexed as (α₁, α₂, α₃)
+in canonical order: (0,0,0),(1,0,0),(0,1,0),(1,1,0),(0,0,1),(1,0,1),(0,1,1),(1,1,1).
+
+Each stage applies H along one dimension:
+  Stage d: for each pair (i, i+stride), compute [a+b, a-b] where stride = 2^(d-1)
+"""
+@inline function wht8!(z::NTuple{8, ComplexF64})
+    # Stage 1: dim 1 (stride=1, pairs: (1,2),(3,4),(5,6),(7,8))
+    a1 = z[1] + z[2]; b1 = z[1] - z[2]
+    a2 = z[3] + z[4]; b2 = z[3] - z[4]
+    a3 = z[5] + z[6]; b3 = z[5] - z[6]
+    a4 = z[7] + z[8]; b4 = z[7] - z[8]
+
+    # Stage 2: dim 2 (stride=2, pairs: (1,3),(2,4),(5,7),(6,8))
+    c1 = a1 + a2; d1 = a1 - a2
+    c2 = b1 + b2; d2 = b1 - b2
+    c3 = a3 + a4; d3 = a3 - a4
+    c4 = b3 + b4; d4 = b3 - b4
+
+    # Stage 3: dim 3 (stride=4, pairs: (1,5),(2,6),(3,7),(4,8))
+    return (c1 + c3, c2 + c4, d1 + d3, d2 + d4,
+            c1 - c3, c2 - c4, d1 - d3, d2 - d4)
+end
+
+# ============================================================================
 # Execution (Hot Path)
 # ============================================================================
 
@@ -403,6 +517,9 @@ This is the SCFT hot path: purely operates on the M-grid subgrid with
 no full-grid allocation or symmetry fill.
 
 Pipeline: f₀ → complex copy → FFT → Q·Y → IFFT → real part → f₀
+
+When `plan.is_separable == true` (Pmmm-like groups), uses the WHT
+butterfly fast path instead of dense Q-row multiplication.
 """
 function execute_m2_q!(plan::M2QPlan, f0::Array{Float64})
     M = plan.M
@@ -415,7 +532,24 @@ function execute_m2_q!(plan::M2QPlan, f0::Array{Float64})
     # Step 1: Forward FFT (in-place)
     plan.sub_fft_plan * Y
 
-    # Step 2: Q multiply
+    # Step 2: Q multiply — dispatch to fast or generic path
+    if plan.is_separable
+        _q_multiply_separable!(Y_new, Y, plan)
+    else
+        _q_multiply_generic!(Y_new, Y, plan)
+    end
+
+    # Step 3: Inverse FFT (in-place, includes 1/prod(M) scaling)
+    plan.sub_ifft_plan * Y_new
+
+    # Step 4: Write real part back to f0
+    @. f0 = real(Y_new)
+end
+
+"""
+Generic Q multiplication: Y_new[q] = Σ_m Q[m,q] · Y[gather[m,q]]
+"""
+function _q_multiply_generic!(Y_new, Y, plan)
     d = length(plan.rep_ops)
     Q = plan.Q_first_row
     idx = plan.gather_idx
@@ -426,12 +560,81 @@ function execute_m2_q!(plan::M2QPlan, f0::Array{Float64})
         end
         Y_new[q_cart] = acc
     end
+end
 
-    # Step 3: Inverse FFT (in-place, includes 1/prod(M) scaling)
-    plan.sub_ifft_plan * Y_new
+"""
+Pmmm separable butterfly Q multiplication.
 
-    # Step 4: Write real part back to f0
-    @. f0 = real(Y_new)
+Algorithm for each q:
+  1. Gather 8 values from Y using gather_idx
+  2. Apply twiddle factors: z[m] *= tw₁(q₁)^α₁ · tw₂(q₂)^α₂ · tw₃(q₃)^α₃
+  3. Forward WHT₈: w = WHT₈ · z  (3-stage butterfly, additions only)
+  4. Multiply by K: v[m] = K_fiber[m,q] · w[m]  (8 real multiplies)
+  5. Sum and normalize: Y_new[q] = (1/d) Σ v[m]
+
+This replaces 8 complex Q-row multiplications with WHT butterfly + 8 real K multiplies.
+"""
+function _q_multiply_separable!(Y_new, Y, plan)
+    idx = plan.gather_idx
+    K = plan.K_fiber
+    tw = plan.twiddle_1d
+    M = plan.M
+    d = length(plan.rep_ops)
+    inv_d = 1.0 / d
+
+    @inbounds for q3 in 1:M[3]
+        tw3 = tw[3][q3]  # exp(2πi (q3-1)/N3)
+        for q2 in 1:M[2]
+            tw2 = tw[2][q2]
+            tw23 = tw2 * tw3   # product of dim 2,3 twiddles (for α₂=α₃=1)
+            for q1 in 1:M[1]
+                tw1 = tw[1][q1]
+
+                # Step 1: Gather 8 values from Y
+                # Canonical alpha order: (0,0,0),(1,0,0),(0,1,0),(1,1,0),
+                #                        (0,0,1),(1,0,1),(0,1,1),(1,1,1)
+                y1 = Y[idx[1, q1, q2, q3]]  # α=(0,0,0), tw=1
+                y2 = Y[idx[2, q1, q2, q3]]  # α=(1,0,0), tw=tw1
+                y3 = Y[idx[3, q1, q2, q3]]  # α=(0,1,0), tw=tw2
+                y4 = Y[idx[4, q1, q2, q3]]  # α=(1,1,0), tw=tw1*tw2
+                y5 = Y[idx[5, q1, q2, q3]]  # α=(0,0,1), tw=tw3
+                y6 = Y[idx[6, q1, q2, q3]]  # α=(1,0,1), tw=tw1*tw3
+                y7 = Y[idx[7, q1, q2, q3]]  # α=(0,1,1), tw=tw2*tw3
+                y8 = Y[idx[8, q1, q2, q3]]  # α=(1,1,1), tw=tw1*tw2*tw3
+
+                # Step 2: Apply twiddle factors
+                # twiddle[m] = prod_d tw_d^α_m_d
+                tw12 = tw1 * tw2
+                tw13 = tw1 * tw3
+                tw123 = tw12 * tw3
+
+                z = (y1,
+                     y2 * tw1,
+                     y3 * tw2,
+                     y4 * tw12,
+                     y5 * tw3,
+                     y6 * tw13,
+                     y7 * tw23,
+                     y8 * tw123)
+
+                # Step 3: Forward WHT₈
+                w = wht8!(z)
+
+                # Step 4: Multiply by K and sum
+                acc = K[1, q1, q2, q3] * w[1] +
+                      K[2, q1, q2, q3] * w[2] +
+                      K[3, q1, q2, q3] * w[3] +
+                      K[4, q1, q2, q3] * w[4] +
+                      K[5, q1, q2, q3] * w[5] +
+                      K[6, q1, q2, q3] * w[6] +
+                      K[7, q1, q2, q3] * w[7] +
+                      K[8, q1, q2, q3] * w[8]
+
+                # Step 5: Normalize (WHT inverse first-row = [1/d, ...] )
+                Y_new[q1, q2, q3] = acc * inv_d
+            end
+        end
+    end
 end
 
 # ============================================================================
