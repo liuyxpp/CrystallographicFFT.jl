@@ -31,6 +31,7 @@ export plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
 export ifft_channels!, centering_unfold!, disassemble_G0!
 export CenteredKRFFTBackwardPlan, InvReconEntry
 export plan_centered_ikrfft, execute_centered_ikrfft!, ifft_unrecon_centered!
+export CenteredSCFTPlan, plan_centered_scft, execute_centered_scft!, update_kernel!
 export M2BackwardPlan, plan_m2_backward, execute_m2_backward!
 
 
