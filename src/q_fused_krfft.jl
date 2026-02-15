@@ -152,7 +152,7 @@ function plan_m2_q(N::Tuple, sg_num::Int, dim::Int, Δs::Float64,
     fill_map = _build_fill_map(shifted_ops, L, M_sub, collect(N), D)
 
     # 8. Detect Pmmm-like separable structure and precompute fast-path data
-    is_sep = _is_pmmm_like(rep_ops, L, D)
+    is_sep = _is_pmmm_like(rep_ops, L, D, N)
     K_fiber = zeros(Float64, 0, 0, 0, 0)  # placeholder
     tw_1d = Vector{ComplexF64}[]
     if is_sep
@@ -420,14 +420,35 @@ end
 Check if the representative operations form a Pmmm-like structure:
   - All rotation matrices are diagonal (mirrors/inversions only)
   - L = [2, 2, ...] in all dimensions
+  - All translations are simple: t[d] mod N[d] ∈ {0, N[d]-1}
+    (i.e., no fractional shifts like N/4 from screw axes or glide planes)
+
+Non-symmorphic groups (Fd-3m, Ia-3d, Fddd, Cmcm, Ibam, Imma, etc.) may have
+diagonal rotations but their glide/screw translations make the B matrix twiddle
+factors incompatible with the separable WHT butterfly fast path. These groups
+must use the generic Q-multiply path, which achieves machine precision.
 """
-function _is_pmmm_like(rep_ops::Vector{SymOp}, L::Vector{Int}, D::Int)
+function _is_pmmm_like(rep_ops::Vector{SymOp}, L::Vector{Int}, D::Int,
+                       N::Union{Tuple,Vector}=())
     # L must be [2, 2, ..., 2]
     all(l == 2 for l in L) || return false
     # All R must be diagonal
     for op in rep_ops
         for i in 1:D, j in 1:D
             i != j && op.R[i, j] != 0 && return false
+        end
+    end
+    # All translations must be "simple" (0 or N-1 mod N, i.e., effectively 0 or -1)
+    # This rejects non-symmorphic operations with fractional translations
+    if !isempty(N)
+        for op in rep_ops
+            t = round.(Int, op.t)
+            for dd in 1:D
+                t_mod = mod(t[dd], Int(N[dd]))
+                if t_mod != 0 && t_mod != Int(N[dd]) - 1
+                    return false
+                end
+            end
         end
     end
     return true
