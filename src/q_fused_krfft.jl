@@ -990,9 +990,9 @@ function execute_m2_scft!(plan::M2SCFTPlan, f0::Array{Float64,3})
     fwd = plan.fwd_plan
     bwd = plan.bwd_plan
     K = plan.K_spec
-    F = plan.F_spec
     n_spec = plan.n_spec
     M = Tuple(fwd.subgrid_dims)
+    M_vol = prod(M)
 
     # Size check: f0 must be M³ = N ÷ L
     if size(f0) != M
@@ -1001,27 +1001,26 @@ function execute_m2_scft!(plan::M2SCFTPlan, f0::Array{Float64,3})
     end
 
     # Step 1: Copy f₀ (real M³) into forward plan's input_buffer (complex flat)
-    M_vol = prod(M)
-    @inbounds for i in 1:M_vol
-        fwd.input_buffer[i] = complex(f0[i])
+    buf_in = fwd.input_buffer
+    @inbounds @simd for i in 1:M_vol
+        buf_in[i] = complex(f0[i])
     end
 
-    # Step 2: Forward M2 KRFFT — FFT + reconstruct → F̂[n_spec]
+    # Step 2: Forward M2 KRFFT — FFT + reconstruct → F̂[n_spec] in output_buffer
     fft_reconstruct!(fwd)
-    @inbounds for i in 1:n_spec
-        F[i] = fwd.output_buffer[i]
-    end
 
-    # Step 3: Spectral K multiply — F̂(h) *= K(h)
+    # Step 3: Spectral K multiply — F̂(h) *= K(h) — in-place on output_buffer
+    buf_out = fwd.output_buffer
     @inbounds @simd for i in 1:n_spec
-        F[i] *= K[i]
+        buf_out[i] *= K[i]
     end
 
     # Step 4: Backward M2 — inv_reconstruct + IFFT → f₀'
-    f0_buf = execute_m2_backward!(bwd, F)
+    #         (reads directly from output_buffer, no F_spec copy needed)
+    f0_buf = execute_m2_backward!(bwd, buf_out)
 
     # Step 5: Write real part back to f₀
-    @inbounds for i in 1:M_vol
+    @inbounds @simd for i in 1:M_vol
         f0[i] = real(f0_buf[i])
     end
 end
