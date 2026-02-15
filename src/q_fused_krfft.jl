@@ -5,12 +5,16 @@ using FFTW
 using ..SymmetryOps: SymOp, get_ops, check_shift_invariance, dual_ops,
     detect_centering_type, CentP
 using ..ASU: find_optimal_shift
+using ..SpectralIndexing: calc_spectral_asu, SpectralIndexing
 using ..KRFFT: auto_L, SubgridCenteringFoldPlan,
     plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!,
-    ifft_channels!, centering_unfold!, disassemble_G0!
+    ifft_channels!, centering_unfold!, disassemble_G0!,
+    GeneralCFFTPlan, plan_krfft, fft_reconstruct!, fast_reconstruct!,
+    M2BackwardPlan, plan_m2_backward, execute_m2_backward!
 
 export M2QPlan, plan_m2_q, execute_m2_q!
 export M7SCFTPlan, plan_m7_scft, execute_m7_scft!
+export M2SCFTPlan, plan_m2_scft, execute_m2_scft!, update_m2_kernel!
 export subgrid_to_fullgrid!, fullgrid_to_subgrid!
 
 # ============================================================================
@@ -867,6 +871,164 @@ function execute_m7_scft!(plan::M7SCFTPlan, f0::Array{Float64,3})
     disassemble_G0!(fold, plan.G0_view)
     ifft_channels!(fold)
     centering_unfold!(fold, f0)
+end
+
+# ============================================================================
+# M2 SCFT Plan: forward → spectral K → backward (all space groups)
+# ============================================================================
+
+"""
+    M2SCFTPlan
+
+SCFT diffusion plan using M2 forward + spectral K multiply + M2 backward.
+
+Computes `f₀_new = IKRFFT_M2(K(h) · KRFFT_M2(f₀))` where:
+- `KRFFT_M2` is the M2 forward transform (subgrid FFT + fast_reconstruct)
+- `K(h) = exp(-Δs · |k(h)|²)` is the diffusion kernel
+- `IKRFFT_M2` is the M2 backward transform (inv_reconstruct + IFFT)
+
+This replaces M2+Q's Q-matrix approach (`B⁻¹·diag(K)·B`) with direct scalar
+multiplication in spectral space, achieving machine precision for ALL space
+groups (including P-centering).
+
+# Fields
+- `fwd_plan`: M2 forward plan (`GeneralCFFTPlan`)
+- `bwd_plan`: M2 backward plan (`M2BackwardPlan`)
+- `K_spec`: Pre-computed diffusion kernel for each spectral ASU point
+- `F_spec`: Workspace for spectral coefficients
+- `n_spec`: Number of spectral ASU points
+"""
+struct M2SCFTPlan
+    fwd_plan::GeneralCFFTPlan
+    bwd_plan::M2BackwardPlan
+    K_spec::Vector{Float64}
+    F_spec::Vector{ComplexF64}
+    n_spec::Int
+end
+
+"""
+    plan_m2_scft(N, sg_num, dim, Δs, lattice) -> M2SCFTPlan
+
+Create an SCFT diffusion plan using M2 fwd+bwd for ANY space group.
+
+# Arguments
+- `N`: Full grid dimensions, e.g. `(64, 64, 64)`
+- `sg_num`: Space group number (1–230)
+- `dim`: Spatial dimension (2 or 3)
+- `Δs`: Chain contour step size
+- `lattice`: Lattice vectors as columns of a matrix (a₁|a₂|a₃)
+
+# Notes
+Unlike `plan_m7_scft` (centered only) or `plan_m2_q` (has precision issues),
+this plan works for ALL space groups with machine precision.
+
+When `Δs` changes, call `update_m2_kernel!` to recompute K in O(n_spec) time.
+"""
+function plan_m2_scft(N::Tuple, sg_num::Int, dim::Int,
+                       Δs::Float64, lattice::AbstractMatrix)
+    D = length(N)
+    @assert D == dim
+
+    # 1. Get operations and apply magic shift
+    direct_ops = get_ops(sg_num, dim, N)
+    _, shifted_ops = find_optimal_shift(direct_ops, N)
+
+    # 2. Compute spectral ASU
+    spec_asu = calc_spectral_asu(shifted_ops, dim, N)
+    n_spec = length(spec_asu.points)
+
+    # 3. Build forward and backward plans
+    fwd_plan = plan_krfft(spec_asu, shifted_ops)
+    bwd_plan = plan_m2_backward(spec_asu, shifted_ops)
+
+    # 4. Pre-compute diffusion kernel K(h) = exp(-Δs · |k(h)|²)
+    recip_B = 2π * inv(Matrix(lattice))'
+    K_spec = Vector{Float64}(undef, n_spec)
+    for (i, pt) in enumerate(spec_asu.points)
+        h_centered = [pt.idx[d] >= N[d] ÷ 2 ? pt.idx[d] - N[d] : pt.idx[d]
+                      for d in 1:D]
+        k_vec = recip_B * h_centered
+        K_spec[i] = exp(-dot(k_vec, k_vec) * Δs)
+    end
+
+    F_spec = Vector{ComplexF64}(undef, n_spec)
+
+    return M2SCFTPlan(fwd_plan, bwd_plan, K_spec, F_spec, n_spec)
+end
+
+"""
+    execute_m2_scft!(plan::M2SCFTPlan, f0::Array{Float64,3})
+
+Apply the SCFT diffusion operator to stride-L subgrid data `f₀` in-place.
+
+Hot path: `f₀ → FFT(M³) → reconstruct → K·F̂ → inv_reconstruct → IFFT → f₀'`
+
+Works for ALL space groups. Replaces M2+Q's Q-multiply with spectral K multiply.
+"""
+function execute_m2_scft!(plan::M2SCFTPlan, f0::Array{Float64,3})
+    fwd = plan.fwd_plan
+    bwd = plan.bwd_plan
+    K = plan.K_spec
+    F = plan.F_spec
+    n_spec = plan.n_spec
+    M = Tuple(fwd.subgrid_dims)
+
+    # Size check: f0 must be M³ = N ÷ L
+    if size(f0) != M
+        error("f0 size $(size(f0)) does not match plan subgrid dims $M. " *
+              "Use L=$(fwd.L_factors[1]) stride subgrid extraction.")
+    end
+
+    # Step 1: Copy f₀ (real M³) into forward plan's input_buffer (complex flat)
+    M_vol = prod(M)
+    @inbounds for i in 1:M_vol
+        fwd.input_buffer[i] = complex(f0[i])
+    end
+
+    # Step 2: Forward M2 KRFFT — FFT + reconstruct → F̂[n_spec]
+    fft_reconstruct!(fwd)
+    @inbounds for i in 1:n_spec
+        F[i] = fwd.output_buffer[i]
+    end
+
+    # Step 3: Spectral K multiply — F̂(h) *= K(h)
+    @inbounds @simd for i in 1:n_spec
+        F[i] *= K[i]
+    end
+
+    # Step 4: Backward M2 — inv_reconstruct + IFFT → f₀'
+    f0_buf = execute_m2_backward!(bwd, F)
+
+    # Step 5: Write real part back to f₀
+    @inbounds for i in 1:M_vol
+        f0[i] = real(f0_buf[i])
+    end
+end
+
+"""
+    update_m2_kernel!(plan::M2SCFTPlan, N, Δs_new, lattice)
+
+Update the diffusion kernel for a new `Δs` value without rebuilding the plan.
+This is O(n_spec) — much faster than rebuilding Q matrices.
+
+Requires the space group info to be embedded in the plan's forward plan.
+"""
+function update_m2_kernel!(plan::M2SCFTPlan,
+                            N::Tuple, sg_num::Int, dim::Int,
+                            Δs_new::Float64, lattice::AbstractMatrix)
+    D = length(N)
+    direct_ops = get_ops(sg_num, dim, N)
+    _, shifted_ops = find_optimal_shift(direct_ops, N)
+    spec_asu = calc_spectral_asu(shifted_ops, dim, N)
+
+    recip_B = 2π * inv(Matrix(lattice))'
+    K = plan.K_spec
+    for (i, pt) in enumerate(spec_asu.points)
+        h_centered = [pt.idx[d] >= N[d] ÷ 2 ? pt.idx[d] - N[d] : pt.idx[d]
+                      for d in 1:D]
+        k_vec = recip_B * h_centered
+        K[i] = exp(-dot(k_vec, k_vec) * Δs_new)
+    end
 end
 
 end  # module QFusedKRFFT

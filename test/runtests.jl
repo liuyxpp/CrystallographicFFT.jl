@@ -41,4 +41,12 @@ using CrystallographicFFT
     @testset "Centered KRFFT Backward" begin
         include("test_centered_backward.jl")
     end
+
+    @testset "Centered SCFT Diffusion" begin
+        include("test_centered_scft.jl")
+    end
+
+    @testset "M2 SCFT Diffusion" begin
+        include("test_m2_scft.jl")
+    end
 end
