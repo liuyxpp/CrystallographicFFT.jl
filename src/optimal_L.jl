@@ -14,7 +14,7 @@ using ..SymmetryOps: SymOp, get_ops
 using ..ASU: find_optimal_shift
 
 """
-    optimal_L_phase1(ops_shifted::Vector{SymOp}) -> (L, n_active, n_reachable)
+    optimal_L_phase1(ops_shifted::Vector{<:SymOp}) -> (L, n_active, n_reachable)
 
 Determine optimal Phase 1 Cooley-Tukey factor L from shifted symmetry operations.
 
@@ -56,7 +56,7 @@ L, n_active, n_reach = optimal_L_phase1(ops_s)
 # L = [2,2,1], n_active = 1, n_reach = 4
 ```
 """
-function optimal_L_phase1(ops_shifted::Vector{SymOp})
+function optimal_L_phase1(ops_shifted::Vector{<:SymOp})
     dim = length(ops_shifted[1].t)
     
     # Step 1: Determine L per dimension from translation parity
@@ -113,7 +113,7 @@ end
 Find the largest subset of L dimensions where all subgrids are reachable.
 Tries all 2^D subsets of dimensions and picks the one with maximum product.
 """
-function _optimize_L_for_coverage(ops::Vector{SymOp}, L_max::Vector{Int}, dim::Int)
+function _optimize_L_for_coverage(ops::Vector{<:SymOp}, L_max::Vector{Int}, dim::Int)
     best_product = 1
     best_L = ones(Int, dim)
     best_active = 1

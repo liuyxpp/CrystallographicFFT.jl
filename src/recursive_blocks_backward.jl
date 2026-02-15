@@ -132,7 +132,7 @@ Create step-inverse backward plan by precomputing:
 3. Butterfly twiddles (same as forward)
 4. IFFT plans and symmetry fill map
 """
-function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_krfft_g0asu_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "G0 ASU backward currently supports 3D only"

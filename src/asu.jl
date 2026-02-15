@@ -16,7 +16,7 @@ Represents an orbit of subgrids (ASUBlocks) under the symmetry group.
 struct InterleavedOrbit
     representative::Vector{Int}       # The x_s (shift) stored in memory
     members::Vector{Vector{Int}}      # All x_s in this orbit
-    ops::Vector{Vector{SymOp}}        # Operations mapping rep -> member (one list per member)
+    ops::Vector{<:AbstractVector}        # Operations mapping rep -> member (one list per member)
     multiplicity::Int                 # Size of the orbit (unique members)
 end
 
@@ -54,22 +54,23 @@ function calc_asu(sg_num, dim, N::Tuple)
     return calc_asu(N, shifted_ops), Tuple(best_shift)
 end
 
-function find_optimal_shift(ops::Vector{SymOp}, N::Tuple)
+function find_optimal_shift(ops::Vector{<:SymOp}, N::Tuple)
     D = length(N)
     
     # The optimal shift fraction (e.g. 0.5, 1/3) depends only on space group
     # symmetry, not on N. Find it at small proxy N, then apply to target N.
-    # Proxy N must be divisible by shift denominators (2,3,4,5).
-    # Use 60 = LCM(2,3,4,5) to cover all candidates.
-    N_proxy = ntuple(_ -> 60, D)  # 60³=216K points — fast for orbit enum
+    # Proxy N must be divisible by shift denominators (2,3,4).
+    # Use 12 = LCM(2,3,4) — only 12³=1728 points for fast orbit enumeration.
+    N_proxy = ntuple(_ -> 12, D)
     ops_proxy = _rescale_ops(ops, N, N_proxy)
     
+    # Crystallographic shift candidates: 0, 1/2, 1/3, 1/4.
+    # 1/5 is not a crystallographic fraction and never wins.
     frac_candidates = [
         zeros(Float64, D),
         fill(0.5, D),
         fill(1.0/3.0, D),
         fill(0.25, D),
-        fill(0.2, D),
     ]
     
     best_frac = frac_candidates[1]
@@ -122,14 +123,14 @@ function find_optimal_shift(ops::Vector{SymOp}, N::Tuple)
 end
 
 """
-    _rescale_ops(ops, N_from, N_to) -> Vector{SymOp}
+    _rescale_ops(ops, N_from, N_to) -> Vector{<:SymOp}
 
 Rescale translation vectors from grid N_from to grid N_to.
 R stays the same, t_new = t * (N_to / N_from).
 """
-function _rescale_ops(ops::Vector{SymOp}, N_from::Tuple, N_to::Tuple)
+function _rescale_ops(ops::Vector{<:SymOp}, N_from::Tuple, N_to::Tuple)
     D = length(N_from)
-    result = Vector{SymOp}(undef, length(ops))
+    result = Vector{eltype(ops)}(undef, length(ops))
     for (i, op) in enumerate(ops)
         t_new = [round(Int, op.t[d] * N_to[d] ÷ N_from[d]) for d in 1:D]
         result[i] = SymOp(op.R, t_new)
@@ -144,7 +145,7 @@ Count the number of ASU points with orbit multiplicity < |G|.
 Uses direct orbit enumeration with BitArray visited mask.
 O(N³ × |G|) with no recursion.
 """
-function _count_special_positions_fast(N::Tuple, ops::Vector{SymOp})
+function _count_special_positions_fast(N::Tuple, ops::Vector{<:SymOp})
     D = length(N)
     n_total = prod(N)
     n_ops = length(ops)
@@ -152,30 +153,25 @@ function _count_special_positions_fast(N::Tuple, ops::Vector{SymOp})
     
     visited = falses(n_total)
     sp_count = 0
-    n_asu = 0
     
-    x = zeros(Int, D)
+    # Pre-extract R and t as tuples of Int for zero-alloc inner loop
+    R_mats = [round.(Int, op.R) for op in ops]
+    t_vecs = [round.(Int, op.t) for op in ops]
+    
     x_rot = zeros(Int, D)
-    R_mats = [op.R for op in ops]
-    t_vecs = [op.t for op in ops]
+    orbit_buf = Vector{Int}(undef, max_orbit)  # reusable buffer
     
     for lin_idx in 1:n_total
-        visited[lin_idx] && continue
+        @inbounds visited[lin_idx] && continue
         
-        # Convert linear index to coordinate
-        rem = lin_idx - 1
-        @inbounds for d in 1:D
-            x[d] = rem % N[d]
-            rem = rem ÷ N[d]
-        end
-        
-        # Compute orbit via worklist
-        worklist = [lin_idx]
-        visited[lin_idx] = true
+        # Compute orbit via reusable buffer (no push! allocation)
+        orbit_len = 1
+        orbit_buf[1] = lin_idx
+        @inbounds visited[lin_idx] = true
         wi = 1
         
-        while wi <= length(worklist)
-            curr_lin = worklist[wi]
+        while wi <= orbit_len
+            curr_lin = orbit_buf[wi]
             wi += 1
             
             rem_c = curr_lin - 1
@@ -201,16 +197,15 @@ function _count_special_positions_fast(N::Tuple, ops::Vector{SymOp})
                 end
                 li += 1
                 
-                if !visited[li]
+                @inbounds if !visited[li]
                     visited[li] = true
-                    push!(worklist, li)
+                    orbit_len += 1
+                    orbit_buf[orbit_len] = li
                 end
             end
         end
         
-        orbit_size = length(worklist)
-        n_asu += 1
-        if orbit_size < max_orbit
+        if orbit_len < max_orbit
             sp_count += 1
         end
     end
@@ -218,7 +213,7 @@ function _count_special_positions_fast(N::Tuple, ops::Vector{SymOp})
     return sp_count
 end
 
-function calc_asu(N::Tuple, ops::Vector{SymOp})
+function calc_asu(N::Tuple, ops::Vector{<:SymOp})
     D = length(N)
     asu_points = Vector{ASUPoint}()
 
@@ -296,7 +291,7 @@ function calc_asu(N::Tuple, ops::Vector{SymOp})
             S_diag = [effective_gp[d] ? 1 : 2 for d in 1:D]
 
             # Filter valid ops for this sector
-            new_ops = Vector{SymOp}()
+            new_ops = eltype(curr_ops)[]
             valid_sector = true
 
             for op in curr_ops
@@ -333,13 +328,13 @@ end
 
 
 """
-    analyze_interleaved_orbits(N::Tuple, ops::Vector{SymOp}; L::Union{Nothing, Tuple}=nothing)
+    analyze_interleaved_orbits(N::Tuple, ops::Vector{<:SymOp}; L::Union{Nothing, Tuple}=nothing)
 
 Analyze the symmetry orbits of the subgrids defined by stride `L`.
 If `L` is not provided, defaults to `(2, 2, ...)` (Standard Cooley-Tukey Radix-2).
 Returns a list of `InterleavedOrbit`s, which become the `ASUBlock`s.
 """
-function analyze_interleaved_orbits(N::Tuple, ops::Vector{SymOp}; L::Union{Nothing, Tuple}=nothing)
+function analyze_interleaved_orbits(N::Tuple, ops::Vector{<:SymOp}; L::Union{Nothing, Tuple}=nothing)
     D = length(N)
     if isnothing(L)
         L = Tuple(fill(2, D))
@@ -364,7 +359,7 @@ function analyze_interleaved_orbits(N::Tuple, ops::Vector{SymOp}; L::Union{Nothi
         # Start new orbit
         member_set = Set([p])
         members = [p]
-        ops_map = Dict{Vector{Int}, Vector{SymOp}}()
+        ops_map = Dict{Vector{Int}, Vector{eltype(ops)}}()
         ops_map[p] = [SymOp(Matrix{Int}(I, D, D), zeros(Int, D))] # Identity maps p to p
         
         # BFS to find all connected subgrids
@@ -414,7 +409,7 @@ function analyze_interleaved_orbits(N::Tuple, ops::Vector{SymOp}; L::Union{Nothi
         
         # Re-scan to build exact mapping p -> m
         final_members = sort(collect(member_set))
-        final_ops = Vector{Vector{SymOp}}(undef, length(final_members))
+        final_ops = Vector{Vector{eltype(ops)}}(undef, length(final_members))
         
         for (i, m) in enumerate(final_members)
             # Find all ops g such that g(p) = m

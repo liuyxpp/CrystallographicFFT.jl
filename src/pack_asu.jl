@@ -102,7 +102,7 @@ function pack_asu(points::Vector{ASUPoint}, N::Tuple, T::Type=Float64, ArrayType
 end
 
 """
-    pack_asu_interleaved(u::AbstractArray, N::Tuple, ops::Vector{SymOp}; 
+    pack_asu_interleaved(u::AbstractArray, N::Tuple, ops::Vector{<:SymOp}; 
                               L::Union{Nothing, Tuple}=nothing, asu_only::Bool=true)
 
 Pack a full grid `u` into Interleaved ASUBlocks (Mode B).
@@ -110,7 +110,7 @@ If `asu_only=true` (default), only returns the single ASU subgrid (Γ₀).
 If `asu_only=false`, returns all orbit representatives (legacy behavior).
 Returns a `CrystallographicASU`.
 """
-function pack_asu_interleaved(u::AbstractArray, N::Tuple, ops::Vector{SymOp}; 
+function pack_asu_interleaved(u::AbstractArray, N::Tuple, ops::Vector{<:SymOp}; 
                               L::Union{Nothing, Tuple}=nothing, asu_only::Bool=true)
     D = length(N)
     T = eltype(u)

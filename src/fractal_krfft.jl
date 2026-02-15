@@ -36,7 +36,7 @@ mutable struct FractalNode
     offset::Vector{Int}         # offset in original grid
 
     # ── Symmetry ──
-    ops::Vector{SymOp}          # current symmetry group
+    ops::Vector{<:SymOp}          # current symmetry group
 
     # ── Tree structure ──
     children::Vector{FractalNode}  # one per orbit representative
@@ -130,7 +130,7 @@ Separate symmetry operations into:
 - `diag_ops`: diagonal R matrices (±1 on diagonal, 0 elsewhere) — preserve per-dim parity
 - `mixing_ops`: non-diagonal R matrices — mix coordinates across dimensions
 """
-function classify_ops(ops::Vector{SymOp}, D::Int)
+function classify_ops(ops::Vector{<:SymOp}, D::Int)
     diag_indices = Int[]
     mixing_indices = Int[]
     for (i, op) in enumerate(ops)
@@ -156,7 +156,7 @@ end
 Find which dimensions can be split by parity: dim d is splittable if
 N[d] is even AND all diagonal ops preserve parity in dim d.
 """
-function find_split_dims(diag_ops::Vector{SymOp}, N, D::Int)
+function find_split_dims(diag_ops::Vector{<:SymOp}, N, D::Int)
     split_dims = Int[]
     for d in 1:D
         N[d] % 2 != 0 && continue
@@ -202,7 +202,7 @@ Returns:
 - `orbit_rep`: orbit_rep[s] = index of representative sector for sector s
 - `orbit_op`: orbit_op[s] = the SymOp mapping rep → sector s (nothing for reps)
 """
-function find_sector_orbits(parities::Vector{Vector{Int}}, all_ops::Vector{SymOp},
+function find_sector_orbits(parities::Vector{Vector{Int}}, all_ops::Vector{<:SymOp},
                             split_dims::Vector{Int}, N, D::Int)
     n_sectors = length(parities)
     orbit_rep = collect(1:n_sectors)  # initially each sector is its own rep
@@ -262,7 +262,7 @@ this adds 1 to t_d, making the reflection map even-parity sectors to
 odd-parity sectors (cross-sector orbit equivalence). This is the key
 mechanism enabling |G|-fold reduction.
 """
-function shift_ops_half_grid(ops::Vector{SymOp}, N, D::Int)
+function shift_ops_half_grid(ops::Vector{<:SymOp}, N, D::Int)
     b = fill(0.5, D)
     shifted = similar(ops)
     for (i, op) in enumerate(ops)
@@ -297,7 +297,7 @@ Uses b=1/2 grid-origin shift so that diagonal symmetry operations
 (reflections, inversions) create cross-sector orbit equivalences,
 enabling full |G|-fold reduction.
 """
-function build_recursive_tree(N::Tuple, ops::Vector{SymOp})
+function build_recursive_tree(N::Tuple, ops::Vector{<:SymOp})
     D = length(N)
     root = FractalNode(
         subgrid_N=collect(N), scale=ones(Int, D), offset=zeros(Int, D), ops=ops
@@ -493,7 +493,7 @@ Centering creates periodicity WITHIN each stride-2 sector, not BETWEEN sectors.
 Therefore we only apply EXTINCTION (skip sectors where F=0), with NO orbit
 equivalence. Each alive sector gets its own independent child.
 """
-function _setup_centering_split!(node::FractalNode, cent_ops::Vector{SymOp},
+function _setup_centering_split!(node::FractalNode, cent_ops::Vector{<:SymOp},
                                   curr_N::Tuple, D::Int)
     node.is_centering_split = true
 
@@ -599,7 +599,7 @@ function _setup_centering_split!(node::FractalNode, cent_ops::Vector{SymOp},
     node.centering_pack_twiddle_h = Vector{Float64}[]
 end
 
-function _deduplicate_ops(ops::Vector{SymOp}, D::Int)
+function _deduplicate_ops(ops::Vector{<:SymOp}, D::Int)
     seen = Set{Tuple{Vector{Int}, Vector{Int}}}()
     unique_ops = SymOp[]
     for op in ops
@@ -675,7 +675,7 @@ end
 
 Build a universal recursive KRFFT plan.
 """
-function plan_fractal_krfft(spec_asu::SpectralIndexing, ops::Vector{SymOp})
+function plan_fractal_krfft(spec_asu::SpectralIndexing, ops::Vector{<:SymOp})
     N = spec_asu.N
     D = length(N)
 
@@ -1018,7 +1018,7 @@ end
 
 Build an optimized fractal KRFFT plan with O(N_spec) sparse butterfly.
 """
-function plan_fractal_krfft_v2(spec_asu::SpectralIndexing, ops::Vector{SymOp})
+function plan_fractal_krfft_v2(spec_asu::SpectralIndexing, ops::Vector{<:SymOp})
     N = spec_asu.N
     D = length(N)
 

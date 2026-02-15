@@ -172,7 +172,7 @@ struct CenteredKRFFTPlan
     n_channels::Int
 end
 
-function plan_krfft_centered(ops::Vector{SymOp}, N::Tuple)
+function plan_krfft_centered(ops::Vector{<:SymOp}, N::Tuple)
     centering = detect_centering_type(ops, N)
     centering == CentP && error("No centering detected. Use plan_krfft instead.")
     return _build_centered_plan(ops, N, centering)
@@ -183,7 +183,7 @@ function plan_krfft_centered(sg_num::Int, N::Tuple; dim::Int=3)
     return plan_krfft_centered(ops, N)
 end
 
-function _build_centered_plan(ops::Vector{SymOp}, N::Tuple, centering::CenteringType)
+function _build_centered_plan(ops::Vector{<:SymOp}, N::Tuple, centering::CenteringType)
     prefold = plan_centering_prefold(centering, N)
     N_sub = prefold.N_sub
     full_spec = calc_spectral_asu(ops, 3, N)

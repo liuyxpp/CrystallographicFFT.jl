@@ -30,7 +30,7 @@ Compute spectral ASU for a subgrid under its residual symmetry group.
 Spectral symmetry action: h → R_g^T h (mod subgrid_N)
 Phase relation: F(R_g^T h) = exp(+2πi h·t_g/N) × F(h)  [from S_g*F = F]
 """
-function compute_spectral_asu(subgrid_N::Vector{Int}, ops::Vector{SymOp})
+function compute_spectral_asu(subgrid_N::Vector{Int}, ops::Vector{<:SymOp})
     D = length(subgrid_N)
     vol = prod(subgrid_N)
     Nt = Tuple(subgrid_N)
@@ -202,7 +202,7 @@ end
 
 Build pull-based ASU-only plan.
 """
-function plan_fractal_krfft_v3(spec_asu::SpectralIndexing, ops::Vector{SymOp})
+function plan_fractal_krfft_v3(spec_asu::SpectralIndexing, ops::Vector{<:SymOp})
     N = spec_asu.N
     D = length(N)
 

@@ -104,7 +104,7 @@ function GeneralCFFTPlan(sub_plans::Vector{P}, recomb::M, buffer::B,
         active, b_dims, Ls, n_ops, grid_N, subgrid_dims)
 end
 
-function plan_krfft(real_asu::CrystallographicASU, spec_asu::SpectralIndexing, direct_ops::Vector{SymOp})
+function plan_krfft(real_asu::CrystallographicASU, spec_asu::SpectralIndexing, direct_ops::Vector{<:SymOp})
     # 1. Analyze Blocks
     all_blocks = Vector{ASUBlock}()
     for d in sort(collect(keys(real_asu.dim_blocks)))
@@ -192,7 +192,7 @@ function plan_krfft(real_asu::CrystallographicASU, spec_asu::SpectralIndexing, d
 end
 
 """
-    auto_L(ops_shifted::Vector{SymOp}) -> Vector{Int}
+    auto_L(ops_shifted::Vector{<:SymOp}) -> Vector{Int}
 
 Determine optimal Phase 1 Cooley-Tukey factor L from shifted symmetry operations.
 
@@ -210,7 +210,7 @@ auto_L(ops_pmm2)   # → [2, 2, 1]  (4x)
 auto_L(ops_pm)     # → [1, 2, 1]  (2x)
 ```
 """
-function auto_L(ops_shifted::Vector{SymOp})
+function auto_L(ops_shifted::Vector{<:SymOp})
     dim = length(ops_shifted[1].t)
     
     # Step 1: Determine L per dimension from translation parity
@@ -267,7 +267,7 @@ function auto_L(ops_shifted::Vector{SymOp})
 end
 
 """
-    plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}) -> GeneralCFFTPlan
+    plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp}) -> GeneralCFFTPlan
 
 Auto-L variant: computes optimal L from ops, constructs plan without pre-packed ASU.
 
@@ -286,7 +286,7 @@ plan.input_buffer .= vec(subgrid_data)
 F = fft_reconstruct!(plan)
 ```
 """
-function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     
@@ -323,7 +323,7 @@ function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
     
     # Enumerate subgrids in canonical order
     n_subs = prod(L)
-    rep_ops = Vector{SymOp}(undef, n_subs)
+    rep_ops = Vector{eltype(ops_shifted)}(undef, n_subs)
     sub_idx = 0
     for x0 in Iterators.product([0:L[d]-1 for d in 1:dim]...)
         sub_idx += 1
@@ -696,7 +696,7 @@ function map_ifft!(plan::GeneralCFFTPlan, asu::CrystallographicASU)
 end
 
 
-function build_recombination_map(spec_asu::SpectralIndexing, real_asu::CrystallographicASU, direct_ops::Vector{SymOp}, all_blocks::Vector{ASUBlock}, L_factors::Vector{Vector{Int}})
+function build_recombination_map(spec_asu::SpectralIndexing, real_asu::CrystallographicASU, direct_ops::Vector{<:SymOp}, all_blocks::Vector{ASUBlock}, L_factors::Vector{Vector{Int}})
     
     N = spec_asu.N
     dim = length(N)
@@ -823,7 +823,7 @@ function build_recombination_map(spec_asu::SpectralIndexing, real_asu::Crystallo
 end
 
 # Mode A recombination (original code)
-function _build_recombination_map_mode_a(spec_asu::SpectralIndexing, real_asu::CrystallographicASU, direct_ops::Vector{SymOp}, all_blocks::Vector{ASUBlock}, L_factors::Vector{Vector{Int}})
+function _build_recombination_map_mode_a(spec_asu::SpectralIndexing, real_asu::CrystallographicASU, direct_ops::Vector{<:SymOp}, all_blocks::Vector{ASUBlock}, L_factors::Vector{Vector{Int}})
     
     N = spec_asu.N
     dim = length(N)
@@ -969,7 +969,7 @@ struct M2BackwardPlan
 end
 
 """
-    plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}) -> M2BackwardPlan
+    plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp}) -> M2BackwardPlan
 
 Construct the M2 backward plan by building the inverse reconstruction table.
 
@@ -980,7 +980,7 @@ For each subgrid frequency q ∈ [0,M)^D:
 4. Map each full-grid frequency to spectral ASU (via symmetry/Hermitian)
 5. Store combined weight = B⁻¹ coeff × symmetry phase
 """
-function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     N_vec = collect(N)
@@ -1010,7 +1010,7 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
     end
 
     d = prod(L)
-    rep_ops = Vector{SymOp}(undef, d)
+    rep_ops = Vector{eltype(ops_shifted)}(undef, d)
     sub_idx = 0
     for x0 in Iterators.product([0:L[dd]-1 for dd in 1:dim]...)
         sub_idx += 1
@@ -1177,7 +1177,7 @@ For h related by symmetry: find g such that R_g^T h ≡ h_asu (mod N).
 For h related by Hermitian symmetry: map -h → h_asu with conjugation.
 """
 function _build_spectral_reverse_lookup(spec_asu::SpectralIndexing,
-                                        ops_shifted::Vector{SymOp},
+                                        ops_shifted::Vector{<:SymOp},
                                         N_vec::Vector{Int}, dim::Int)
     # Result: h_mod (0-based) → (spec_idx, phase, conj_flag)
     h_to_spec = Dict{Vector{Int}, Tuple{Int, ComplexF64, Bool}}()

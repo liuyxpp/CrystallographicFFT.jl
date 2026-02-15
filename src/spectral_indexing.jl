@@ -8,18 +8,18 @@ export SpectralIndexing, calc_spectral_asu, get_k_vector
 
 struct SpectralIndexing
     points::Vector{ASUPoint}
-    ops::Vector{SymOp}
+    ops::Vector{<:SymOp}
     N::Tuple
 end
 
 
 """
-    calc_spectral_asu(ops::Vector{SymOp}, dim::Int, N::Tuple) -> SpectralIndexing
+    calc_spectral_asu(ops::Vector{<:SymOp}, dim::Int, N::Tuple) -> SpectralIndexing
 
 Calculate the spectral ASU using direct orbit enumeration.
 Bypasses recursive calc_asu for O(N³ × |G|) performance.
 """
-function calc_spectral_asu(direct_ops::Vector{SymOp}, dim::Int, N::Tuple)
+function calc_spectral_asu(direct_ops::Vector{<:SymOp}, dim::Int, N::Tuple)
     D = length(N)
     N_vec = collect(N)
     n_total = prod(N)

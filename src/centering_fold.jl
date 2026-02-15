@@ -325,7 +325,7 @@ Falls back to plain `plan_krfft` if centering is P or L ≠ [2,2,2].
 Returns a `CenteredKRFFTPlan` if centering fold is applicable, otherwise
 a `GeneralCFFTPlan`.
 """
-function plan_krfft_centered(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp};
+function plan_krfft_centered(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp};
                              centering::Union{CenteringType,Symbol}=:auto)
     N = spec_asu.N
     dim = length(N)
@@ -628,7 +628,7 @@ Builds CSR compact inv_recon table (zero entries removed, conj pre-applied)
 and spatial orbit structure for orbit-based reduction.
 """
 function plan_centered_ikrfft(spec_asu::SpectralIndexing,
-                               ops_shifted::Vector{SymOp},
+                               ops_shifted::Vector{<:SymOp},
                                fwd_plan::CenteredKRFFTPlan)
     krfft = fwd_plan.krfft_plan
     fold = fwd_plan.fold_plan
@@ -866,7 +866,7 @@ When `Δs` changes (e.g., variable step-size SCFT), only `K_spec` needs to be
 recomputed (O(n_spec)), not the entire plan.
 """
 function plan_centered_scft(spec_asu::SpectralIndexing,
-                             ops_shifted::Vector{SymOp},
+                             ops_shifted::Vector{<:SymOp},
                              N::Tuple,
                              Δs::Float64,
                              lattice::AbstractMatrix)

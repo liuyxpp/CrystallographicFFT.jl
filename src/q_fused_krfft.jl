@@ -49,7 +49,7 @@ struct M2QPlan{D, FP, IP}
     sub_ifft_plan::IP
     Y_buf::Array{ComplexF64, D}
     Y_new_buf::Array{ComplexF64, D}
-    rep_ops::Vector{SymOp}
+    rep_ops::Vector{<:SymOp}
     L::Vector{Int}
     M::Vector{Int}
     N::Vector{Int}
@@ -116,7 +116,7 @@ function plan_m2_q(N::Tuple, sg_num::Int, dim::Int, Δs::Float64,
 
     # Enumerate subgrids in canonical order
     d = prod(L)  # number of subgrids = prod(L)
-    rep_ops = Vector{SymOp}(undef, d)
+    rep_ops = Vector{eltype(shifted_ops)}(undef, d)
     sub_idx = 0
     for x0 in Iterators.product([0:L[dd]-1 for dd in 1:D]...)
         sub_idx += 1
@@ -428,7 +428,7 @@ diagonal rotations but their glide/screw translations make the B matrix twiddle
 factors incompatible with the separable WHT butterfly fast path. These groups
 must use the generic Q-multiply path, which achieves machine precision.
 """
-function _is_pmmm_like(rep_ops::Vector{SymOp}, L::Vector{Int}, D::Int,
+function _is_pmmm_like(rep_ops::Vector{<:SymOp}, L::Vector{Int}, D::Int,
                        N::Union{Tuple,Vector}=())
     # L must be [2, 2, ..., 2]
     all(l == 2 for l in L) || return false

@@ -2,24 +2,51 @@ module SymmetryOps
 
 using LinearAlgebra
 using Crystalline
+using StaticArrays
 
 export SymOp, apply_op, apply_op!, get_ops, convert_op, check_shift_invariance, dual_ops
 export CenteringType, CentP, CentC, CentA, CentI, CentF
 export detect_centering_type, strip_centering
 
-struct SymOp
-    R::Matrix{Int}
-    t::Vector{Int}
+"""
+    SymOp{D}
+
+Symmetry operation with rotation matrix R and translation vector t,
+parametrized by spatial dimension D. Uses stack-allocated StaticArrays.
+"""
+struct SymOp{D}
+    R::SMatrix{D, D, Int}
+    t::SVector{D, Int}
 end
 
-function convert_op(op::SymOperation, N::Tuple)
+# Convenience constructors: auto-convert from regular Matrix/Vector
+# Exclude SMatrix/SVector to avoid infinite recursion with the inner constructor
+function SymOp(R::Matrix{<:Integer}, t::AbstractVector{<:Integer})
+    D = size(R, 1)
+    @assert size(R) == (D, D) "R must be square"
+    @assert length(t) == D "t must have same dimension as R"
+    SymOp{D}(SMatrix{D,D,Int}(R), SVector{D,Int}(t))
+end
+
+# Accept Float64 / Real inputs (round to Int) — used by fractal_krfft.jl
+function SymOp(R::AbstractMatrix{<:Real}, t::AbstractVector{<:Real})
+    SymOp(Matrix{Int}(round.(Int, R)), Vector{Int}(round.(Int, t)))
+end
+
+
+
+function convert_op(op::SymOperation{D}, N::NTuple{D, Int}) where {D}
     t_grid = op.translation .* collect(N)
     t_int = round.(Int, t_grid)
     if !all(isapprox.(t_grid, t_int, atol=1e-5))
         error("Symmetry operation not commensurate with grid $N")
     end
-    return SymOp(round.(Int, op.rotation), t_int)
+    return SymOp{D}(SMatrix{D,D,Int}(round.(Int, op.rotation)),
+                    SVector{D,Int}(t_int))
 end
+
+# Allow Tuple input (non-NTuple dispatch)
+convert_op(op::SymOperation{D}, N::Tuple) where {D} = convert_op(op, NTuple{D,Int}(N))
 
 function get_ops(sg_num::Int, dim::Int, N::Tuple)
     [convert_op(op, N) for op in operations(spacegroup(sg_num, dim))]
@@ -51,49 +78,35 @@ function apply_op(op::SymOp, x::Vector{Int}, N::Tuple)
     return out
 end
 
-function check_shift_invariance(ops::Vector{SymOp}, shift::Vector{Float64}, N::Tuple)
-    # Check if shifting origin by `shift` keeps the operations commensurate with grid `N`.
-    # Original: g(x) = Rx + t.
-    # Shifted: g'(x) = g(x+s)-s = R(x+s)+t-s = Rx + (Rs + t - s).
-    # New t' = t + (Rs - s).
-    # We return deltas = (Rs - s), so t' = t + deltas.
-    # We check if t' is integer. Since t is integer, we need (Rs - s) to be integer?
-    # Actually, we need (Rs + t - s) to be integer.
-    # Generally (Rs - s) might not be integer, but combined with t it might be?
-    # But t is always integer (on grid).
-    # So (Rs - s) must be integer.
-    deltas = Vector{Vector{Int}}(undef, length(ops))
-    deltas = Vector{Vector{Int}}(undef, length(ops))
+function check_shift_invariance(ops::Vector{<:SymOp}, shift::Vector{Float64}, N::Tuple)
+    D = length(N)
+    deltas = Vector{SVector{D,Int}}(undef, length(ops))
     for (i, op) in enumerate(ops)
         # We want the change in translation: R*s - s
-        delta_float = (op.R * shift .- shift) .* collect(N)
+        delta_float = (Matrix(op.R) * shift .- shift) .* collect(N)
         delta_int = round.(Int, delta_float)
         if !all(isapprox.(delta_float, delta_int, atol=1e-5))
-            return false, Vector{Vector{Int}}()
+            return false, SVector{D,Int}[]
         end
-        deltas[i] = delta_int
+        deltas[i] = SVector{D,Int}(delta_int)
     end
     return true, deltas
 end
 
 """
-    dual_ops(ops::Vector{SymOp}) -> Vector{SymOp}
+    dual_ops(ops::Vector{<:SymOp}) -> Vector{SymOp}
 
 Compute the dual operations for the reciprocal lattice.
 R_dual = (R^{-1})^T
 t_dual = 0
 """
-function dual_ops(ops::Vector{SymOp})
-    dual = Vector{SymOp}()
-    for op in ops
-        # R is integer matrix with det +/- 1.
-        # Inverse of R is exact.
-        # We can use float inverse and round, as entries should be integers.
-        R_inv = round.(Int, inv(op.R))
-        R_dual = transpose(R_inv)
-        # Translation in reciprocal space point group is 0
-        t_dual = zeros(Int, length(op.t))
-        push!(dual, SymOp(collect(R_dual), t_dual))
+function dual_ops(ops::Vector{<:SymOp{D}}) where {D}
+    dual = Vector{SymOp{D}}(undef, length(ops))
+    z = zero(SVector{D,Int})
+    for (i, op) in enumerate(ops)
+        R_inv = round.(Int, inv(Matrix(op.R)))
+        R_dual = SMatrix{D,D,Int}(R_inv')
+        dual[i] = SymOp{D}(R_dual, z)
     end
     return dual
 end
@@ -110,27 +123,26 @@ Enumeration of Bravais lattice centering types.
 @enum CenteringType CentP CentC CentA CentI CentF
 
 """
-    detect_centering_type(ops::Vector{SymOp}, N::Tuple) → CenteringType
+    detect_centering_type(ops::Vector{<:SymOp}, N::Tuple) → CenteringType
 
 Detect lattice centering from symmetry operations by identifying
 pure translations (R = I) with half-cell translation vectors.
 
 Recognizes: P (primitive), C (ab-face), A (bc-face), I (body), F (all-face).
 """
-function detect_centering_type(ops::Vector{SymOp}, N::Tuple)
-    dim = length(N)
-    I_mat = Matrix{Int}(I, dim, dim)
+function detect_centering_type(ops::Vector{<:SymOp{D}}, N::Tuple) where {D}
+    I_mat = SMatrix{D,D,Int}(I)
 
     # Collect fractional translation vectors of pure translations
-    pure_translations = NTuple{3,Bool}[]
+    pure_translations = NTuple{D,Bool}[]
 
     for op in ops
         # Check if R is identity
         op.R != I_mat && continue
-        all(abs.(op.t) .< 0.1) && continue  # skip zero translation
+        all(d -> abs(op.t[d]) < 0.1, 1:D) && continue  # skip zero translation
 
         # Classify each component as ~N/2 or ~0
-        halves = ntuple(dim) do d
+        halves = ntuple(D) do d
             t_frac = abs(op.t[d]) / N[d]
             abs(t_frac - 0.5) < 0.01
         end
@@ -138,6 +150,9 @@ function detect_centering_type(ops::Vector{SymOp}, N::Tuple)
     end
 
     isempty(pure_translations) && return CentP
+
+    # Only 3D centering classification
+    D < 3 && return CentP
 
     has_xyz = any(t -> all(t), pure_translations)  # (½,½,½)
     has_0yz = any(t -> !t[1] && t[2] && t[3], pure_translations)  # (0,½,½)
@@ -164,7 +179,7 @@ function detect_centering_type(ops::Vector{SymOp}, N::Tuple)
 end
 
 """
-    strip_centering(ops::Vector{SymOp}, centering::CenteringType, N::Tuple)
+    strip_centering(ops::Vector{<:SymOp}, centering::CenteringType, N::Tuple)
         → (ops_sub::Vector{SymOp}, N_sub::Tuple)
 
 Remove centering translations from ops and remap to the half-grid.
@@ -174,34 +189,32 @@ Returns unique point-group operations on the sub-grid `N_sub = N .÷ 2`
 
 The returned ops are suitable for `plan_krfft` on the sub-grid.
 """
-function strip_centering(ops::Vector{SymOp}, centering::CenteringType, N::Tuple)
-    dim = length(N)
-
+function strip_centering(ops::Vector{<:SymOp{D}}, centering::CenteringType, N::Tuple) where {D}
     # Determine which dimensions are halved
     halve = if centering == CentI || centering == CentF
-        ntuple(_ -> true, dim)   # all dimensions halved
+        ntuple(_ -> true, D)   # all dimensions halved
     elseif centering == CentC
-        ntuple(d -> d <= 2, dim) # x,y halved, z kept
+        ntuple(d -> d <= 2, D) # x,y halved, z kept
     elseif centering == CentA
-        ntuple(d -> d >= 2, dim) # y,z halved, x kept
+        ntuple(d -> d >= 2, D) # y,z halved, x kept
     else
-        ntuple(_ -> false, dim)  # CentP: nothing halved
+        ntuple(_ -> false, D)  # CentP: nothing halved
     end
 
-    N_sub = ntuple(dim) do d
+    N_sub = ntuple(D) do d
         halve[d] ? N[d] ÷ 2 : N[d]
     end
 
     # Map each op to sub-grid coordinates: t_sub = mod(t, N_sub)
-    seen = Set{Tuple{Matrix{Int}, Vector{Int}}}()
-    ops_sub = SymOp[]
+    seen = Set{Tuple{SMatrix{D,D,Int}, SVector{D,Int}}}()
+    ops_sub = SymOp{D}[]
 
     for op in ops
-        t_sub = [mod(op.t[d], N_sub[d]) for d in 1:dim]
+        t_sub = SVector{D,Int}(ntuple(d -> mod(op.t[d], N_sub[d]), D))
         key = (op.R, t_sub)
         if !(key in seen)
             push!(seen, key)
-            push!(ops_sub, SymOp(op.R, t_sub))
+            push!(ops_sub, SymOp{D}(op.R, t_sub))
         end
     end
 

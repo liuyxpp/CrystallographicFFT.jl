@@ -27,7 +27,7 @@ struct MatrixDiffusionSolver{MType, QType} <: AbstractDiffusionSolver
 end
 
 # Include the matrix calculation helper (moved from previous version)
-function calc_transform_matrix(real_pts::Vector{ASUPoint}, spec_asu::SpectralIndexing, direct_ops::Vector{SymOp}, N::Tuple, shift::NTuple)
+function calc_transform_matrix(real_pts::Vector{ASUPoint}, spec_asu::SpectralIndexing, direct_ops::Vector{<:SymOp}, N::Tuple, shift::NTuple)
     n_real = length(real_pts)
     n_spec = length(spec_asu.points)
     M = zeros(ComplexF64, n_real, n_spec)

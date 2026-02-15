@@ -61,7 +61,7 @@ end
 
 Create a recursive KRFFT plan with butterfly-fused P3c + A8 decomposition.
 """
-function plan_krfft_recursive(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_krfft_recursive(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "Recursive KRFFT currently supports 3D only"
@@ -365,7 +365,7 @@ end
 Detect lattice centering from the symmetry operations. Looks for pure
 translation operations (R = I) with non-zero translation vectors.
 """
-function detect_centering(ops::Vector{SymOp}, N)
+function detect_centering(ops::Vector{<:SymOp}, N)
     dim = length(N)
     I_mat = zeros(Int, dim, dim)
     for d in 1:dim; I_mat[d,d] = 1; end
@@ -511,7 +511,7 @@ With centering=:auto (default), automatically detects F/I/P centering and
 filters out entries pointing to identically-zero FFT outputs due to centering
 extinctions. This can reduce nnz by ~50-75% for centered lattices.
 """
-function plan_krfft_sparse(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp};
+function plan_krfft_sparse(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp};
                            centering::Symbol=:auto)
     N = spec_asu.N
     dim = length(N)
@@ -753,7 +753,7 @@ Create a selective G0 cascade plan.
 
 For Fm-3m (|G|=192) at N=64: |S| = 7727 out of M³ = 32768 (23.6%).
 """
-function plan_krfft_selective(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_krfft_selective(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "Selective G0 KRFFT currently supports 3D only"
@@ -971,7 +971,7 @@ Only cubic groups (#195-#230) possess this symmetry. Tetragonal, orthorhombic,
 and lower-symmetry groups do NOT, and will produce incorrect results with the
 P3c decomposition.
 """
-function has_cubic_p3c_symmetry(ops::Vector{SymOp})
+function has_cubic_p3c_symmetry(ops::Vector{<:SymOp})
     # The 3-fold body-diagonal rotation: R = [0 0 1; 1 0 0; 0 1 0]
     for op in ops
         R = round.(Int, op.R)
@@ -1031,7 +1031,7 @@ Create a G0 ASU plan with orbit reduction.
 4. Precomputes P3c weights only at orbit representatives
 5. Builds A8 table with merged G0 symmetry phases
 """
-function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "G0 ASU KRFFT currently supports 3D only"
@@ -1375,7 +1375,7 @@ positions. Spectral ASU values are obtained by looking up G0 values with symmetr
 
 Works for all space groups except P1 (which has |G|=1, no sub-grid relations).
 """
-function plan_krfft_g0asu_general(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp})
+function plan_krfft_g0asu_general(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     N = spec_asu.N
     dim = length(N)
     @assert dim == 3 "General G0 ASU currently supports 3D only"
