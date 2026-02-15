@@ -934,12 +934,24 @@ end
     M2BackwardPlan
 
 Plan for the M2 backward transform (inverse of General KRFFT).
-Precomputed inverse reconstruction table enables efficient spectral ASU → subgrid IFFT.
+
+Uses SoA (Struct-of-Arrays) layout for the inverse reconstruction hot path:
+- `inv_work_idx[k]` = index into F_work buffer (conj entries use n_spec + spec_idx)
+- `inv_weight[k]` = combined B⁻¹ coefficient × symmetry phase
+- `F_work` = pre-allocated buffer for [F_spec; conj(F_spec)]
+
+Also keeps `inv_recon_table` for plan-time use (e.g., centering_fold.jl).
 """
 struct M2BackwardPlan
-    # Inverse reconstruction table: (d, prod(M))
+    # AoS inverse reconstruction table: (d, prod(M)) — kept for plan-time use
     inv_recon_table::Matrix{InvReconEntry}
     d::Int                                   # fiber length = prod(L)
+
+    # SoA inverse reconstruction (hot path): length = d × prod(M)
+    inv_work_idx::Vector{Int32}              # index into F_work (conj → n_spec + idx)
+    inv_weight::Vector{ComplexF64}           # combined weight
+    n_spec::Int                              # spectral ASU size (for F_work split)
+    F_work::Vector{ComplexF64}               # (2 × n_spec): [F; conj(F)] workspace
 
     # IFFT
     ifft_plan::Any                           # FFTW plan for M-grid
@@ -1100,15 +1112,35 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
         end
     end
 
-    # 5. Plan IFFT
+    # 5. Build SoA arrays from inv_recon_table for hot-path branchless inner loop
+    #    For conj entries: work_idx = n_spec + spec_idx (reads from conj half of F_work)
+    n_spec = length(spec_asu.points)
+    soa_len = d * M_vol
+    inv_work_idx = Vector{Int32}(undef, soa_len)
+    inv_weight = Vector{ComplexF64}(undef, soa_len)
+
+    for q_lin in 1:M_vol
+        base = (q_lin - 1) * d
+        for a in 1:d
+            entry = inv_recon_table[a, q_lin]
+            k = base + a
+            inv_weight[k] = entry.weight
+            inv_work_idx[k] = entry.conj_flag ?
+                Int32(n_spec + entry.spec_idx) : entry.spec_idx
+        end
+    end
+
+    F_work = zeros(ComplexF64, 2 * n_spec)
+
+    # 6. Plan IFFT
     dummy = zeros(ComplexF64, Tuple(M_sub))
     ifft_plan = plan_ifft(dummy)
 
-    # 6. Allocate buffers
+    # 7. Allocate buffers
     Y_buf = zeros(ComplexF64, M_vol)
     f0_buf = zeros(ComplexF64, M_vol)
 
-    # 7. Detect Pmmm separable structure
+    # 8. Detect Pmmm separable structure
     all_diagonal = all(op -> all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j), rep_ops)
     simple_translations = all(op -> all(mod(round(Int, op.t[dd]), N[dd]) ∈ (0, N[dd]-1)
                                         for dd in 1:dim), rep_ops)
@@ -1126,6 +1158,7 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{SymOp}
 
     return M2BackwardPlan(
         inv_recon_table, d,
+        inv_work_idx, inv_weight, n_spec, F_work,
         ifft_plan, Y_buf, f0_buf,
         L, M_sub, N_vec,
         is_sep, inv_phase_factors
@@ -1269,22 +1302,36 @@ function execute_m2_backward!(bplan::M2BackwardPlan, F_spec::AbstractVector{Comp
 end
 
 """
-General table-based inverse reconstruction: spectral ASU → Y₀(M³).
+SoA-based inverse reconstruction: spectral ASU → Y₀(M³).
+
+Branchless inner loop using pre-built F_work = [F_spec; conj(F_spec)].
+Conjugated entries index into the second half (n_spec + spec_idx).
 """
 function _inv_reconstruct_m2!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64})
     d = bplan.d
     M_vol = prod(bplan.subgrid_dims)
     Y = bplan.Y_buf
-    table = bplan.inv_recon_table
+    n = bplan.n_spec
+    F_work = bplan.F_work
+    widx = bplan.inv_work_idx
+    w = bplan.inv_weight
 
-    @inbounds for q_lin in 1:M_vol
-        val = zero(ComplexF64)
-        for a in 1:d
-            entry = table[a, q_lin]
-            f_val = entry.conj_flag ? conj(F_spec[entry.spec_idx]) : F_spec[entry.spec_idx]
-            val += entry.weight * f_val
+    # Step 0: Fill work buffer [F_spec; conj(F_spec)]
+    @inbounds @simd for i in 1:n
+        F_work[i] = F_spec[i]
+    end
+    @inbounds @simd for i in 1:n
+        F_work[n + i] = conj(F_spec[i])
+    end
+
+    # Step 1: SoA gather-multiply-accumulate (branchless)
+    @inbounds for q in 1:M_vol
+        base = (q - 1) * d
+        val = w[base + 1] * F_work[widx[base + 1]]
+        for a in 2:d
+            val += w[base + a] * F_work[widx[base + a]]
         end
-        Y[q_lin] = val
+        Y[q] = val
     end
 end
 
