@@ -308,11 +308,11 @@ stride-2 subgrid. Pipeline:
     u(N³) → pack_stride → f₀(M³) → centering_fold → n_ch × H³
           → FFT channels → assemble G₀(M³) → fast_reconstruct → spectral ASU
 """
-struct CenteredKRFFTPlan
-    krfft_plan::GeneralCFFTPlan          # inner KRFFT plan
-    fold_plan::SubgridCenteringFoldPlan  # centering fold plan
-    f0_buffer::Array{Float64,3}          # M³ real buffer for stride-2 subgrid
-    G0_view::Array{ComplexF64,3}         # pre-stored reshape of work_buffer
+struct CenteredKRFFTPlan{KP<:GeneralCFFTPlan, SP<:SubgridCenteringFoldPlan}
+    krfft_plan::KP                           # inner KRFFT plan
+    fold_plan::SP                            # centering fold plan
+    f0_buffer::Array{Float64,3}              # M³ real buffer for stride-2 subgrid
+    G0_view::Array{ComplexF64,3}             # pre-stored reshape of work_buffer
 end
 
 """
@@ -632,7 +632,7 @@ function plan_centered_ikrfft(spec_asu::SpectralIndexing,
                                fwd_plan::CenteredKRFFTPlan)
     krfft = fwd_plan.krfft_plan
     fold = fwd_plan.fold_plan
-    M = Tuple(krfft.subgrid_dims)
+    M = krfft.subgrid_dims  # already NTuple after Phase 2
     dim = length(M)
     M_vol = prod(M)
     n_spec = length(spec_asu.points)
@@ -837,9 +837,9 @@ on M_vol fibers.
 - `F_spec`: Workspace for spectral coefficients
 - `n_spec`: Number of spectral ASU points
 """
-struct CenteredSCFTPlan
-    fwd_plan::CenteredKRFFTPlan
-    bwd_plan::CenteredKRFFTBackwardPlan
+struct CenteredSCFTPlan{FP<:CenteredKRFFTPlan, BP<:CenteredKRFFTBackwardPlan}
+    fwd_plan::FP
+    bwd_plan::BP
     K_spec::Vector{Float64}
     F_spec::Vector{ComplexF64}
     n_spec::Int

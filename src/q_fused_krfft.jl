@@ -50,9 +50,9 @@ struct M2QPlan{D, FP, IP}
     Y_buf::Array{ComplexF64, D}
     Y_new_buf::Array{ComplexF64, D}
     rep_ops::Vector{<:SymOp}
-    L::Vector{Int}
-    M::Vector{Int}
-    N::Vector{Int}
+    L::NTuple{D,Int}
+    M::NTuple{D,Int}
+    N::NTuple{D,Int}
     fill_map::Array{Int32}  # N1×N2×N3, maps full-grid to subgrid linear index
     # --- Pmmm separable butterfly fast path ---
     is_separable::Bool                    # true if Pmmm-like (diagonal R, L=[2,2,2])
@@ -164,7 +164,7 @@ function plan_m2_q(N::Tuple, sg_num::Int, dim::Int, Δs::Float64,
                       Q_first_row, gather_idx,
                       sub_fft_plan, sub_ifft_plan,
                       Y_buf, Y_new_buf,
-                      rep_ops, L, M_sub, collect(N), fill_map,
+                      rep_ops, Tuple(L), Tuple(M_sub), N, fill_map,
                       is_sep, K_fiber, tw_1d)
 end
 
@@ -919,9 +919,9 @@ groups (including P-centering).
 - `F_spec`: Workspace for spectral coefficients
 - `n_spec`: Number of spectral ASU points
 """
-struct M2SCFTPlan
-    fwd_plan::GeneralCFFTPlan
-    bwd_plan::M2BackwardPlan
+struct M2SCFTPlan{FP<:GeneralCFFTPlan, BP<:M2BackwardPlan}
+    fwd_plan::FP
+    bwd_plan::BP
     K_spec::Vector{Float64}
     F_spec::Vector{ComplexF64}
     n_spec::Int
@@ -991,7 +991,7 @@ function execute_m2_scft!(plan::M2SCFTPlan, f0::Array{Float64,3})
     bwd = plan.bwd_plan
     K = plan.K_spec
     n_spec = plan.n_spec
-    M = Tuple(fwd.subgrid_dims)
+    M = fwd.subgrid_dims  # already NTuple — no conversion needed
     M_vol = prod(M)
 
     # Size check: f0 must be M³ = N ÷ L

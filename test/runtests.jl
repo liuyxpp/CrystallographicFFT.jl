@@ -221,9 +221,9 @@ include("test_helpers.jl")
             p = prep[47]
             plan_q = plan_m2_q(N16, 47, 3, Δs, lattice)
             @test plan_q isa M2QPlan
-            @test plan_q.L == [2, 2, 2]
+            @test plan_q.L == (2, 2, 2)
 
-            M = Tuple(plan_q.M)
+            M = plan_q.M  # already NTuple
             f0 = zeros(Float64, M)
             fullgrid_to_subgrid!(f0, p.u, plan_q)
 

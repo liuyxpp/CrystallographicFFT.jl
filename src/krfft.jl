@@ -42,7 +42,7 @@ export M2BackwardPlan, plan_m2_backward, execute_m2_backward!
 """
 struct ActiveBlock
     block_idx::Int
-    r_shift::Vector{Int} # Remainder/Shift indices
+    r_shift::NTuple{3,Int}  # Remainder/Shift indices — NTuple for stack storage
     buffer_offset::Int
 end
 
@@ -63,7 +63,7 @@ end
 A plan for General KRFFT using Modulated Block FFTs (Cooley-Tukey Decomposition).
 Decomposes Global frequency q = m * L + r.
 """
-struct GeneralCFFTPlan{T, N, P, M, B} <: AbstractFFTs.Plan{T}
+struct GeneralCFFTPlan{T, N, P, M, B, D} <: AbstractFFTs.Plan{T}
     # 1. Sub-plans for small FFTs (shared by size)
     sub_plans::Vector{P}
     
@@ -82,26 +82,37 @@ struct GeneralCFFTPlan{T, N, P, M, B} <: AbstractFFTs.Plan{T}
     # phase_factors[d][h+1] = exp(2πi h / N_d) for h = 0..M_d-1
     phase_factors::Vector{Vector{ComplexF64}}
     
+    # 6. Pre-stored reshaped views (zero-alloc hot path)
+    input_view::Array{ComplexF64,D}   # reshape(input_buffer, subgrid_dims)
+    work_view::Array{ComplexF64,D}    # reshape(work_buffer, subgrid_dims)
+    
     # Metadata
     active_blocks::Vector{ActiveBlock}
     block_dims::Vector{Tuple}
     L_factors::Vector{Vector{Int}}
     n_ops::Int
-    grid_N::Vector{Int}
-    subgrid_dims::Vector{Int}
+    grid_N::NTuple{D,Int}        # Full grid N — NTuple for zero-alloc access
+    subgrid_dims::NTuple{D,Int}  # M = N/L  — NTuple for zero-alloc access
 end
 
-# Constructor
+# Constructor — accepts Vector{Int} or Tuple for grid_N/subgrid_dims
 function GeneralCFFTPlan(sub_plans::Vector{P}, recomb::M, buffer::B,
         recon_table::Matrix{ReconEntry}, output_buffer::Vector{ComplexF64}, input_buffer::Vector{ComplexF64},
         phase_factors::Vector{Vector{ComplexF64}},
         active::Vector{ActiveBlock}, b_dims, Ls, n_ops,
-        grid_N::Vector{Int}, subgrid_dims::Vector{Int}) where {P, M, B}
+        grid_N, subgrid_dims) where {P, M, B}
     T = eltype(buffer)
     N = 1
-    return GeneralCFFTPlan{T, N, P, M, B}(sub_plans, recomb, buffer,
+    gN = Tuple(grid_N)
+    sD = Tuple(subgrid_dims)
+    D = length(gN)
+    # Pre-store reshaped views for zero-alloc execute path
+    in_view = reshape(input_buffer, sD)
+    wk_view = reshape(buffer, sD)
+    return GeneralCFFTPlan{T, N, P, M, B, D}(sub_plans, recomb, buffer,
         recon_table, output_buffer, input_buffer, phase_factors,
-        active, b_dims, Ls, n_ops, grid_N, subgrid_dims)
+        in_view, wk_view,
+        active, b_dims, Ls, n_ops, gN, sD)
 end
 
 function plan_krfft(real_asu::CrystallographicASU, spec_asu::SpectralIndexing, direct_ops::Vector{<:SymOp})
@@ -395,7 +406,7 @@ function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     end
     
     # 7. Create active block and L_factors for struct
-    active_blocks = [ActiveBlock(1, zeros(Int, dim), 1)]
+    active_blocks = [ActiveBlock(1, ntuple(_ -> 0, dim), 1)]
     block_dims_list = [Tuple(M_sub)]
     L_factors = [L]
     
@@ -574,10 +585,8 @@ Assumes subgrid data is already stored as complex values in plan.work_buffer.
 Returns plan.output_buffer containing spectral ASU values.
 """
 function fft_reconstruct!(plan::GeneralCFFTPlan)
-    # 1. Out-of-place FFT: input_buffer → work_buffer
-    sub_in = reshape(plan.input_buffer, Tuple(plan.subgrid_dims))
-    sub_out = reshape(plan.work_buffer, Tuple(plan.subgrid_dims))
-    mul!(sub_out, plan.sub_plans[1], sub_in)
+    # 1. Out-of-place FFT: input_buffer → work_buffer (pre-stored views)
+    mul!(plan.work_view, plan.sub_plans[1], plan.input_view)
     
     # 2. Reconstruct spectral ASU
     fast_reconstruct!(plan)
@@ -634,7 +643,7 @@ function execute_krfft!(plan::GeneralCFFTPlan, u::AbstractArray{<:Real})
     pack_stride!(plan, u)
     
     # 2. FFT in-place on work_buffer (reshaped to subgrid dims)
-    sub_grid = reshape(plan.work_buffer, Tuple(plan.subgrid_dims))
+    sub_grid = plan.work_view  # pre-stored reshaped view
     p = plan.sub_plans[1]
     p * sub_grid  # in-place FFT
     
@@ -762,7 +771,7 @@ function build_recombination_map(spec_asu::SpectralIndexing, real_asu::Crystallo
         dims = size(block.data)
         len = length(block.data)
         active_lookup[b_i] = current_offset
-        push!(active_blocks, ActiveBlock(b_i, zeros(Int, dim), current_offset))
+        push!(active_blocks, ActiveBlock(b_i, ntuple(_ -> 0, dim), current_offset))
         current_offset += len
     end
     
@@ -816,7 +825,6 @@ function build_recombination_map(spec_asu::SpectralIndexing, real_asu::Crystallo
     total_size = current_offset - 1
     n_orbits = length(all_blocks)
     n_subgrids = prod(L)
-    println("DEBUG [build_recombination_map Mode B]: n_orbits=$n_orbits/$n_subgrids subgrids, buffer_size=$total_size, speedup=$(n_subgrids/n_orbits)x")
     
     M_sparse = sparse(I_idx, J_idx, V_val, length(spec_asu.points), total_size)
     return M_sparse, active_blocks, total_size
@@ -875,11 +883,12 @@ function _build_recombination_map_mode_a(spec_asu::SpectralIndexing, real_asu::C
                 end
                 
                 r_vec = zeros(Int, dim)
+                r_tup = Tuple(r_vec)
                 key = (b_i, r_vec)
                 if !haskey(active_lookup, key)
                     len = length(block.data)
                     active_lookup[key] = current_offset
-                    push!(active_blocks, ActiveBlock(b_i, r_vec, current_offset))
+                    push!(active_blocks, ActiveBlock(b_i, r_tup, current_offset))
                     current_offset += len
                 end
                 buffer_base = active_lookup[key]
@@ -895,7 +904,6 @@ function _build_recombination_map_mode_a(spec_asu::SpectralIndexing, real_asu::C
     end
     
     total_size = current_offset - 1
-    println("DEBUG [build_recombination_map Mode A]: n_ops=$(length(direct_ops)), buffer_size=$total_size, active_blocks=$(length(active_blocks))")
     
     M = sparse(I, J, V, length(spec_asu.points), total_size)
     return M, active_blocks, total_size
@@ -942,7 +950,7 @@ Uses SoA (Struct-of-Arrays) layout for the inverse reconstruction hot path:
 
 Also keeps `inv_recon_table` for plan-time use (e.g., centering_fold.jl).
 """
-struct M2BackwardPlan
+struct M2BackwardPlan{IP}
     # AoS inverse reconstruction table: (d, prod(M)) — kept for plan-time use
     inv_recon_table::Matrix{InvReconEntry}
     d::Int                                   # fiber length = prod(L)
@@ -954,14 +962,18 @@ struct M2BackwardPlan
     F_work::Vector{ComplexF64}               # (2 × n_spec): [F; conj(F)] workspace
 
     # IFFT
-    ifft_plan::Any                           # FFTW plan for M-grid
+    ifft_plan::IP                            # FFTW plan for M-grid (parametrized)
     Y_buf::Vector{ComplexF64}                # M³ complex buffer (inv_recon output / IFFT input)
     f0_buf::Vector{ComplexF64}               # M³ complex buffer (IFFT output)
 
-    # Grid metadata
-    L::Vector{Int}
-    subgrid_dims::Vector{Int}                # M = N/L
-    grid_N::Vector{Int}                      # N
+    # Pre-stored reshaped views (zero-alloc hot path)
+    Y_view::Array{ComplexF64,3}              # reshape(Y_buf, subgrid_dims)
+    f0_view::Array{ComplexF64,3}             # reshape(f0_buf, subgrid_dims)
+
+    # Grid metadata — NTuple for zero-alloc access
+    L::NTuple{3,Int}
+    subgrid_dims::NTuple{3,Int}              # M = N/L
+    grid_N::NTuple{3,Int}                    # N
 
     # Pmmm separable fast path data
     is_separable::Bool
@@ -1156,11 +1168,13 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
         end
     end
 
+    M_tup = Tuple(M_sub)
     return M2BackwardPlan(
         inv_recon_table, d,
         inv_work_idx, inv_weight, n_spec, F_work,
         ifft_plan, Y_buf, f0_buf,
-        L, M_sub, N_vec,
+        reshape(Y_buf, M_tup), reshape(f0_buf, M_tup),  # pre-stored views
+        Tuple(L), M_tup, Tuple(N_vec),
         is_sep, inv_phase_factors
     )
 end
@@ -1293,10 +1307,8 @@ function execute_m2_backward!(bplan::M2BackwardPlan, F_spec::AbstractVector{Comp
     # Step 1: Inverse reconstruction
     _inv_reconstruct_m2!(bplan, F_spec)
 
-    # Step 2: IFFT
-    Y_in = reshape(bplan.Y_buf, Tuple(bplan.subgrid_dims))
-    f_out = reshape(bplan.f0_buf, Tuple(bplan.subgrid_dims))
-    mul!(f_out, bplan.ifft_plan, Y_in)  # Apply IFFT: Y₀ → f₀
+    # Step 2: IFFT (using pre-stored reshaped views)
+    mul!(bplan.f0_view, bplan.ifft_plan, bplan.Y_view)
 
     return bplan.f0_buf
 end
