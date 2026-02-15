@@ -4,6 +4,7 @@ using KernelAbstractions
 using AbstractFFTs
 using FFTW
 using LinearAlgebra
+using LinearAlgebra: LAPACK
 using SparseArrays
 using ..ASU: CrystallographicASU, ASUBlock
 using ..ASU
@@ -309,44 +310,10 @@ function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
         error("Grid size N=$N not divisible by auto L=$L. Use N that is a multiple of L in each dimension.")
     end
     
-    # 2. Select one representative operation per subgrid
-    #    Group ops by subgrid mapping: x₀ = t_g mod L
-    #    F(h) = Σ_{x₀} exp(-2πi h·t_{g(x₀)}/N) · Y₀(R_{g(x₀)}^T h mod M)
-    #    Prefer diagonal R with simple translations t_d ∈ {0,-1} so more groups
-    #    can benefit from the separable Pmmm fast path.
-    subgrid_reps = Dict{Vector{Int}, SymOp}()
-    subgrid_quality = Dict{Vector{Int}, Int}()  # higher = better
-    
-    for op in ops_shifted
-        t = round.(Int, op.t)
-        x0 = [mod(t[d], L[d]) for d in 1:dim]
-        
-        # Score: 2 = diagonal R + simple t, 1 = diagonal R only, 0 = non-diagonal
-        is_diag = all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j)
-        simple_t = all(mod(t[d], N[d]) ∈ (0, N[d]-1) for d in 1:dim)
-        quality = is_diag ? (simple_t ? 2 : 1) : 0
-        
-        if !haskey(subgrid_reps, x0) || quality > subgrid_quality[x0]
-            subgrid_reps[x0] = op
-            subgrid_quality[x0] = quality
-        end
-    end
-    
-    # Enumerate subgrids in canonical order
+    # 2. Select one representative operation per subgrid (shared logic)
+    rep_ops = _select_rep_ops(ops_shifted, L, N, dim)
     n_subs = prod(L)
-    rep_ops = Vector{eltype(ops_shifted)}(undef, n_subs)
-    sub_idx = 0
-    for x0 in Iterators.product([0:L[d]-1 for d in 1:dim]...)
-        sub_idx += 1
-        x0_vec = collect(x0)
-        if haskey(subgrid_reps, x0_vec)
-            rep_ops[sub_idx] = subgrid_reps[x0_vec]
-        else
-            error("Subgrid x₀=$x0_vec not reachable from subgrid 0. auto_L should have prevented this.")
-        end
-    end
-    
-    n_ops_effective = n_subs  # Always prod(L), not |G|
+    n_ops_effective = n_subs
     
     # 3. Plan out-of-place FFT on subgrid
     dummy_in = zeros(ComplexF64, Tuple(M_sub))
@@ -981,37 +948,20 @@ struct M2BackwardPlan{IP}
 end
 
 """
-    plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp}) -> M2BackwardPlan
+    _select_rep_ops(ops_shifted, L, N, dim) -> Vector{SymOp}
 
-Construct the M2 backward plan by building the inverse reconstruction table.
+Select one representative symmetry operation per subgrid coset x₀ = t_g mod L.
+Prefer diagonal R with simple translations (t_d ∈ {0, N_d-1}) for the Pmmm fast path.
 
-For each subgrid frequency q ∈ [0,M)^D:
-1. Enumerate the d full-grid frequencies in the fiber
-2. Build the d×d butterfly matrix B(q)
-3. Compute B⁻¹'s first row
-4. Map each full-grid frequency to spectral ASU (via symmetry/Hermitian)
-5. Store combined weight = B⁻¹ coeff × symmetry phase
+Shared by `plan_krfft` and `plan_m2_backward`.
 """
-function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
-    N = spec_asu.N
-    dim = length(N)
-    N_vec = collect(N)
-
-    # 1. Auto-determine L and M (same as forward)
-    L = auto_L(ops_shifted)
-    M_sub = [N[d] ÷ L[d] for d in 1:dim]
-
-    if any(L .* M_sub .!= N_vec)
-        error("Grid size N=$N not divisible by auto L=$L.")
-    end
-
-    # 2. Select representative ops per subgrid (same logic as plan_krfft)
-    subgrid_reps = Dict{Vector{Int}, SymOp}()
-    subgrid_quality = Dict{Vector{Int}, Int}()
+function _select_rep_ops(ops_shifted::Vector{<:SymOp}, L, N, dim)
+    subgrid_reps = Dict{NTuple{3,Int}, eltype(ops_shifted)}()
+    subgrid_quality = Dict{NTuple{3,Int}, Int}()
 
     for op in ops_shifted
         t = round.(Int, op.t)
-        x0 = [mod(t[d], L[d]) for d in 1:dim]
+        x0 = (mod(t[1], L[1]), mod(t[2], L[2]), mod(t[3], L[3]))
         is_diag = all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j)
         simple_t = all(mod(t[d], N[d]) ∈ (0, N[d]-1) for d in 1:dim)
         quality = is_diag ? (simple_t ? 2 : 1) : 0
@@ -1026,107 +976,104 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
     sub_idx = 0
     for x0 in Iterators.product([0:L[dd]-1 for dd in 1:dim]...)
         sub_idx += 1
-        x0_vec = collect(x0)
-        if haskey(subgrid_reps, x0_vec)
-            rep_ops[sub_idx] = subgrid_reps[x0_vec]
+        x0_tup = (x0[1], x0[2], x0[3])
+        if haskey(subgrid_reps, x0_tup)
+            rep_ops[sub_idx] = subgrid_reps[x0_tup]
         else
-            error("Subgrid x₀=$x0_vec not reachable. auto_L should have prevented this.")
+            error("Subgrid x₀=$x0_tup not reachable. auto_L should have prevented this.")
         end
     end
+    return rep_ops
+end
 
-    # 3. Build spectral reverse lookup: full-grid h → (spec_idx, phase, conj_flag)
-    #    For each full-grid frequency, find which spectral ASU point represents it
-    h_to_spec = _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)
+"""
+    _build_inv_recon_table!(table, rep_ops, alphas, h_to_spec, M_sub, N, d, dim)
 
-    # 4. Build inverse reconstruction table
+Core hot loop: for each subgrid frequency q, build the d×d butterfly matrix B(q),
+solve for B⁻¹ first row, and map full-grid frequencies to spectral ASU entries.
+
+Extracted as a function barrier so Julia can fully specialize on concrete types.
+"""
+function _build_inv_recon_table!(inv_recon_table::Matrix{InvReconEntry},
+                                 rep_ops::Vector{<:SymOp},
+                                 alphas::Vector{NTuple{3,Int}},
+                                 h_to_spec::Dict{NTuple{3,Int}, Tuple{Int, ComplexF64, Bool}},
+                                 M_sub::Vector{Int}, N, d::Int, dim::Int)
     M_vol = prod(M_sub)
-    inv_recon_table = Matrix{InvReconEntry}(undef, d, M_vol)
 
-    # Compute subgrid parities (α vectors) for each rep_op
-    alphas = Vector{Vector{Int}}(undef, d)
-    a_idx = 0
-    for x0 in Iterators.product([0:L[dd]-1 for dd in 1:dim]...)
-        a_idx += 1
-        alphas[a_idx] = collect(x0)
-    end
-
-    # Pre-allocate working arrays
+    # Pre-allocate all working arrays inside the barrier
     B_matrix = zeros(ComplexF64, d, d)
-    h_vecs = [zeros(Int, dim) for _ in 1:d]  # full-grid frequencies per fiber
+    h_vecs = [zeros(Int, dim) for _ in 1:d]
+    ipiv = Vector{Int64}(undef, d)
+    rhs = zeros(ComplexF64, d, 1)
+    rhs[1] = 1.0
+    rhs_work = similar(rhs)
+    q_vec = zeros(Int, dim)
 
-    for q_cart in CartesianIndices(Tuple(M_sub))
-        q_vec = [q_cart[dd] - 1 for dd in 1:dim]  # 0-based
-        q_lin = LinearIndices(Tuple(M_sub))[q_cart]
+    # Pre-extract translations as plain NTuples to avoid SVector alloc
+    rep_translations = NTuple{3,Int}[(Int(g.t[1]), Int(g.t[2]), Int(g.t[3])) for g in rep_ops]
 
-        # 4a. Enumerate full-grid frequencies in this fiber
+    N1, N2, N3 = N[1], N[2], N[3]
+    M_sub_tup = Tuple(M_sub)
+    ci = CartesianIndices(M_sub_tup)
+    li = LinearIndices(M_sub_tup)
+
+    for q_cart in ci
+        for dd in 1:dim
+            q_vec[dd] = q_cart[dd] - 1
+        end
+        q_lin = li[q_cart]
+
+        # Enumerate full-grid frequencies in this fiber
         for a in 1:d
+            α = alphas[a]
             for dd in 1:dim
-                h_vecs[a][dd] = q_vec[dd] + M_sub[dd] * alphas[a][dd]
+                h_vecs[a][dd] = q_vec[dd] + M_sub[dd] * α[dd]
             end
         end
 
-        # 4b. Build d×d butterfly matrix B(q)
-        #     B[a, b] = exp(-2πi h_a · t_b / N) × δ(R_bᵀ h_a mod M maps correctly)
-        #     But simpler: B[a, b] = weight of rep_op b applied to h_a
+        # Build d×d butterfly matrix B(q)
         fill!(B_matrix, zero(ComplexF64))
         for a in 1:d
             h = h_vecs[a]
             for b in 1:d
-                g = rep_ops[b]
-                # Phase: exp(-2πi h · t_g / N)
-                phase_val = 0.0
-                for dd in 1:dim
-                    phase_val += h[dd] * g.t[dd] / N[dd]
-                end
-                w = cispi(-2 * phase_val)
-
-                # Rotated frequency → subgrid index
-                rot_q_lin = 0
-                stride = 1
-                for dd in 1:dim
-                    rot_val = 0
-                    for dd2 in 1:dim
-                        rot_val += g.R[dd2, dd] * h[dd2]
-                    end
-                    rot_val = mod(rot_val, M_sub[dd])
-                    rot_q_lin += rot_val * stride
-                    stride *= M_sub[dd]
-                end
-                # B[a, b] contributes to the position rot_q_lin in Y₀
-                # For the standard M2 case, all rep_ops map the same q to different
-                # or same positions. The correct B construction is:
-                # F(h_a) = Σ_b B[a,b] · Y₀(gather[b])
-                # where gather[b] = R_bᵀ h_a mod M → linear index
-                B_matrix[a, b] = w
+                t_b = rep_translations[b]
+                phase_val = h[1] * t_b[1] / N1 + h[2] * t_b[2] / N2 + h[3] * t_b[3] / N3
+                B_matrix[a, b] = cispi(-2 * phase_val)
             end
         end
 
-        # 4c. Compute B⁻¹ first row
-        B_inv_row1 = inv(B_matrix)[1, :]
+        # Solve B^T · x = e₁ for first row of B⁻¹
+        copyto!(rhs_work, rhs)
+        LAPACK.getrf!(B_matrix, ipiv)
+        LAPACK.getrs!('T', B_matrix, ipiv, rhs_work)
 
-        # 4d. Map full-grid frequencies to spectral ASU and build entries
+        # Map to spectral ASU entries
         for a in 1:d
             h = h_vecs[a]
-            h_mod = [mod(h[dd], N_vec[dd]) for dd in 1:dim]
+            h_key = (mod(h[1], N1), mod(h[2], N2), mod(h[3], N3))
 
-            if haskey(h_to_spec, h_mod)
-                spec_idx, sym_phase, conj_f = h_to_spec[h_mod]
-                combined_weight = B_inv_row1[a] * sym_phase
+            if haskey(h_to_spec, h_key)
+                spec_idx, sym_phase, conj_f = h_to_spec[h_key]
                 inv_recon_table[a, q_lin] = InvReconEntry(
-                    Int32(spec_idx), combined_weight, conj_f
+                    Int32(spec_idx), rhs_work[a] * sym_phase, conj_f
                 )
             else
-                # Extinguished frequency: F(h) = 0, contributes nothing
                 inv_recon_table[a, q_lin] = InvReconEntry(
                     Int32(1), zero(ComplexF64), false
                 )
             end
         end
     end
+end
 
-    # 5. Build SoA arrays from inv_recon_table for hot-path branchless inner loop
-    #    For conj entries: work_idx = n_spec + spec_idx (reads from conj half of F_work)
-    n_spec = length(spec_asu.points)
+"""
+    _build_soa_arrays(inv_recon_table, d, M_vol, n_spec) -> (inv_work_idx, inv_weight)
+
+Convert the AoS `inv_recon_table` to SoA arrays for the branchless hot-path inner loop.
+For conjugate entries: work_idx = n_spec + spec_idx (reads from conj half of F_work).
+"""
+function _build_soa_arrays(inv_recon_table::Matrix{InvReconEntry}, d::Int, M_vol::Int, n_spec::Int)
     soa_len = d * M_vol
     inv_work_idx = Vector{Int32}(undef, soa_len)
     inv_weight = Vector{ComplexF64}(undef, soa_len)
@@ -1141,39 +1088,82 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
                 Int32(n_spec + entry.spec_idx) : entry.spec_idx
         end
     end
+    return inv_work_idx, inv_weight
+end
 
+"""
+    plan_m2_backward(spec_asu, ops_shifted) -> M2BackwardPlan
+
+Construct the M2 backward plan: spectral ASU → subgrid inverse reconstruction.
+Delegates to `_select_rep_ops`, `_build_spectral_reverse_lookup`,
+`_build_inv_recon_table!`, and `_build_soa_arrays`.
+"""
+function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
+    N = spec_asu.N
+    dim = length(N)
+    N_vec = collect(N)
+
+    # 1. Auto-determine L and M
+    L = auto_L(ops_shifted)
+    M_sub = [N[d] ÷ L[d] for d in 1:dim]
+    if any(L .* M_sub .!= N_vec)
+        error("Grid size N=$N not divisible by auto L=$L.")
+    end
+
+    # 2. Select representative ops per subgrid
+    rep_ops = _select_rep_ops(ops_shifted, L, N, dim)
+    d = prod(L)
+
+    # 3. Build spectral reverse lookup
+    h_to_spec = _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)
+
+    # 4. Build inverse reconstruction table (function barrier for specialization)
+    M_vol = prod(M_sub)
+    inv_recon_table = Matrix{InvReconEntry}(undef, d, M_vol)
+    alphas = Vector{NTuple{3,Int}}(undef, d)
+    a_idx = 0
+    for x0 in Iterators.product([0:L[dd]-1 for dd in 1:dim]...)
+        a_idx += 1
+        alphas[a_idx] = (x0[1], x0[2], x0[3])
+    end
+    _build_inv_recon_table!(inv_recon_table, rep_ops, alphas, h_to_spec, M_sub, N, d, dim)
+
+    # 5. Build SoA arrays
+    n_spec = length(spec_asu.points)
+    inv_work_idx, inv_weight = _build_soa_arrays(inv_recon_table, d, M_vol, n_spec)
+
+    # 6. Allocate buffers and plan IFFT
     F_work = zeros(ComplexF64, 2 * n_spec)
-
-    # 6. Plan IFFT
-    dummy = zeros(ComplexF64, Tuple(M_sub))
+    M_tup = Tuple(M_sub)
+    dummy = zeros(ComplexF64, M_tup)
     ifft_plan = plan_ifft(dummy)
-
-    # 7. Allocate buffers
     Y_buf = zeros(ComplexF64, M_vol)
     f0_buf = zeros(ComplexF64, M_vol)
 
-    # 8. Detect Pmmm separable structure
-    all_diagonal = all(op -> all(op.R[i,j] == 0 for i in 1:dim for j in 1:dim if i != j), rep_ops)
-    simple_translations = all(op -> all(mod(round(Int, op.t[dd]), N[dd]) ∈ (0, N[dd]-1)
-                                        for dd in 1:dim), rep_ops)
+    # 7. Detect Pmmm separable structure
+    all_diagonal = all(1:d) do i
+        R = rep_ops[i].R
+        all(R[ii,jj] == 0 for ii in 1:dim for jj in 1:dim if ii != jj)
+    end
+    simple_translations = all(1:d) do i
+        t = rep_ops[i].t
+        all(mod(Int(t[dd]), N[dd]) ∈ (0, N[dd]-1) for dd in 1:dim)
+    end
     is_sep = all_diagonal && simple_translations && d == 2^dim
 
     inv_phase_factors = Vector{ComplexF64}[]
     if is_sep
-        # For Pmmm inverse: phase factor for dimension d at freq q is
-        # conj(φ_d(q)) / 2 where φ_d(q) = exp(2πi q / N_d)
         inv_phase_factors = Vector{Vector{ComplexF64}}(undef, dim)
         for dd in 1:dim
             inv_phase_factors[dd] = [cispi(-2 * q / N[dd]) for q in 0:M_sub[dd]-1]
         end
     end
 
-    M_tup = Tuple(M_sub)
     return M2BackwardPlan(
         inv_recon_table, d,
         inv_work_idx, inv_weight, n_spec, F_work,
         ifft_plan, Y_buf, f0_buf,
-        reshape(Y_buf, M_tup), reshape(f0_buf, M_tup),  # pre-stored views
+        reshape(Y_buf, M_tup), reshape(f0_buf, M_tup),
         Tuple(L), M_tup, Tuple(N_vec),
         is_sep, inv_phase_factors
     )
@@ -1194,97 +1184,70 @@ function _build_spectral_reverse_lookup(spec_asu::SpectralIndexing,
                                         ops_shifted::Vector{<:SymOp},
                                         N_vec::Vector{Int}, dim::Int)
     # Result: h_mod (0-based) → (spec_idx, phase, conj_flag)
-    h_to_spec = Dict{Vector{Int}, Tuple{Int, ComplexF64, Bool}}()
+    # Use NTuple keys to avoid heap-allocating Vector per Dict entry
+    h_to_spec = Dict{NTuple{3,Int}, Tuple{Int, ComplexF64, Bool}}()
+    sizehint!(h_to_spec, prod(N_vec))
 
     n_spec = length(spec_asu.points)
+    n_ops = length(ops_shifted)
 
-    # Reciprocal-space ops: R* = (R⁻¹)ᵀ = R for orthogonal ops, but use dual_ops
-    # Actually, the forward recon uses R^T (transpose of the direct-space rotation).
-    # The spectral ASU uses dual_ops (reciprocal ops).
-    # For reverse lookup: we need to map R_g^T h back to h_asu.
-    # The direct_ops have R_direct, and in the recon: R_directᵀ · h mod M.
-    # For spectral orbit: h and R_recip · h are equivalent
-    # where R_recip comes from dual_ops.
-    recip_ops = spec_asu.ops  # Already the reciprocal-space ops stored in SpectralIndexing
-
-    # Build fast index lookup for spectral ASU points
-    spec_point_map = Dict{Vector{Int}, Int}()
-    for (idx, pt) in enumerate(spec_asu.points)
-        spec_point_map[pt.idx] = idx
+    # Pre-extract R matrices and translations as plain arrays to avoid SVector alloc
+    # R_flat[dd2, dd, op_idx] = op.R[dd2, dd]
+    R_flat = Array{Int}(undef, dim, dim, n_ops)
+    t_flat = Vector{NTuple{3,Int}}(undef, n_ops)
+    for (i, op) in enumerate(ops_shifted)
+        for dd in 1:dim, dd2 in 1:dim
+            R_flat[dd2, dd, i] = Int(op.R[dd2, dd])
+        end
+        t_flat[i] = (Int(op.t[1]), Int(op.t[2]), Int(op.t[3]))
     end
+
+    # Pre-allocate working buffer for h_rot (reused across all iterations)
+    h_buf = zeros(Int, dim)
+
+    N1, N2, N3 = N_vec[1], N_vec[2], N_vec[3]
 
     # For each spectral ASU point, expand its orbit
     for (spec_idx, pt) in enumerate(spec_asu.points)
-        h_asu = pt.idx  # 0-based
+        h_asu = pt.idx  # 0-based Vector{Int}
+        h1, h2, h3 = h_asu[1], h_asu[2], h_asu[3]
 
         # Identity: h_asu itself
-        if !haskey(h_to_spec, h_asu)
-            h_to_spec[h_asu] = (spec_idx, complex(1.0), false)
+        h_key = (h1, h2, h3)
+        if !haskey(h_to_spec, h_key)
+            h_to_spec[h_key] = (spec_idx, complex(1.0), false)
         end
 
         # Apply all direct-space ops to get full-grid equivalents
-        # Spectral symmetry (numerically verified):
-        #   F(R^T h) = exp(+2πi h·t/N) · F(h)
-        # So: F_full(h') = exp(+2πi h_asu·t/N) · F_spec(spec_idx)
-        # where h' = R^T · h_asu mod N
-        for op in ops_shifted
-            R = op.R
-            t = op.t
-            # h' = R^T · h_asu mod N
-            h_rot = zeros(Int, dim)
+        for oi in 1:n_ops
+            t_op = t_flat[oi]
+            # h' = R^T · h_asu mod N — compute into h_buf, then make tuple key
             for dd in 1:dim
                 s = 0
                 for dd2 in 1:dim
-                    s += R[dd2, dd] * h_asu[dd2]
+                    s += R_flat[dd2, dd, oi] * h_asu[dd2]
                 end
-                h_rot[dd] = mod(s, N_vec[dd])
+                h_buf[dd] = mod(s, N_vec[dd])
+            end
+            h_rot_key = (h_buf[1], h_buf[2], h_buf[3])
+
+            if !haskey(h_to_spec, h_rot_key)
+                phase_val = h1 * t_op[1] / N1 + h2 * t_op[2] / N2 + h3 * t_op[3] / N3
+                h_to_spec[h_rot_key] = (spec_idx, cispi(2 * phase_val), false)
             end
 
-            if !haskey(h_to_spec, h_rot)
-                # F_full(h') = exp(+2πi h_asu · t / N) · F_spec
-                phase_val = 0.0
-                for dd in 1:dim
-                    phase_val += h_asu[dd] * t[dd] / N_vec[dd]
-                end
-                phase = cispi(2 * phase_val)
-                h_to_spec[h_rot] = (spec_idx, phase, false)
+            # Hermitian of this orbit member: -R^T h_asu mod N
+            h_neg_key = (mod(-h_buf[1], N1), mod(-h_buf[2], N2), mod(-h_buf[3], N3))
+            if !haskey(h_to_spec, h_neg_key)
+                phase_val = h1 * t_op[1] / N1 + h2 * t_op[2] / N2 + h3 * t_op[3] / N3
+                h_to_spec[h_neg_key] = (spec_idx, cispi(-2 * phase_val), true)
             end
         end
 
-        # Hermitian symmetry: F(-h) = conj(F(h)) for real-valued fields
-        # So F_full(-h_asu mod N) = conj(F_spec(spec_idx))
-        h_neg = [mod(-h_asu[dd], N_vec[dd]) for dd in 1:dim]
-        if !haskey(h_to_spec, h_neg)
-            h_to_spec[h_neg] = (spec_idx, complex(1.0), true)
-        end
-
-        # Also: Hermitian of orbit members
-        # F_full(R^T h) = exp(+2πi h·t/N) · F_spec
-        # F_full(-R^T h) = conj(F_full(R^T h)) = exp(-2πi h·t/N) · conj(F_spec)
-        # phase for conj = exp(+2πi h·t/N) conj'd = exp(-2πi h·t/N)
-        for op in ops_shifted
-            R = op.R
-            t = op.t
-            # h' = R^T · h_asu mod N
-            h_rot = zeros(Int, dim)
-            for dd in 1:dim
-                s = 0
-                for dd2 in 1:dim
-                    s += R[dd2, dd] * h_asu[dd2]
-                end
-                h_rot[dd] = mod(s, N_vec[dd])
-            end
-
-            h_rot_neg = [mod(-h_rot[dd], N_vec[dd]) for dd in 1:dim]
-            if !haskey(h_to_spec, h_rot_neg)
-                # F_full(-h') = conj(F_full(h')) = exp(-2πi h_asu·t/N) · conj(F_spec)
-                phase_val = 0.0
-                for dd in 1:dim
-                    phase_val += h_asu[dd] * t[dd] / N_vec[dd]
-                end
-                phase = cispi(-2 * phase_val)
-                h_to_spec[h_rot_neg] = (spec_idx, phase, true)
-            end
+        # Hermitian symmetry of the ASU point itself: -h_asu mod N
+        h_neg_asu = (mod(-h1, N1), mod(-h2, N2), mod(-h3, N3))
+        if !haskey(h_to_spec, h_neg_asu)
+            h_to_spec[h_neg_asu] = (spec_idx, complex(1.0), true)
         end
     end
 
