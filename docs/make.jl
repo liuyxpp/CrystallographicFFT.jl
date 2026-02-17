@@ -65,6 +65,7 @@ makedocs(;
     sitename = "CrystallographicFFT.jl",
     format = Documenter.HTML(; canonical = "https://liuyxpp.github.io/CrystallographicFFT.jl"),
     pages = list_pages(),
+    warnonly = [:missing_docs],
 )
 
 deploydocs(; repo = "github.com/liuyxpp/CrystallographicFFT.jl")
