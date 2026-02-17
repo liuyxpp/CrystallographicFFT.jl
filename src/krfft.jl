@@ -12,7 +12,7 @@ using ..SpectralIndexing: SpectralIndexing, get_k_vector
 using ..SymmetryOps: SymOp, apply_op!, CenteringType, CentP, CentC, CentA, CentI, CentF
 using ..SymmetryOps: detect_centering_type
 
-export GeneralCFFTPlan, map_fft!, map_ifft!, build_recombination_map, plan_krfft
+export GeneralForwardPlan, map_fft!, map_ifft!, build_recombination_map, plan_krfft
 export fast_reconstruct!, pack_stride!, execute_krfft!, ReconEntry, fft_reconstruct!
 export auto_L
 export plan_krfft_recursive, execute_recursive_krfft!, pack_p3c!, fft_p3c!
@@ -26,14 +26,14 @@ export FractalNode, FractalCFFTPlan, calc_asu_tree, build_recursive_tree
 export collect_leaves, collect_inner_nodes_bottomup, tree_summary
 export plan_fractal_krfft, execute_fractal_krfft!
 export OptimizedFractalPlan, plan_fractal_krfft_v2, execute_fractal_krfft_v2!
-export SubgridCenteringFoldPlan, CenteredKRFFTPlan
+export SubgridCenteringFoldPlan, CenteredForwardPlan
 export plan_krfft_centered, execute_centered_krfft!, fft_reconstruct_centered!
 export plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
 export ifft_channels!, centering_unfold!, disassemble_G0!
-export CenteredKRFFTBackwardPlan, InvReconEntry
+export CenteredBackwardPlan, InvReconEntry
 export plan_centered_ikrfft, execute_centered_ikrfft!, ifft_unrecon_centered!
 export CenteredSCFTPlan, plan_centered_scft, execute_centered_scft!, update_kernel!
-export M2BackwardPlan, plan_m2_backward, execute_m2_backward!
+export GeneralBackwardPlan, plan_m2_backward, execute_m2_backward!
 
 
 """
@@ -59,12 +59,12 @@ struct ReconEntry
 end
 
 """
-    GeneralCFFTPlan
+    GeneralForwardPlan
 
 A plan for General KRFFT using Modulated Block FFTs (Cooley-Tukey Decomposition).
 Decomposes Global frequency q = m * L + r.
 """
-struct GeneralCFFTPlan{T, N, P, M, B, D} <: AbstractFFTs.Plan{T}
+struct GeneralForwardPlan{T, N, P, M, B, D} <: AbstractFFTs.Plan{T}
     # 1. Sub-plans for small FFTs (shared by size)
     sub_plans::Vector{P}
     
@@ -97,7 +97,7 @@ struct GeneralCFFTPlan{T, N, P, M, B, D} <: AbstractFFTs.Plan{T}
 end
 
 # Constructor — accepts Vector{Int} or Tuple for grid_N/subgrid_dims
-function GeneralCFFTPlan(sub_plans::Vector{P}, recomb::M, buffer::B,
+function GeneralForwardPlan(sub_plans::Vector{P}, recomb::M, buffer::B,
         recon_table::Matrix{ReconEntry}, output_buffer::Vector{ComplexF64}, input_buffer::Vector{ComplexF64},
         phase_factors::Vector{Vector{ComplexF64}},
         active::Vector{ActiveBlock}, b_dims, Ls, n_ops,
@@ -110,7 +110,7 @@ function GeneralCFFTPlan(sub_plans::Vector{P}, recomb::M, buffer::B,
     # Pre-store reshaped views for zero-alloc execute path
     in_view = reshape(input_buffer, sD)
     wk_view = reshape(buffer, sD)
-    return GeneralCFFTPlan{T, N, P, M, B, D}(sub_plans, recomb, buffer,
+    return GeneralForwardPlan{T, N, P, M, B, D}(sub_plans, recomb, buffer,
         recon_table, output_buffer, input_buffer, phase_factors,
         in_view, wk_view,
         active, b_dims, Ls, n_ops, gN, sD)
@@ -197,7 +197,7 @@ function plan_krfft(real_asu::CrystallographicASU, spec_asu::SpectralIndexing, d
     
     P_type = eltype(block_plans)
     
-    return GeneralCFFTPlan(convert(Vector{P_type}, block_plans), M_recomb, work_buffer,
+    return GeneralForwardPlan(convert(Vector{P_type}, block_plans), M_recomb, work_buffer,
         recon_table, output_buffer, vec(input_buffer), phase_factors,
         active_blocks, block_dims_list, L_factors, n_ops,
         collect(N), M_sub)
@@ -279,7 +279,7 @@ function auto_L(ops_shifted::Vector{<:SymOp})
 end
 
 """
-    plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp}) -> GeneralCFFTPlan
+    plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp}) -> GeneralForwardPlan
 
 Auto-L variant: computes optimal L from ops, constructs plan without pre-packed ASU.
 
@@ -382,13 +382,13 @@ function plan_krfft(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp})
     # Dummy sparse recomb (unused in fast path, kept for interface compat)
     M_recomb = sparse(Int[], Int[], ComplexF64[], n_spec, buffer_size)
     
-    return GeneralCFFTPlan(convert(Vector{P_type}, block_plans), M_recomb, work_buffer,
+    return GeneralForwardPlan(convert(Vector{P_type}, block_plans), M_recomb, work_buffer,
         recon_table, output_buffer, vec(input_buffer), phase_factors,
         active_blocks, block_dims_list, L_factors, n_ops_effective,
         collect(N), M_sub)
 end
 
-function map_fft!(plan::GeneralCFFTPlan, asu::CrystallographicASU)
+function map_fft!(plan::GeneralForwardPlan, asu::CrystallographicASU)
     # 1. Flatten ASU blocks to linear access if needed? No, access by index.
     # Better: Re-linearize `all_blocks` references
     all_blocks = Vector{ASUBlock}()
@@ -458,7 +458,7 @@ For diagonal-R groups (Pmmm), uses on-the-fly index computation
 with precomputed 1D phase tables instead of general ReconEntry table.
 Falls back to table-based approach for non-diagonal groups.
 """
-function fast_reconstruct!(plan::GeneralCFFTPlan)
+function fast_reconstruct!(plan::GeneralForwardPlan)
     M = plan.subgrid_dims
     dim = length(M)
     
@@ -472,7 +472,7 @@ function fast_reconstruct!(plan::GeneralCFFTPlan)
 end
 
 """Specialized Pmmm reconstruction with on-the-fly mirror indices."""
-function _fast_reconstruct_pmmm!(plan::GeneralCFFTPlan)
+function _fast_reconstruct_pmmm!(plan::GeneralForwardPlan)
     M1, M2, M3 = plan.subgrid_dims[1], plan.subgrid_dims[2], plan.subgrid_dims[3]
     Y = reshape(plan.work_buffer, M1, M2, M3)
     out = plan.output_buffer
@@ -526,7 +526,7 @@ function _fast_reconstruct_pmmm!(plan::GeneralCFFTPlan)
 end
 
 """General table-based fallback for non-diagonal groups."""
-function _fast_reconstruct_general!(plan::GeneralCFFTPlan)
+function _fast_reconstruct_general!(plan::GeneralForwardPlan)
     n_ops = plan.n_ops
     n_spec = length(plan.output_buffer)
     buf = plan.work_buffer
@@ -551,7 +551,7 @@ Combined FFT + reconstruct for SCFT fast path.
 Assumes subgrid data is already stored as complex values in plan.work_buffer.
 Returns plan.output_buffer containing spectral ASU values.
 """
-function fft_reconstruct!(plan::GeneralCFFTPlan)
+function fft_reconstruct!(plan::GeneralForwardPlan)
     # 1. Out-of-place FFT: input_buffer → work_buffer (pre-stored views)
     mul!(plan.work_view, plan.sub_plans[1], plan.input_view)
     
@@ -568,7 +568,7 @@ end
 Fast stride-2 subgrid extraction from real array u into plan's work_buffer.
 Directly copies u[1:2:end, 1:2:end, 1:2:end] into the complex work buffer.
 """
-function pack_stride!(plan::GeneralCFFTPlan, u::AbstractArray{<:Real})
+function pack_stride!(plan::GeneralForwardPlan, u::AbstractArray{<:Real})
     N = plan.grid_N
     M = plan.subgrid_dims
     dim = length(N)
@@ -605,7 +605,7 @@ end
 Full KRFFT pipeline: pack → FFT → reconstruct.
 Returns the output_buffer containing spectral ASU values.
 """
-function execute_krfft!(plan::GeneralCFFTPlan, u::AbstractArray{<:Real})
+function execute_krfft!(plan::GeneralForwardPlan, u::AbstractArray{<:Real})
     # 1. Pack: stride-2 copy into work_buffer
     pack_stride!(plan, u)
     
@@ -621,7 +621,7 @@ function execute_krfft!(plan::GeneralCFFTPlan, u::AbstractArray{<:Real})
 end
 
 
-function map_ifft!(plan::GeneralCFFTPlan, asu::CrystallographicASU)
+function map_ifft!(plan::GeneralForwardPlan, asu::CrystallographicASU)
     # Inverse:
     # 1. Input: u_spec (Caller uses M') -> plan.work_buffer.
     # Buffer contains summed contributions for Modulated FFTs.
@@ -906,7 +906,7 @@ struct InvReconEntry
 end
 
 """
-    M2BackwardPlan
+    GeneralBackwardPlan
 
 Plan for the M2 backward transform (inverse of General KRFFT).
 
@@ -917,7 +917,7 @@ Uses SoA (Struct-of-Arrays) layout for the inverse reconstruction hot path:
 
 Also keeps `inv_recon_table` for plan-time use (e.g., centering_fold.jl).
 """
-struct M2BackwardPlan{IP}
+struct GeneralBackwardPlan{IP}
     # AoS inverse reconstruction table: (d, prod(M)) — kept for plan-time use
     inv_recon_table::Matrix{InvReconEntry}
     d::Int                                   # fiber length = prod(L)
@@ -1092,7 +1092,7 @@ function _build_soa_arrays(inv_recon_table::Matrix{InvReconEntry}, d::Int, M_vol
 end
 
 """
-    plan_m2_backward(spec_asu, ops_shifted) -> M2BackwardPlan
+    plan_m2_backward(spec_asu, ops_shifted) -> GeneralBackwardPlan
 
 Construct the M2 backward plan: spectral ASU → subgrid inverse reconstruction.
 Delegates to `_select_rep_ops`, `_build_spectral_reverse_lookup`,
@@ -1159,7 +1159,7 @@ function plan_m2_backward(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
         end
     end
 
-    return M2BackwardPlan(
+    return GeneralBackwardPlan(
         inv_recon_table, d,
         inv_work_idx, inv_weight, n_spec, F_work,
         ifft_plan, Y_buf, f0_buf,
@@ -1256,7 +1256,7 @@ end
 
 
 """
-    execute_m2_backward!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64}) -> Vector{ComplexF64}
+    execute_m2_backward!(bplan::GeneralBackwardPlan, F_spec::AbstractVector{ComplexF64}) -> Vector{ComplexF64}
 
 Execute the M2 backward transform: spectral ASU → subgrid (M³).
 
@@ -1266,7 +1266,7 @@ Steps:
 
 Returns `bplan.f0_buf` containing the subgrid real-space data.
 """
-function execute_m2_backward!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64})
+function execute_m2_backward!(bplan::GeneralBackwardPlan, F_spec::AbstractVector{ComplexF64})
     # Step 1: Inverse reconstruction
     _inv_reconstruct_m2!(bplan, F_spec)
 
@@ -1282,7 +1282,7 @@ SoA-based inverse reconstruction: spectral ASU → Y₀(M³).
 Branchless inner loop using pre-built F_work = [F_spec; conj(F_spec)].
 Conjugated entries index into the second half (n_spec + spec_idx).
 """
-function _inv_reconstruct_m2!(bplan::M2BackwardPlan, F_spec::AbstractVector{ComplexF64})
+function _inv_reconstruct_m2!(bplan::GeneralBackwardPlan, F_spec::AbstractVector{ComplexF64})
     d = bplan.d
     M_vol = prod(bplan.subgrid_dims)
     Y = bplan.Y_buf

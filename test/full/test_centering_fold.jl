@@ -5,7 +5,7 @@ using CrystallographicFFT.ASU: find_optimal_shift
 using CrystallographicFFT.SpectralIndexing: calc_spectral_asu, get_k_vector
 using CrystallographicFFT.KRFFT: plan_krfft_centered, execute_centered_krfft!
 using CrystallographicFFT.KRFFT: plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!
-using CrystallographicFFT.KRFFT: SubgridCenteringFoldPlan, CenteredKRFFTPlan
+using CrystallographicFFT.KRFFT: SubgridCenteringFoldPlan, CenteredForwardPlan
 using CrystallographicFFT.KRFFT: pack_stride_real!
 using FFTW
 using Random
@@ -105,7 +105,7 @@ end
                 F_ref = fft(u_sym)
 
                 plan = plan_krfft_centered(spec, ops_s)
-                @test plan isa CenteredKRFFTPlan
+                @test plan isa CenteredForwardPlan
 
                 execute_centered_krfft!(plan, u_sym)
                 spec_out = plan.krfft_plan.output_buffer
@@ -140,7 +140,7 @@ end
         u_sym = make_symmetric(ops_s, N)
 
         plan = plan_krfft_centered(spec, ops_s)
-        @test plan isa CenteredKRFFTPlan
+        @test plan isa CenteredForwardPlan
 
         # Execute full pipeline
         execute_centered_krfft!(plan, u_sym)

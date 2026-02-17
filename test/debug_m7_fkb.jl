@@ -8,7 +8,7 @@ using CrystallographicFFT.ASU: find_optimal_shift
 using CrystallographicFFT.QFusedKRFFT
 using CrystallographicFFT.KRFFT: plan_centering_fold, centering_fold!, fft_channels!,
     assemble_G0!, ifft_channels!, centering_unfold!, disassemble_G0!,
-    GeneralCFFTPlan, plan_krfft, ReconEntry, fast_reconstruct!
+    GeneralForwardPlan, plan_krfft, ReconEntry, fast_reconstruct!
 using FFTW
 using Statistics
 using LinearAlgebra

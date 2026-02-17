@@ -11,7 +11,7 @@ using ..SymmetryOps: detect_centering_type, strip_centering, get_ops
 using ..SpectralIndexing: SpectralIndexing as SpectralASU
 using ..SpectralIndexing: calc_spectral_asu
 
-export CenteringPreFoldPlan, CenteredKRFFTPlan
+export CenteringPreFoldPlan, CenteredPreFoldPlan
 export plan_krfft_centered, execute_centered_krfft!
 
 # ============================================================================
@@ -151,7 +151,7 @@ function _execute_channel!(ch::ChannelPlan)
 end
 
 # ============================================================================
-# CenteredKRFFTPlan
+# CenteredPreFoldPlan
 # ============================================================================
 
 struct ChannelMergeEntry
@@ -159,7 +159,7 @@ struct ChannelMergeEntry
     fft_idx::Int32
 end
 
-struct CenteredKRFFTPlan
+struct CenteredPreFoldPlan
     prefold::CenteringPreFoldPlan
     channel_plans::Vector{ChannelPlan}
     channel_buffers::Vector{Array{ComplexF64,3}}
@@ -194,10 +194,10 @@ function _build_centered_plan(ops::Vector{<:SymOp}, N::Tuple, centering::Centeri
     merge_table = _build_merge_table(full_spec, prefold, N, N_sub)
 
     n_unmapped = count(e -> e.channel == 0, merge_table)
-    @info "CenteredKRFFTPlan: centering=$centering, N=$N→$(N_sub), " *
+    @info "CenteredPreFoldPlan: centering=$centering, N=$N→$(N_sub), " *
           "channels=$n_ch, full_spec=$(length(full_spec.points)), unmapped=$n_unmapped"
 
-    return CenteredKRFFTPlan(
+    return CenteredPreFoldPlan(
         prefold, channel_plans, channel_buffers,
         full_spec, merge_table, zeros(ComplexF64, length(full_spec.points)),
         centering, NTuple{3,Int}(N), N_sub, n_ch)
@@ -233,7 +233,7 @@ end
 # Execution
 # ============================================================================
 
-function execute_centered_krfft!(plan::CenteredKRFFTPlan, u::Array{<:Real,3})
+function execute_centered_krfft!(plan::CenteredPreFoldPlan, u::Array{<:Real,3})
     centering_prefold!(plan.channel_buffers, u, plan.prefold)
     for (c, ch) in enumerate(plan.channel_plans)
         ch.fft_input .= plan.channel_buffers[c]
@@ -243,7 +243,7 @@ function execute_centered_krfft!(plan::CenteredKRFFTPlan, u::Array{<:Real,3})
     return plan.output_buffer
 end
 
-function _merge_channels!(plan::CenteredKRFFTPlan)
+function _merge_channels!(plan::CenteredPreFoldPlan)
     out = plan.output_buffer
     mt = plan.merge_table
     @inbounds for i in 1:length(out)

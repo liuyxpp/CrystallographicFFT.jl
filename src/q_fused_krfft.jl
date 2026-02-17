@@ -10,8 +10,8 @@ using ..SpectralIndexing: calc_spectral_asu, SpectralIndexing
 using ..KRFFT: auto_L, _select_rep_ops, SubgridCenteringFoldPlan,
     plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!,
     ifft_channels!, centering_unfold!, disassemble_G0!,
-    GeneralCFFTPlan, plan_krfft, fft_reconstruct!, fast_reconstruct!,
-    M2BackwardPlan, plan_m2_backward, execute_m2_backward!
+    GeneralForwardPlan, plan_krfft, fft_reconstruct!, fast_reconstruct!,
+    GeneralBackwardPlan, plan_m2_backward, execute_m2_backward!
 
 export M2QPlan, plan_m2_q, execute_m2_q!
 export M7SCFTPlan, plan_m7_scft, execute_m7_scft!
@@ -755,13 +755,13 @@ multiplication in spectral space, achieving machine precision for ALL space
 groups (including P-centering).
 
 # Fields
-- `fwd_plan`: M2 forward plan (`GeneralCFFTPlan`)
-- `bwd_plan`: M2 backward plan (`M2BackwardPlan`)
+- `fwd_plan`: M2 forward plan (`GeneralForwardPlan`)
+- `bwd_plan`: M2 backward plan (`GeneralBackwardPlan`)
 - `K_spec`: Pre-computed diffusion kernel for each spectral ASU point
 - `F_spec`: Workspace for spectral coefficients
 - `n_spec`: Number of spectral ASU points
 """
-struct M2SCFTPlan{FP<:GeneralCFFTPlan, BP<:M2BackwardPlan}
+struct M2SCFTPlan{FP<:GeneralForwardPlan, BP<:GeneralBackwardPlan}
     fwd_plan::FP
     bwd_plan::BP
     K_spec::Vector{Float64}

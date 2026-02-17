@@ -17,9 +17,21 @@ include("diffusion_solver.jl")
 using .DiffusionSolver
 include("optimal_L.jl")
 include("execution.jl")
-export CFFTPlan, plan_cfft
-export optimal_L, optimal_L_isotropic, recommended_N, group_order
-export auto_L
-export M2QPlan, plan_m2_q, execute_m2_q!, subgrid_to_fullgrid!, fullgrid_to_subgrid!
+include("cfft_api.jl")
+using .CFFTApi
+
+# ---- Public API ----
+export AbstractCFFTPlan, AbstractCFFTPairPlan
+export GeneralCFFTPairPlan, CenteredCFFTPairPlan
+export CFFTPlan, ICFFTPlan
+export plan_cfft, plan_icfft, plan_cfft_pair
+export cfft!, icfft!
+export make_diffusion_kernel, update_diffusion_kernel!
+export cfft_k2
+export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size
+export subgrid_to_fullgrid!, fullgrid_to_subgrid!
+export recommended_N, group_order
 
 end
+
+

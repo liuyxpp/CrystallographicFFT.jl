@@ -46,10 +46,10 @@ end
                 u_sym = make_symmetric(ops_s, N)
 
                 fwd = CKRFFT.plan_krfft_centered(spec, ops_s)
-                @test fwd isa CKRFFT.CenteredKRFFTPlan
+                @test fwd isa CKRFFT.CenteredForwardPlan
 
                 bwd = CKRFFT.plan_centered_ikrfft(spec, ops_s, fwd)
-                @test bwd isa CKRFFT.CenteredKRFFTBackwardPlan
+                @test bwd isa CKRFFT.CenteredBackwardPlan
 
                 # Extract f₀ subgrid
                 M = N .÷ 2

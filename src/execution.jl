@@ -2,12 +2,12 @@
 import LinearAlgebra: ldiv!, mul!
 
 """
-    mul!(out::CrystallographicASU, plan::CFFTPlan, in::CrystallographicASU)
+    mul!(out::CrystallographicASU, plan::ASUPlan, in::CrystallographicASU)
 
 Perform the forward Crystallographic FFT (Spatial -> Spectral).
 Applies the sub-plans to each block.
 """
-function mul!(out::CrystallographicASU{D, To, Ao}, plan::CFFTPlan, in::CrystallographicASU{D, Ti, Ai}) where {D, To, Ao, Ti, Ai}
+function mul!(out::CrystallographicASU{D, To, Ao}, plan::ASUPlan, in::CrystallographicASU{D, Ti, Ai}) where {D, To, Ao, Ti, Ai}
     # Iterate over all dimension groups
     for (d, blocks_in) in in.dim_blocks
         if !haskey(out.dim_blocks, d)
@@ -30,11 +30,11 @@ function mul!(out::CrystallographicASU{D, To, Ao}, plan::CFFTPlan, in::Crystallo
 end
 
 """
-    ldiv!(out::CrystallographicASU, plan::CFFTPlan, in::CrystallographicASU)
+    ldiv!(out::CrystallographicASU, plan::ASUPlan, in::CrystallographicASU)
 
 Perform the inverse Crystallographic FFT (Spectral -> Spatial).
 """
-function ldiv!(out::CrystallographicASU{D, To, Ao}, plan::CFFTPlan, in::CrystallographicASU{D, Ti, Ai}) where {D, To, Ao, Ti, Ai}
+function ldiv!(out::CrystallographicASU{D, To, Ao}, plan::ASUPlan, in::CrystallographicASU{D, Ti, Ai}) where {D, To, Ao, Ti, Ai}
     for (d, blocks_in) in in.dim_blocks
         if !haskey(out.dim_blocks, d)
             error("Output ASU missing dimension $d blocks")

@@ -162,7 +162,7 @@ end
     # `plan.work_buffer` is size `buffer_size`.
     # They match.
     # But `work_buffer` is 1D array in our implementation?
-    # `GeneralCFFTPlan` line 208: `work_buffer = zeros(ComplexF64, buffer_size)`.
+    # `GeneralForwardPlan` line 208: `work_buffer = zeros(ComplexF64, buffer_size)`.
     # So it is Vector.
     
     mul!(solver.u_spec_buf, solver.plan.recombination_map, solver.plan.work_buffer)

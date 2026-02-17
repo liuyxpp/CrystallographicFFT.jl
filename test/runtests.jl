@@ -11,6 +11,7 @@
 
 using Test
 using CrystallographicFFT
+using CrystallographicFFT: ASUPlan, plan_cfft_asu
 using CrystallographicFFT.SymmetryOps: get_ops, SymOp, apply_op,
     check_shift_invariance, detect_centering_type, CentF, CentI, CentC
 using CrystallographicFFT.ASU: find_optimal_shift, calc_asu, pack_asu
@@ -24,7 +25,7 @@ using CrystallographicFFT.KRFFT: plan_krfft_selective, execute_selective_krfft!,
     ifft_channels!, centering_unfold!, disassemble_G0!,
     pack_stride_real!,
     plan_centered_scft, execute_centered_scft!, auto_L,
-    SubgridCenteringFoldPlan, CenteredKRFFTPlan, CenteredKRFFTBackwardPlan
+    SubgridCenteringFoldPlan, CenteredForwardPlan, CenteredBackwardPlan
 using CrystallographicFFT.QFusedKRFFT: plan_m2_q, execute_m2_q!,
     M2QPlan, fullgrid_to_subgrid!, subgrid_to_fullgrid!,
     plan_m7_scft, execute_m7_scft!,
@@ -82,8 +83,8 @@ include("test_helpers.jl")
     # ── 3. CFFT Plan + Roundtrip (2D) ────────────────────────────────────
     @testset "CFFT Roundtrip (p2mm)" begin
         sg_num = 6; N = (16, 16)
-        plan = plan_cfft(N, sg_num, ComplexF64, Array)
-        @test plan isa CFFTPlan
+        plan = plan_cfft_asu(N, sg_num, ComplexF64, Array)
+        @test plan isa ASUPlan
 
         input_asu = deepcopy(plan.asu)
         for (_, blocks) in input_asu.dim_blocks
@@ -201,7 +202,7 @@ include("test_helpers.jl")
         p = prep[225]
         F_ref = fft(p.u)
         plan_c = plan_krfft_centered(p.spec, p.ops_s)
-        @test plan_c isa CenteredKRFFTPlan
+        @test plan_c isa CenteredForwardPlan
 
         execute_centered_krfft!(plan_c, p.u)
         spec_out = plan_c.krfft_plan.output_buffer
@@ -440,7 +441,7 @@ include("test_helpers.jl")
         p = prep[70]
         F_ref = fft(p.u)
         plan_c = plan_krfft_centered(p.spec, p.ops_s)
-        @test plan_c isa CenteredKRFFTPlan
+        @test plan_c isa CenteredForwardPlan
 
         execute_centered_krfft!(plan_c, p.u)
         spec_out = plan_c.krfft_plan.output_buffer
@@ -461,7 +462,7 @@ include("test_helpers.jl")
         p = prep[72]
         F_ref = fft(p.u)
         plan_c = plan_krfft_centered(p.spec, p.ops_s)
-        @test plan_c isa CenteredKRFFTPlan
+        @test plan_c isa CenteredForwardPlan
 
         execute_centered_krfft!(plan_c, p.u)
         spec_out = plan_c.krfft_plan.output_buffer
@@ -485,6 +486,146 @@ include("test_helpers.jl")
         execute_centered_scft!(scft, f0)
 
         @test maximum(abs.(f0 .- f0_ref)) < 1e-12
+    end
+
+    # ── 26. New CFFT API ─────────────────────────────────────────────────
+    @testset "CFFT API" begin
+        # ── plan_cfft_pair dispatch ──
+        @testset "plan_cfft_pair dispatch" begin
+            plan_g = plan_cfft_pair(N16, 221, 3)
+            @test plan_g isa GeneralCFFTPairPlan
+            @test subgrid_size(plan_g) == (8, 8, 8)
+            @test fullgrid_size(plan_g) == N16
+            @test stride_factors(plan_g) == (2, 2, 2)
+            @test cfft_asu_size(plan_g) > 0
+
+            plan_c = plan_cfft_pair(N16, 225, 3)
+            @test plan_c isa CenteredCFFTPairPlan
+            @test subgrid_size(plan_c) == (8, 8, 8)
+
+            # Force general path for centered group
+            plan_c_gen = plan_cfft_pair(N16, 225, 3; method=:general)
+            @test plan_c_gen isa GeneralCFFTPairPlan
+        end
+
+        # ── plan_cfft / plan_icfft (single-direction) ──
+        @testset "Single-direction plans" begin
+            fwd = plan_cfft(N16, 221, 3)
+            @test fwd isa CFFTPlan
+            @test subgrid_size(fwd) == (8, 8, 8)
+
+            bwd = plan_icfft(fwd)
+            @test bwd isa ICFFTPlan
+            @test subgrid_size(bwd) == (8, 8, 8)
+
+            # Standalone backward
+            bwd2 = plan_icfft(N16, 221, 3)
+            @test bwd2 isa ICFFTPlan
+        end
+
+        # ── cfft!/icfft! roundtrip (PairPlan, General) ──
+        @testset "Roundtrip PairPlan General (Pm-3m)" begin
+            plan_g = plan_cfft_pair(N16, 221, 3)
+            p = prep[221]
+            L = stride_factors(plan_g)
+            M = subgrid_size(plan_g)
+            f0 = extract_subgrid(p.u, N16, collect(L))
+
+            F̂ = Vector{ComplexF64}(undef, cfft_asu_size(plan_g))
+            cfft!(F̂, plan_g, f0)
+            f0_out = zeros(M...)
+            icfft!(f0_out, plan_g, F̂)
+
+            @test maximum(abs.(f0 .- f0_out)) < 1e-10
+        end
+
+        # ── cfft!/icfft! roundtrip (PairPlan, Centered) ──
+        @testset "Roundtrip PairPlan Centered (Fm-3m)" begin
+            plan_c = plan_cfft_pair(N16, 225, 3)
+            p = prep[225]
+            f0 = extract_subgrid(p.u, N16, [2, 2, 2])
+
+            F̂ = Vector{ComplexF64}(undef, cfft_asu_size(plan_c))
+            cfft!(F̂, plan_c, f0)
+            f0_out = zeros(subgrid_size(plan_c)...)
+            icfft!(f0_out, plan_c, F̂)
+
+            @test maximum(abs.(f0 .- f0_out)) < 1e-10
+        end
+
+        # ── cfft!/icfft! roundtrip (Single-direction CFFTPlan + ICFFTPlan) ──
+        @testset "Roundtrip CFFTPlan+ICFFTPlan (Pm-3m)" begin
+            fwd = plan_cfft(N16, 221, 3)
+            bwd = plan_icfft(fwd)
+            p = prep[221]
+            f0 = extract_subgrid(p.u, N16, collect(stride_factors(fwd)))
+
+            F̂ = Vector{ComplexF64}(undef, cfft_asu_size(fwd))
+            cfft!(F̂, fwd, f0)
+            f0_out = zeros(subgrid_size(bwd)...)
+            icfft!(f0_out, bwd, F̂)
+
+            @test maximum(abs.(f0 .- f0_out)) < 1e-10
+        end
+
+        # ── Diffusion kernel vs old M2 SCFT ──
+        @testset "Diffusion kernel (Pm-3m)" begin
+            plan_g = plan_cfft_pair(N16, 221, 3)
+            p = prep[221]
+            f0 = extract_subgrid(p.u, N16, collect(stride_factors(plan_g)))
+
+            K = make_diffusion_kernel(plan_g, Δs, lattice)
+            @test length(K) == cfft_asu_size(plan_g)
+            @test all(0 .< K .<= 1)
+
+            F̂ = Vector{ComplexF64}(undef, cfft_asu_size(plan_g))
+            f0_new = copy(f0)
+            cfft!(F̂, plan_g, f0_new)
+            @. F̂ *= K
+            icfft!(f0_new, plan_g, F̂)
+
+            # Compare with old M2 SCFT
+            scft_old = plan_m2_scft(N16, 221, 3, Δs, lattice)
+            f0_ref = copy(f0)
+            execute_m2_scft!(scft_old, f0_ref)
+
+            @test maximum(abs.(f0_new .- f0_ref)) < 1e-12
+        end
+
+        # ── update_diffusion_kernel! ──
+        @testset "update_diffusion_kernel!" begin
+            fwd = plan_cfft(N16, 221, 3)
+            K = make_diffusion_kernel(fwd, Δs, lattice)
+            update_diffusion_kernel!(K, fwd, 0.10, lattice)
+            K_ref = make_diffusion_kernel(fwd, 0.10, lattice)
+
+            @test maximum(abs.(K .- K_ref)) < 1e-15
+        end
+
+        # ── cfft_k2 ──
+        @testset "cfft_k2" begin
+            fwd = plan_cfft(N16, 221, 3)
+            k2 = cfft_k2(fwd, lattice)
+            @test length(k2) == cfft_asu_size(fwd)
+            @test all(k2 .>= 0)
+            @test k2[1] ≈ 0.0  # Γ point
+        end
+
+        # ── Grid conversions ──
+        @testset "Grid conversions" begin
+            fwd = plan_cfft(N16, 221, 3)
+            p = prep[221]
+            f0 = extract_subgrid(p.u, N16, collect(stride_factors(fwd)))
+
+            # subgrid → fullgrid → extract back = original
+            f_full = zeros(N16...)
+            CrystallographicFFT.CFFTApi.subgrid_to_fullgrid!(f_full, fwd, f0)
+            @test maximum(abs.(f_full .- p.u)) < 1e-12
+
+            f0_back = zeros(subgrid_size(fwd)...)
+            CrystallographicFFT.CFFTApi.fullgrid_to_subgrid!(f0_back, fwd, p.u)
+            @test maximum(abs.(f0 .- f0_back)) < 1e-12
+        end
     end
 
 end

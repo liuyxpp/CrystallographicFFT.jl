@@ -1,5 +1,6 @@
 using Test
 using CrystallographicFFT
+using CrystallographicFFT: ASUPlan, plan_cfft_asu
 using CrystallographicFFT.ASU
 using FFTW
 using LinearAlgebra
@@ -77,8 +78,8 @@ end
         N = (16, 16)
         
         # 1. Plan
-        plan = plan_cfft(N, sg_num, ComplexF64, Array)
-        @test plan isa CFFTPlan
+        plan = plan_cfft_asu(N, sg_num, ComplexF64, Array)
+        @test plan isa ASUPlan
         
         # 2. Random Data
         input_asu = deepcopy(plan.asu)

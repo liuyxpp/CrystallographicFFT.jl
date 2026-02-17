@@ -1,18 +1,18 @@
 using FFTW
 using LinearAlgebra
 
-struct CFFTPlan{D, T, A}
+struct ASUPlan{D, T, A}
     asu::CrystallographicASU{D, T, A}
     fft_plans::Dict{Tuple, Any}
     block_plans::Dict{Int, Vector{Any}}
 end
 
 """
-    plan_cfft(N::Tuple, sg_num::Int, T::Type=Float64, ArrayType=Array; dim::Int=length(N))
+    plan_cfft_asu(N::Tuple, sg_num::Int, T::Type=Float64, ArrayType=Array; dim::Int=length(N))
 
 Create a Crystallographic FFT Plan using Magic Shift logic.
 """
-function plan_cfft(N::Tuple, sg_num::Int, T::Type=Float64, ArrayType=Array; dim::Int=length(N))
+function plan_cfft_asu(N::Tuple, sg_num::Int, T::Type=Float64, ArrayType=Array; dim::Int=length(N))
     # 1. ASU Construction (Logic + Magic Shift Search)
     points, shift = calc_asu(sg_num, dim, N)
     
@@ -36,11 +36,11 @@ function plan_cfft(N::Tuple, sg_num::Int, T::Type=Float64, ArrayType=Array; dim:
         block_plans[d] = [fft_plans[size(b.data)] for b in blocks]
     end
     
-    return CFFTPlan(c_asu, fft_plans, block_plans)
+    return ASUPlan(c_asu, fft_plans, block_plans)
 end
 
 # Forward Transform (CFFT)
-function LinearAlgebra.mul!(y::CrystallographicASU, p::CFFTPlan, x::CrystallographicASU)
+function LinearAlgebra.mul!(y::CrystallographicASU, p::ASUPlan, x::CrystallographicASU)
     for (d, blocks) in x.dim_blocks
         plans = p.block_plans[d]
         y_blocks = y.dim_blocks[d]
@@ -53,7 +53,7 @@ function LinearAlgebra.mul!(y::CrystallographicASU, p::CFFTPlan, x::Crystallogra
 end
 
 # Inverse Transform (ICFFT)
-function LinearAlgebra.ldiv!(y::CrystallographicASU, p::CFFTPlan, x::CrystallographicASU)
+function LinearAlgebra.ldiv!(y::CrystallographicASU, p::ASUPlan, x::CrystallographicASU)
     for (d, blocks) in x.dim_blocks
         plans = p.block_plans[d]
         y_blocks = y.dim_blocks[d]

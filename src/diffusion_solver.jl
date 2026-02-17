@@ -6,7 +6,7 @@ using ..SymmetryOps
 using ..ASU
 using ..SpectralIndexing
 using ..MatrixQ
-using ..KRFFT: GeneralCFFTPlan, map_fft!, map_ifft!, plan_krfft, flatten_to_buffer!, unflatten_from_buffer!
+using ..KRFFT: GeneralForwardPlan, map_fft!, map_ifft!, plan_krfft, flatten_to_buffer!, unflatten_from_buffer!
 using ..QFusedKRFFT: M2QPlan, plan_m2_q, execute_m2_q!, fullgrid_to_subgrid!, subgrid_to_fullgrid!
 
 export AbstractDiffusionSolver, MatrixDiffusionSolver, KRFFTDiffusionSolver, QFusedDiffusionSolver
@@ -93,7 +93,7 @@ end
 # =========================================================================
 # 2. KRFFT Diffusion Solver (O(N log N))
 # =========================================================================
-struct KRFFTDiffusionSolver{P<:GeneralCFFTPlan, QType} <: AbstractDiffusionSolver
+struct KRFFTDiffusionSolver{P<:GeneralForwardPlan, QType} <: AbstractDiffusionSolver
     real_asu::CrystallographicASU # Holds Blocks
     spec_asu::SpectralIndexing
     Q::QType

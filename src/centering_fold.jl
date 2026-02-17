@@ -296,19 +296,19 @@ function assemble_G0!(G0::AbstractArray{ComplexF64,3}, plan::SubgridCenteringFol
 end
 
 # ============================================================================
-# CenteredKRFFTPlan: compositional wrapper
+# CenteredForwardPlan: compositional wrapper
 # ============================================================================
 
 """
-    CenteredKRFFTPlan
+    CenteredForwardPlan
 
-A composite plan that wraps a `GeneralCFFTPlan` with centering fold on the
+A composite plan that wraps a `GeneralForwardPlan` with centering fold on the
 stride-2 subgrid. Pipeline:
 
     u(N³) → pack_stride → f₀(M³) → centering_fold → n_ch × H³
           → FFT channels → assemble G₀(M³) → fast_reconstruct → spectral ASU
 """
-struct CenteredKRFFTPlan{KP<:GeneralCFFTPlan, SP<:SubgridCenteringFoldPlan}
+struct CenteredForwardPlan{KP<:GeneralForwardPlan, SP<:SubgridCenteringFoldPlan}
     krfft_plan::KP                           # inner KRFFT plan
     fold_plan::SP                            # centering fold plan
     f0_buffer::Array{Float64,3}              # M³ real buffer for stride-2 subgrid
@@ -322,8 +322,8 @@ Create a centered KRFFT plan that combines stride-2 decomposition with
 centering fold on the subgrid.
 
 Falls back to plain `plan_krfft` if centering is P or L ≠ [2,2,2].
-Returns a `CenteredKRFFTPlan` if centering fold is applicable, otherwise
-a `GeneralCFFTPlan`.
+Returns a `CenteredForwardPlan` if centering fold is applicable, otherwise
+a `GeneralForwardPlan`.
 """
 function plan_krfft_centered(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymOp};
                              centering::Union{CenteringType,Symbol}=:auto)
@@ -363,7 +363,7 @@ function plan_krfft_centered(spec_asu::SpectralIndexing, ops_shifted::Vector{<:S
     # P3: Pre-store G0 reshape view (avoids runtime Tuple(Vector{Int}) type instability)
     G0_view = reshape(krfft_plan.work_buffer, M_sub)
 
-    return CenteredKRFFTPlan(krfft_plan, fold_plan, f0_buffer, G0_view)
+    return CenteredForwardPlan(krfft_plan, fold_plan, f0_buffer, G0_view)
 end
 
 """
@@ -380,7 +380,7 @@ function pack_stride_real!(f0::Array{Float64,3}, u::AbstractArray{<:Real,3})
 end
 
 """
-    execute_centered_krfft!(plan::CenteredKRFFTPlan, u)
+    execute_centered_krfft!(plan::CenteredForwardPlan, u)
 
 Full centered KRFFT pipeline:
 1. pack_stride → f₀ (real M³)
@@ -389,7 +389,7 @@ Full centered KRFFT pipeline:
 4. assemble G₀ → work_buffer (M³)
 5. fast_reconstruct → spectral ASU
 """
-function execute_centered_krfft!(plan::CenteredKRFFTPlan,
+function execute_centered_krfft!(plan::CenteredForwardPlan,
                                   u::AbstractArray{<:Real,3})
     krfft = plan.krfft_plan
     fold = plan.fold_plan
@@ -413,12 +413,12 @@ function execute_centered_krfft!(plan::CenteredKRFFTPlan,
 end
 
 """
-    fft_reconstruct_centered!(plan::CenteredKRFFTPlan)
+    fft_reconstruct_centered!(plan::CenteredForwardPlan)
 
 Fast-path variant: assumes f₀ is already in plan.f0_buffer.
 Executes centering fold → FFT channels → assemble G₀ → reconstruct.
 """
-function fft_reconstruct_centered!(plan::CenteredKRFFTPlan)
+function fft_reconstruct_centered!(plan::CenteredForwardPlan)
     fold = plan.fold_plan
     krfft = plan.krfft_plan
 
@@ -584,7 +584,7 @@ end
 # ============================================================================
 
 """
-    CenteredKRFFTBackwardPlan
+    CenteredBackwardPlan
 
 Backward plan for centered KRFFT: spectral ASU → f₀(M³).
 
@@ -596,7 +596,7 @@ Optimized with:
 - **Orbit reduction**: computes inv_recon at orbit reps only, expands via
   G₀(R^T q) = e^{2πi q·s/M} × G₀(q)
 """
-struct CenteredKRFFTBackwardPlan
+struct CenteredBackwardPlan
     # CSR compact inv_recon: nnz entries for orbit reps only
     inv_offsets::Vector{Int32}       # (n_orbits + 1,) CSR row pointers
     inv_spec_idx::Vector{Int32}      # (nnz,) spectral indices
@@ -629,7 +629,7 @@ and spatial orbit structure for orbit-based reduction.
 """
 function plan_centered_ikrfft(spec_asu::SpectralIndexing,
                                ops_shifted::Vector{<:SymOp},
-                               fwd_plan::CenteredKRFFTPlan)
+                               fwd_plan::CenteredForwardPlan)
     krfft = fwd_plan.krfft_plan
     fold = fwd_plan.fold_plan
     M = krfft.subgrid_dims  # already NTuple after Phase 2
@@ -722,7 +722,7 @@ function plan_centered_ikrfft(spec_asu::SpectralIndexing,
     G0_view = reshape(krfft.work_buffer, M)
     G0_reps = Vector{ComplexF64}(undef, n_orbits)
 
-    return CenteredKRFFTBackwardPlan(
+    return CenteredBackwardPlan(
         offsets, spec_idx, weight, n_orbits,
         orbits_rep, orbit_id, orbit_phase,
         G0_reps,
@@ -742,7 +742,7 @@ Steps:
 4. IFFT channels
 5. Centering unfold → f₀
 """
-function execute_centered_ikrfft!(bplan::CenteredKRFFTBackwardPlan,
+function execute_centered_ikrfft!(bplan::CenteredBackwardPlan,
                                    F_spec::AbstractVector{ComplexF64},
                                    f0_out::AbstractArray{Float64, 3})
     G0 = bplan.G0_view
@@ -769,7 +769,7 @@ end
 SCFT fast path: F̂ → f₀. Result written to bplan.f0_buffer.
 Symmetric counterpart of `fft_reconstruct_centered!`.
 """
-function ifft_unrecon_centered!(bplan::CenteredKRFFTBackwardPlan,
+function ifft_unrecon_centered!(bplan::CenteredBackwardPlan,
                                  F_spec::AbstractVector{ComplexF64})
     execute_centered_ikrfft!(bplan, F_spec, bplan.f0_buffer)
 end
@@ -781,7 +781,7 @@ Uses negative spec_idx to signal conjugation (branchless sign trick).
 """
 function _inv_recon_orbit!(G0::AbstractArray{ComplexF64, 3},
                             F_spec::AbstractVector{ComplexF64},
-                            bplan::CenteredKRFFTBackwardPlan)
+                            bplan::CenteredBackwardPlan)
     offsets = bplan.inv_offsets
     sidx = bplan.inv_spec_idx
     wt = bplan.inv_weight
@@ -837,7 +837,7 @@ on M_vol fibers.
 - `F_spec`: Workspace for spectral coefficients
 - `n_spec`: Number of spectral ASU points
 """
-struct CenteredSCFTPlan{FP<:CenteredKRFFTPlan, BP<:CenteredKRFFTBackwardPlan}
+struct CenteredSCFTPlan{FP<:CenteredForwardPlan, BP<:CenteredBackwardPlan}
     fwd_plan::FP
     bwd_plan::BP
     K_spec::Vector{Float64}

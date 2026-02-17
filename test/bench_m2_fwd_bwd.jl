@@ -11,8 +11,8 @@ Also measures the sub-steps separately:
 """
 
 using CrystallographicFFT
-using CrystallographicFFT.KRFFT: GeneralCFFTPlan, plan_krfft, fft_reconstruct!,
-    plan_m2_backward, execute_m2_backward!, _inv_reconstruct_m2!, M2BackwardPlan,
+using CrystallographicFFT.KRFFT: GeneralForwardPlan, plan_krfft, fft_reconstruct!,
+    plan_m2_backward, execute_m2_backward!, _inv_reconstruct_m2!, GeneralBackwardPlan,
     pack_stride!, auto_L
 using CrystallographicFFT.SymmetryOps: get_ops
 using CrystallographicFFT.ASU: find_optimal_shift

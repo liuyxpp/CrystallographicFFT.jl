@@ -1,6 +1,6 @@
 # General KRFFT (plan_krfft) Benchmark across Crystal Systems
 #
-# Tests the universally-applicable plan_krfft (GeneralCFFTPlan) across representative
+# Tests the universally-applicable plan_krfft (GeneralForwardPlan) across representative
 # space groups from all 7 crystal systems. Unlike plan_krfft_g0asu (cubic-only),
 # plan_krfft works for all 230 space groups.
 #
