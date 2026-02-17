@@ -1,12 +1,13 @@
 module QFusedKRFFT
 
 using LinearAlgebra
+using LinearAlgebra: LAPACK
 using FFTW
 using ..SymmetryOps: SymOp, get_ops, check_shift_invariance, dual_ops,
     detect_centering_type, CentP
 using ..ASU: find_optimal_shift
 using ..SpectralIndexing: calc_spectral_asu, SpectralIndexing
-using ..KRFFT: auto_L, SubgridCenteringFoldPlan,
+using ..KRFFT: auto_L, _select_rep_ops, SubgridCenteringFoldPlan,
     plan_centering_fold, centering_fold!, fft_channels!, assemble_G0!,
     ifft_channels!, centering_unfold!, disassemble_G0!,
     GeneralCFFTPlan, plan_krfft, fft_reconstruct!, fast_reconstruct!,
@@ -97,36 +98,9 @@ function plan_m2_q(N::Tuple, sg_num::Int, dim::Int, Δs::Float64,
         error("Grid size N=$N not divisible by auto L=$L.")
     end
 
-    # 3. Select one representative operation per subgrid
-    subgrid_reps = Dict{Vector{Int}, SymOp}()
-    subgrid_quality = Dict{Vector{Int}, Int}()
-
-    for op in shifted_ops
-        t = round.(Int, op.t)
-        x0 = [mod(t[d], L[d]) for d in 1:D]
-        is_diag = all(op.R[i,j] == 0 for i in 1:D for j in 1:D if i != j)
-        simple_t = all(mod(t[d], N[d]) ∈ (0, N[d]-1) for d in 1:D)
-        quality = is_diag ? (simple_t ? 2 : 1) : 0
-
-        if !haskey(subgrid_reps, x0) || quality > subgrid_quality[x0]
-            subgrid_reps[x0] = op
-            subgrid_quality[x0] = quality
-        end
-    end
-
-    # Enumerate subgrids in canonical order
-    d = prod(L)  # number of subgrids = prod(L)
-    rep_ops = Vector{eltype(shifted_ops)}(undef, d)
-    sub_idx = 0
-    for x0 in Iterators.product([0:L[dd]-1 for dd in 1:D]...)
-        sub_idx += 1
-        x0_vec = collect(x0)
-        if haskey(subgrid_reps, x0_vec)
-            rep_ops[sub_idx] = subgrid_reps[x0_vec]
-        else
-            error("Subgrid x₀=$x0_vec not reachable. auto_L should have prevented this.")
-        end
-    end
+    # 3. Select one representative operation per subgrid (shared logic)
+    rep_ops = _select_rep_ops(shifted_ops, L, collect(N), D)
+    d = prod(L)
 
     # 4. Build the diffusion kernel function
     recip_B = 2π * inv(lattice)'
@@ -173,241 +147,108 @@ end
 # ============================================================================
 
 """
-Build Q matrices for all fibers. For each subgrid frequency q ∈ [0,M)^D:
-  1. Enumerate the d full-grid frequencies h that map to q via the rep_ops
-  2. Build the d×d butterfly matrix B(q)
-  3. Compute Q(q) = B⁻¹(q) · diag(K) · B(q)
-  4. Store only Q's first row (since n_active=1 in M2)
+    _build_q_matrices!(Q_first_row, gather_idx, rep_ops, L, M_sub, N, D, kernel_func)
+
+Build Q = B⁻¹·diag(K)·B matrices for all fibers, store first row only.
 """
 function _build_q_matrices!(Q_first_row, gather_idx,
                             rep_ops, L, M_sub, N, D, kernel_func)
     d = length(rep_ops)
 
-    # Pre-compute what subgrid each rep_op maps q to
-    # For rep_ops[a], the subgrid shift is x₀ = t_a mod L
-    # The full-grid frequency is: for each combination of "high" bits α ∈ {0,1}^D,
-    # h[dim] = q[dim] + M[dim] * α[dim]
-    # But which α corresponds to which rep_op?
-
-    # In plan_krfft's auto-L variant, rep_ops are enumerated in canonical order:
-    # sub_idx = 1 corresponds to x₀ = (0,0,...,0)
-    # sub_idx = 2 corresponds to x₀ = (1,0,...,0) (if L[1]=2)
-    # etc.
-    # The "subgrid parity" α for rep_ops[a] is reconstructed from the canonical order.
-
-    # We need: for rep_ops[a] with parity α_a,
-    #   h_a(q) = q + M .* α_a       (the full-grid frequency)
-    #   rotated freq: R_a^T h_a mod M  (the gather source)
-    #   weight: exp(-2πi h_a · t_a / N)
-
-    # Extract α for each rep_op (canonical ordering matches Iterators.product)
-    alphas = Vector{Vector{Int}}(undef, d)
+    # Extract α for each rep_op as NTuple (canonical ordering)
+    alphas = Vector{NTuple{3,Int}}(undef, d)
     idx = 0
     for x0 in Iterators.product([0:L[dd]-1 for dd in 1:D]...)
         idx += 1
-        alphas[idx] = collect(x0)
+        alphas[idx] = (x0[1], D >= 2 ? x0[2] : 0, D >= 3 ? x0[3] : 0)
     end
 
-    # Pre-allocate
+    # Pre-extract R matrices and translations from SymOps
+    R_flat = Array{Int}(undef, D, D, d)
+    t_flat = Vector{NTuple{3,Int}}(undef, d)
+    for a in 1:d
+        g = rep_ops[a]
+        t_int = round.(Int, g.t)
+        t_flat[a] = (t_int[1], D >= 2 ? t_int[2] : 0, D >= 3 ? t_int[3] : 0)
+        for i in 1:D, j in 1:D
+            R_flat[i, j, a] = round(Int, g.R[i, j])
+        end
+    end
+
+    # Pre-allocate all working buffers outside the loop
     B_matrix = zeros(ComplexF64, d, d)
+    B_copy = zeros(ComplexF64, d, d)
+    KB = zeros(ComplexF64, d, d)
     K_values = zeros(Float64, d)
     h_vec = zeros(Int, D)
+    h_centered = zeros(Int, D)
     rot_h = zeros(Int, D)
+    q_vec = zeros(Int, D)
+    ipiv = zeros(LinearAlgebra.BlasInt, d)
+
+    N1 = N[1]; N2 = D >= 2 ? N[2] : 1; N3 = D >= 3 ? N[3] : 1
+    M1 = M_sub[1]; M2v = D >= 2 ? M_sub[2] : 1; M3 = D >= 3 ? M_sub[3] : 1
 
     for q_cart in CartesianIndices(Tuple(M_sub))
-        q_vec = [q_cart[dd] - 1 for dd in 1:D]  # 0-based
+        for dd in 1:D
+            q_vec[dd] = q_cart[dd] - 1
+        end
 
-        # Build B matrix and K values for this fiber
-        fill!(B_matrix, zero(ComplexF64))
-
+        # --- Build B matrix and K values (single clean pass) ---
         for a in 1:d
             α = alphas[a]
-            g = rep_ops[a]
 
-            # Full-grid frequency
-            for dd in 1:D
-                h_vec[dd] = q_vec[dd] + M_sub[dd] * α[dd]
-            end
+            # Full-grid frequency h_a = q + M * α_a
+            h_vec[1] = q_vec[1] + M1 * α[1]
+            if D >= 2; h_vec[2] = q_vec[2] + M2v * α[2]; end
+            if D >= 3; h_vec[3] = q_vec[3] + M3 * α[3]; end
 
-            # Kernel value K(h) — need wrapped h for physical frequency
-            # Convert h to centered representation for kernel
-            h_centered = zeros(Int, D)
-            for dd in 1:D
-                h_centered[dd] = h_vec[dd] >= N[dd] ÷ 2 ? h_vec[dd] - N[dd] : h_vec[dd]
-            end
+            # Centered frequency for kernel
+            h_centered[1] = h_vec[1] >= N1 ÷ 2 ? h_vec[1] - N1 : h_vec[1]
+            if D >= 2; h_centered[2] = h_vec[2] >= N2 ÷ 2 ? h_vec[2] - N2 : h_vec[2]; end
+            if D >= 3; h_centered[3] = h_vec[3] >= N3 ÷ 2 ? h_vec[3] - N3 : h_vec[3]; end
             K_values[a] = kernel_func(h_centered)
 
-            # Phase weight: exp(-2πi h · t_g / N)
-            phase_val = 0.0
-            for dd in 1:D
-                phase_val += h_vec[dd] * g.t[dd] / N[dd]
-            end
-            weight = exp(-im * 2π * phase_val)
-
-            # Rotated frequency: R_g^T h mod M
-            for d1 in 1:D
-                s = 0
-                for d2 in 1:D
-                    s += g.R[d2, d1] * h_vec[d2]  # R^T: swap d1,d2
-                end
-                rot_h[d1] = mod(s, M_sub[d1])
-            end
-
-            # Linear index of rotated freq in M-grid (1-based, column-major)
-            lin_rot = 1
-            stride = 1
-            for dd in 1:D
-                lin_rot += rot_h[dd] * stride
-                stride *= M_sub[dd]
-            end
-
-            # B[a, col] = weight, where col is determined by rot_h's subgrid index
-            # Since all d ops map to the SAME subgrid freq space (they differ by which
-            # M-grid point they read from), col = the index among the d gather sources.
-            # But actually B is the matrix mapping Y₀-values to F-values:
-            # F(h_a) = Σ_b B[a,b] * Y₀(gather_src_b)
-            # In the M2 case with n_active=1, Y₀ is a single M-grid, and all gather
-            # sources are positions within that same M-grid.
-            # The "column" is determined by which M-grid position is being read.
-            # For the butterfly structure, col = a itself when referenced by the
-            # canonical ordering of the ops.
-            # Actually, let me reconsider: the B matrix relates:
-            # F(h_a) = Σ_b w_b(h_a) · Y₀(R_b^T h_a mod M)
-            # So B[a, b] = w_b(h_a) IF R_b^T h_a mod M = R_b^T h_a mod M
-            # This is a d×d matrix indexed by (fiber member a, op b).
-
-            # Store gather index for this (a, q)
-            gather_idx[a, q_cart] = Int32(lin_rot)
-
-            # B matrix: row = a (fiber member), col = op index
-            # Each row has exactly d entries corresponding to the d ops
-            # B[a, b] = exp(-2πi h_a · t_b / N) if R_b^T h_a mod M maps to the
-            # correct subgrid frequency. But this can produce different target indices.
-            # Let me just build the full B matrix properly.
-        end
-
-        # Build B properly: B[a, b] tells the contribution of Y₀(rot_b(h_a)) to F(h_a)
-        # with weight w_b(h_a).
-        # Note: For each (a, b), h_a is fixed (determined by α_a), and we apply op b.
-        fill!(B_matrix, zero(ComplexF64))
-        # We also need a gather map: for each (a, b), what M-grid linear index does
-        # Y₀(R_b^T h_a mod M) correspond to?
-        gather_for_B = zeros(Int, d, d)
-
-        for a in 1:d
-            α = alphas[a]
-            for dd in 1:D
-                h_vec[dd] = q_vec[dd] + M_sub[dd] * α[dd]
-            end
-
+            # B[a, b] = exp(-2πi h_a · t_b / N)
             for b in 1:d
-                g = rep_ops[b]
-
-                # Phase: exp(-2πi h_a · t_b / N)
-                phase_val = 0.0
-                for dd in 1:D
-                    phase_val += h_vec[dd] * g.t[dd] / N[dd]
-                end
-                weight = exp(-im * 2π * phase_val)
-
-                # Rotated freq: R_b^T h_a mod M
-                for d1 in 1:D
-                    s = 0
-                    for d2 in 1:D
-                        s += g.R[d2, d1] * h_vec[d2]
-                    end
-                    rot_h[d1] = mod(s, M_sub[d1])
-                end
-
-                lin_rot = 1
-                stride = 1
-                for dd in 1:D
-                    lin_rot += rot_h[dd] * stride
-                    stride *= M_sub[dd]
-                end
-
-                B_matrix[a, b] = weight
-                gather_for_B[a, b] = lin_rot
+                tb = t_flat[b]
+                phase_val = h_vec[1] * tb[1] / N1
+                if D >= 2; phase_val += h_vec[2] * tb[2] / N2; end
+                if D >= 3; phase_val += h_vec[3] * tb[3] / N3; end
+                @inbounds B_matrix[a, b] = exp(-im * 2π * phase_val)
             end
         end
 
-        # Now: F(h_a) = Σ_b B[a,b] · Y₀[gather_for_B[a,b]]
-        # In the standard M2 case, all gather_for_B[a, b] for fixed b differ across a,
-        # but for fixed a, different b read different positions.
-        # Actually, the gather depends on BOTH a and b. But in the Q formula,
-        # we want: Q such that Y₀_new = Q · y_gathered
-        # where y_gathered[b] = Y₀[gather_for_B[*, b]] ... this needs more thought.
-
-        # SIMPLIFICATION: In M2 (auto_L), the rep_ops are structured such that
-        # for the identity op (sub_idx=1, α=(0,...,0)), R=I and t=0.
-        # For the other ops, R is a rotation/reflection and t is a translation.
-        # The gather pattern for a fixed q is:
-        #   For op b: rot_q_b = R_b^T q mod M
-        # This is INDEPENDENT of the fiber member a (since R^T acts only on q part,
-        # and h = q + M*α ⟹ R^T h mod M = R^T q mod M).
-        # This is the key insight! The gather depends ONLY on b, not on a.
-
-        # So gather_for_B[a, b] = gather_for_B[1, b] for all a.
-        # Verify this and store gather_idx from b only.
-
-        # Recompute gather indices using only q (independent of α):
+        # --- Gather indices: R_b^T q mod M (independent of α) ---
         for b in 1:d
-            g = rep_ops[b]
             for d1 in 1:D
                 s = 0
                 for d2 in 1:D
-                    s += g.R[d2, d1] * q_vec[d2]
+                    @inbounds s += R_flat[d2, d1, b] * q_vec[d2]
                 end
                 rot_h[d1] = mod(s, M_sub[d1])
             end
-            lin_rot = 1
-            stride = 1
-            for dd in 1:D
-                lin_rot += rot_h[dd] * stride
-                stride *= M_sub[dd]
-            end
+            lin_rot = 1 + rot_h[1]
+            if D >= 2; lin_rot += rot_h[2] * M1; end
+            if D >= 3; lin_rot += rot_h[3] * M1 * M2v; end
             gather_idx[b, q_cart] = Int32(lin_rot)
         end
 
-        # Now B[a,b] = exp(-2πi h_a · t_b / N)
-        # And F(h_a) = Σ_b B[a,b] · Y₀[gather_idx[b]]
-        # K_values[a] = K(h_a)
-        # Q = B⁻¹ · diag(K) · B
-        # Store only Q's first row: Q[1, :] = (B⁻¹ · diag(K) · B)[1, :]
-
-        # Rebuild B matrix cleanly since gather is independent of a:
-        fill!(B_matrix, zero(ComplexF64))
-        for a in 1:d
-            α = alphas[a]
-            for dd in 1:D
-                h_vec[dd] = q_vec[dd] + M_sub[dd] * α[dd]
-            end
-
-            # K value
-            h_centered = zeros(Int, D)
-            for dd in 1:D
-                h_centered[dd] = h_vec[dd] >= N[dd] ÷ 2 ? h_vec[dd] - N[dd] : h_vec[dd]
-            end
-            K_values[a] = kernel_func(h_centered)
-
-            for b in 1:d
-                g = rep_ops[b]
-                phase_val = 0.0
-                for dd in 1:D
-                    phase_val += h_vec[dd] * g.t[dd] / N[dd]
-                end
-                B_matrix[a, b] = exp(-im * 2π * phase_val)
+        # --- Q = B⁻¹ · diag(K) · B, store first row ---
+        # KB = diag(K) * B  (in-place, no allocation)
+        for b in 1:d
+            for a in 1:d
+                @inbounds KB[a, b] = K_values[a] * B_matrix[a, b]
             end
         end
+        # Solve B · X = KB  ⟹  X = B⁻¹ · KB = Q
+        copyto!(B_copy, B_matrix)
+        LAPACK.getrf!(B_copy, ipiv)
+        LAPACK.getrs!('N', B_copy, ipiv, KB)  # KB ← Q
 
-        # Q = B⁻¹ · diag(K) · B, take first row
-        # Q_full = B \ (Diagonal(K_values) * B)  — more stable
-        KB = Diagonal(K_values) * B_matrix
-        Q_full = B_matrix \ KB
-
-        # Store first row
+        # Store first row of Q
         for b in 1:d
-            Q_first_row[b, q_cart] = Q_full[1, b]
+            @inbounds Q_first_row[b, q_cart] = KB[1, b]
         end
     end
 end
@@ -468,20 +309,21 @@ Returns:
 function _build_separable_data(rep_ops, L, M_sub, N, D, kernel_func)
     d = prod(L)
 
-    # Build alphas (canonical ordering matching rep_ops)
-    alphas = Vector{Vector{Int}}(undef, d)
+    # Build alphas as NTuples (canonical ordering matching rep_ops)
+    alphas = Vector{NTuple{3,Int}}(undef, d)
     idx = 0
     for x0 in Iterators.product([0:L[dd]-1 for dd in 1:D]...)
         idx += 1
-        alphas[idx] = collect(x0)
+        alphas[idx] = (x0[1], D >= 2 ? x0[2] : 0, D >= 3 ? x0[3] : 0)
     end
 
     # K_fiber[a, q1, q2, q3] = K(h_a) where h_a = q + M*α_a
     K_fiber = zeros(Float64, d, M_sub...)
     h_centered = zeros(Int, D)
+    q_vec = zeros(Int, D)
 
     for q_cart in CartesianIndices(Tuple(M_sub))
-        q_vec = [q_cart[dd] - 1 for dd in 1:D]
+        for dd in 1:D; q_vec[dd] = q_cart[dd] - 1; end
         for a in 1:d
             α = alphas[a]
             for dd in 1:D

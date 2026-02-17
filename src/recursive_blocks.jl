@@ -1070,6 +1070,17 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
     end
     n_a8 = length(active_a8)
 
+    # Pre-extract R/t for active A8 ops (avoid SVector overhead in hot loop)
+    a8_R = Array{Int}(undef, dim, dim, 8)
+    a8_t = Vector{NTuple{3,Float64}}(undef, 8)
+    for a8_idx in active_a8
+        g = subgrid_reps[a8_idx]::SymOp
+        a8_t[a8_idx] = (Float64(g.t[1]), Float64(g.t[2]), Float64(g.t[3]))
+        for i in 1:dim, j in 1:dim
+            a8_R[i, j, a8_idx] = round(Int, g.R[i, j])
+        end
+    end
+
     # Step 2: Extract remaining point group (even-translation ops)
     rem_ops = SymOp[]
     for op in ops_shifted
@@ -1080,26 +1091,47 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
     end
     n_rem = length(rem_ops)
 
+    # Pre-extract R/t for rem_ops
+    rem_R = Array{Int}(undef, dim, dim, n_rem)
+    rem_t_half = Vector{NTuple{3,Int}}(undef, n_rem)
+    for (ri, op) in enumerate(rem_ops)
+        t_int = round.(Int, op.t)
+        rem_t_half[ri] = (t_int[1] ÷ 2, t_int[2] ÷ 2, t_int[3] ÷ 2)
+        for i in 1:dim, j in 1:dim
+            rem_R[i, j, ri] = round(Int, op.R[i, j])
+        end
+    end
+
+    M1 = M[1]; M2m = M[2]; M3 = M[3]
+    N1 = N[1]; N2m = N[2]; N3 = N[3]
+
     # Step 3: Collect all accessed G0 positions + per-spectral-point A8 info
     g0_pos_set = Set{Int}()
-    # Each spectral point has 8 A8 entries (padded with zero-weight for inactive classes)
     a8_raw = Vector{Tuple{Int, ComplexF64}}(undef, 8 * n_spec)
+    rot_h = zeros(Int, dim)
 
     for (h_idx, _) in enumerate(spec_asu.points)
         h_vec = get_k_vector(spec_asu, h_idx)
         base = (h_idx - 1) * 8
         slot = 0
         for a8_idx in active_a8
-            g = subgrid_reps[a8_idx]::SymOp
-            a8_phase = sum(h_vec[d] * g.t[d] / N[d] for d in 1:dim)
+            gt = a8_t[a8_idx]
+            # Phase: exp(-2πi h · t_g / N)
+            a8_phase = h_vec[1]*gt[1]/N1 + h_vec[2]*gt[2]/N2m + h_vec[3]*gt[3]/N3
             a8_tw = cispi(-2 * a8_phase)
-            rot_h = [mod(sum(Int(g.R[d2, d1]) * h_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
-            lin = 1 + rot_h[1] + M[1] * rot_h[2] + M[1] * M[2] * rot_h[3]
+            # Rotated frequency: R^T h mod M
+            for d1 in 1:dim
+                s = 0
+                for d2 in 1:dim
+                    @inbounds s += a8_R[d2, d1, a8_idx] * h_vec[d2]
+                end
+                rot_h[d1] = mod(s, M[d1])
+            end
+            lin = 1 + rot_h[1] + M1 * rot_h[2] + M1 * M2m * rot_h[3]
             push!(g0_pos_set, lin)
             slot += 1
             a8_raw[base + slot] = (lin, a8_tw)
         end
-        # Pad remaining slots with zero weight (pointing to a safe index)
         for s in (slot+1):8
             a8_raw[base + s] = (1, complex(0.0))
         end
@@ -1110,43 +1142,45 @@ function plan_krfft_g0asu(spec_asu::SpectralIndexing, ops_shifted::Vector{<:SymO
     g0_to_rep = Dict{Int, Int}()      # G0 linear idx → representative linear idx
     g0_to_phase = Dict{Int, ComplexF64}()  # G0 linear idx → phase to get from rep
 
+    rq = zeros(Int, dim)
     for start_lin in g0_pos_set
         haskey(g0_to_rep, start_lin) && continue
 
         # Decode start position
         lin0 = start_lin - 1
-        sq = [mod(lin0, M[1]), mod(div(lin0, M[1]), M[2]), div(lin0, M[1] * M[2])]
+        sq = (mod(lin0, M1), mod(div(lin0, M1), M2m), div(lin0, M1 * M2m))
 
         # Build orbit via worklist
         orbit = Dict{Int, Tuple{NTuple{3,Int}, ComplexF64}}()
-        # orbit[lin] = (q_vec, phase_from_start)
-        orbit[start_lin] = (Tuple(sq), complex(1.0))
+        orbit[start_lin] = (sq, complex(1.0))
         worklist = [(sq, complex(1.0))]
 
         while !isempty(worklist)
             q_vec, q_phase = pop!(worklist)
-            for op in rem_ops
-                # R^T q mod M
-                rq = [mod(sum(Int(op.R[d2, d1]) * q_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
-                rlin = 1 + rq[1] + M[1] * rq[2] + M[1] * M[2] * rq[3]
+            for ri in 1:n_rem
+                # R^T q mod M (using pre-extracted R)
+                for d1 in 1:dim
+                    s = 0
+                    for d2 in 1:dim
+                        @inbounds s += rem_R[d2, d1, ri] * q_vec[d2]
+                    end
+                    rq[d1] = mod(s, M[d1])
+                end
+                rlin = 1 + rq[1] + M1 * rq[2] + M1 * M2m * rq[3]
                 if !haskey(orbit, rlin) && rlin in g0_pos_set
-                    # Phase: G0(R^T q) = exp(-2πi q·(t/2)/M) × G0(q)
-                    t_half = round.(Int, op.t) .÷ 2
-                    sym_phase = cispi(-2 * sum(q_vec[d] * t_half[d] / M[d] for d in 1:dim))
+                    th = rem_t_half[ri]
+                    sym_phase = cispi(-2 * (q_vec[1]*th[1]/M1 + q_vec[2]*th[2]/M2m + q_vec[3]*th[3]/M3))
                     new_phase = sym_phase * q_phase
-                    orbit[rlin] = (Tuple(rq), new_phase)
-                    push!(worklist, (rq, new_phase))
+                    rq_tup = (rq[1], rq[2], rq[3])
+                    orbit[rlin] = (rq_tup, new_phase)
+                    push!(worklist, (rq_tup, new_phase))
                 end
             end
         end
 
-        # Choose representative = minimum linear index in orbit
         rep_lin = minimum(keys(orbit))
         rep_phase = orbit[rep_lin][2]
 
-        # For each member: g0_to_rep[member] = rep, phase to reconstruct member from rep
-        # member_value = member_phase_from_start / rep_phase_from_start × rep_value
-        # But we track: G0(member) = (member_phase / rep_phase) × G0(rep)
         for (member_lin, (_, member_phase)) in orbit
             g0_to_rep[member_lin] = rep_lin
             g0_to_phase[member_lin] = member_phase / rep_phase
@@ -1418,6 +1452,31 @@ function plan_krfft_g0asu_general(spec_asu::SpectralIndexing, ops_shifted::Vecto
     end
     n_rem = length(rem_ops)
 
+    # Pre-extract R/t for rem_ops
+    rem_R = Array{Int}(undef, dim, dim, n_rem)
+    rem_t_sub = Vector{NTuple{3,Int}}(undef, n_rem)
+    for (ri, op) in enumerate(rem_ops)
+        t_int = round.(Int, op.t)
+        rem_t_sub[ri] = (t_int[1] ÷ L[1], t_int[2] ÷ L[2], t_int[3] ÷ L[3])
+        for i in 1:dim, j in 1:dim
+            rem_R[i, j, ri] = round(Int, op.R[i, j])
+        end
+    end
+
+    # Pre-extract R/t for parity class representatives
+    par_R = Array{Int}(undef, dim, dim, n_parities)
+    par_t = Vector{NTuple{3,Float64}}(undef, n_parities)
+    for (a_idx, parity) in enumerate(parity_list)
+        op = subgrid_reps[parity]
+        par_t[a_idx] = (Float64(op.t[1]), Float64(op.t[2]), Float64(op.t[3]))
+        for i in 1:dim, j in 1:dim
+            par_R[i, j, a_idx] = round(Int, op.R[i, j])
+        end
+    end
+
+    M1 = M[1]; M2g = M[2]; M3g = M[3]
+    N1 = N[1]; N2g = N[2]; N3g = N[3]
+
     # Step 2: Collect G0 positions accessed via spectral ASU
     # For each spectral point h, G0 access is at q = h mod M (single position, no rotation)
     # because the full reconstruction is: F(h) = G0(h mod M)
@@ -1443,27 +1502,35 @@ function plan_krfft_g0asu_general(spec_asu::SpectralIndexing, ops_shifted::Vecto
     g0_to_rep = Dict{Int, Int}()
     g0_to_phase = Dict{Int, ComplexF64}()
 
+    rq_buf = zeros(Int, dim)
     for start_lin in g0_pos_set
         haskey(g0_to_rep, start_lin) && continue
 
         lin0 = start_lin - 1
-        sq = [mod(lin0, M[1]), mod(div(lin0, M[1]), M[2]), div(lin0, M[1]*M[2])]
+        sq = (mod(lin0, M1), mod(div(lin0, M1), M2g), div(lin0, M1*M2g))
 
-        orbit = Dict{Int, Tuple{Vector{Int}, ComplexF64}}()
+        orbit = Dict{Int, Tuple{NTuple{3,Int}, ComplexF64}}()
         orbit[start_lin] = (sq, complex(1.0))
-        worklist = [(copy(sq), complex(1.0))]
+        worklist = [(sq, complex(1.0))]
 
         while !isempty(worklist)
             q_vec, q_phase = pop!(worklist)
-            for op in rem_ops
-                rq = [mod(sum(Int(op.R[d2, d1]) * q_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
-                rlin = 1 + rq[1] + M[1]*rq[2] + M[1]*M[2]*rq[3]
+            for ri in 1:n_rem
+                for d1 in 1:dim
+                    s = 0
+                    for d2 in 1:dim
+                        @inbounds s += rem_R[d2, d1, ri] * q_vec[d2]
+                    end
+                    rq_buf[d1] = mod(s, M[d1])
+                end
+                rlin = 1 + rq_buf[1] + M1*rq_buf[2] + M1*M2g*rq_buf[3]
                 if !haskey(orbit, rlin) && rlin in g0_pos_set
-                    t_sub = round.(Int, op.t) .÷ L
-                    sym_phase = cispi(-2 * sum(q_vec[d] * t_sub[d] / M[d] for d in 1:dim))
+                    ts = rem_t_sub[ri]
+                    sym_phase = cispi(-2 * (q_vec[1]*ts[1]/M1 + q_vec[2]*ts[2]/M2g + q_vec[3]*ts[3]/M3g))
                     new_phase = sym_phase * q_phase
-                    orbit[rlin] = (rq, new_phase)
-                    push!(worklist, (copy(rq), new_phase))
+                    rq_tup = (rq_buf[1], rq_buf[2], rq_buf[3])
+                    orbit[rlin] = (rq_tup, new_phase)
+                    push!(worklist, (rq_tup, new_phase))
                 end
             end
         end
@@ -1500,20 +1567,27 @@ function plan_krfft_g0asu_general(spec_asu::SpectralIndexing, ops_shifted::Vecto
     # This avoids overcounting from multiple ops sharing the same parity.
 
     g0_weights = Vector{GeneralPointWeights}(undef, n_spec)
+    rh_buf = zeros(Int, dim)
     for (h_idx, _) in enumerate(spec_asu.points)
         h_vec = get_k_vector(spec_asu, h_idx)
         fft_idx = zeros(Int32, 8)
         tw = zeros(ComplexF64, 8)
 
-        for (a_idx, parity) in enumerate(parity_list)
-            op = subgrid_reps[parity]
+        for (a_idx, _parity) in enumerate(parity_list)
+            pt = par_t[a_idx]
             # R_a^T h mod M
-            rh = [mod(sum(Int(op.R[d2, d1]) * h_vec[d2] for d2 in 1:dim), M[d1]) for d1 in 1:dim]
-            rh_lin = 1 + rh[1] + M[1]*rh[2] + M[1]*M[2]*rh[3]
+            for d1 in 1:dim
+                s = 0
+                for d2 in 1:dim
+                    @inbounds s += par_R[d2, d1, a_idx] * h_vec[d2]
+                end
+                rh_buf[d1] = mod(s, M[d1])
+            end
+            rh_lin = 1 + rh_buf[1] + M1*rh_buf[2] + M1*M2g*rh_buf[3]
             fft_idx[a_idx] = Int32(rh_lin)
 
             # Phase: exp(-2πi h·t_a/N)
-            phase = sum(h_vec[d] * op.t[d] / N[d] for d in 1:dim)
+            phase = h_vec[1]*pt[1]/N1 + h_vec[2]*pt[2]/N2g + h_vec[3]*pt[3]/N3g
             tw[a_idx] = cispi(-2 * phase)
         end
 
