@@ -14,9 +14,9 @@ using CrystallographicFFT.SymmetryOps: get_ops, detect_centering_type
 using CrystallographicFFT.ASU: find_optimal_shift
 using CrystallographicFFT.SpectralIndexing: calc_spectral_asu, get_k_vector
 using CrystallographicFFT.KRFFT
-using CrystallographicFFT.KRFFT: plan_krfft_centered, CenteredKRFFTPlan
+using CrystallographicFFT.KRFFT: plan_krfft_centered, CenteredForwardPlan
 using CrystallographicFFT.KRFFT: fft_reconstruct_centered!, pack_stride_real!
-using CrystallographicFFT.KRFFT: plan_centered_ikrfft, CenteredKRFFTBackwardPlan
+using CrystallographicFFT.KRFFT: plan_centered_ikrfft, CenteredBackwardPlan
 using CrystallographicFFT.KRFFT: ifft_unrecon_centered!
 using FFTW
 using LinearAlgebra: mul!
@@ -63,7 +63,7 @@ function benchmark_one(sg, name, N_size, fft_plan, fft_out; n_warmup=2, n_trials
 
     # ── M7 Forward plan ──
     fwd = plan_krfft_centered(spec, ops_s)
-    if !(fwd isa CenteredKRFFTPlan)
+    if !(fwd isa CenteredForwardPlan)
         @printf "%-10s SG%-3d  %s  N=%d  NOT APPLICABLE (fell back to plain KRFFT)\n" name sg cent N_size
         return nothing
     end
