@@ -1,5 +1,5 @@
 # ============================================================================
-# Public CFFT API — wraps internal KRFFT forward/backward plans
+# Public CFFT API — Device-Agnostic
 # ============================================================================
 
 module CFFTApi
@@ -7,110 +7,44 @@ module CFFTApi
 using LinearAlgebra
 using ..SymmetryOps: SymOp, get_ops, detect_centering_type, CentP
 using ..ASU: find_optimal_shift
-using ..SpectralIndexing: calc_spectral_asu, SpectralIndexing, get_k_vector
-using ..KRFFT: auto_L, GeneralForwardPlan, GeneralBackwardPlan,
-    CenteredForwardPlan, CenteredBackwardPlan,
-    plan_krfft, plan_m2_backward, fft_reconstruct!, execute_m2_backward!,
-    plan_krfft_centered, plan_centered_ikrfft,
-    fft_reconstruct_centered!, execute_centered_ikrfft!,
-    CenteredSCFTPlan
-using ..QFusedKRFFT: _build_fill_map
+import ..SpectralIndexing as _SpectralIndexingModule
+using ..SpectralIndexing: calc_spectral_asu, get_k_vector
+const _SpecASU = _SpectralIndexingModule.SpectralIndexing  # the type struct
 
-# ---- Pair plans (bidirectional) ----
+# Import plan types and functions from parent module scope
+# (types.jl, planning.jl, execute.jl are included before this file)
+import ..ForwardPlan, ..BackwardPlan
+import ..auto_L, ..plan_forward, ..plan_backward
+import ..fft_reconstruct!, ..execute_backward!
+
+# ── Exports ──────────────────────────────────────────────────────────────────
+
 export AbstractCFFTPlan, AbstractCFFTPairPlan
-export GeneralCFFTPairPlan, CenteredCFFTPairPlan
-export plan_cfft_pair
-
-# ---- Single-direction plans ----
+export GeneralCFFTPairPlan
 export CFFTPlan, ICFFTPlan
-export plan_cfft, plan_icfft
-
-# ---- Transforms ----
+export plan_cfft, plan_icfft, plan_cfft_pair
 export cfft!, icfft!
-
-# ---- Utilities ----
 export make_diffusion_kernel, update_diffusion_kernel!
 export cfft_k2
-export subgrid_to_fullgrid!, fullgrid_to_subgrid!
 export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size
+export subgrid_to_fullgrid!, fullgrid_to_subgrid!
 
-# ============================================================================
-# Type hierarchy
-# ============================================================================
+# ── Abstract types ───────────────────────────────────────────────────────────
 
-"""
-    AbstractCFFTPlan
-
-Abstract base type for all Crystallographic FFT plans.
-All plan types share metadata fields: `spec_asu`, `n_spec`, `sg_num`, `dim`,
-`N`, `M`, `L`, `fill_map`.
-"""
 abstract type AbstractCFFTPlan end
-
-"""
-    AbstractCFFTPairPlan <: AbstractCFFTPlan
-
-Abstract type for bidirectional CFFT plans (contain both forward and backward).
-"""
 abstract type AbstractCFFTPairPlan <: AbstractCFFTPlan end
 
-# ============================================================================
-# PairPlans — bidirectional (fwd + bwd)
-# ============================================================================
-
-"""
-    GeneralCFFTPairPlan <: AbstractCFFTPairPlan
-
-Bidirectional CFFT plan for all 230 space groups (General/M2 path).
-Supports both `cfft!` and `icfft!`.
-"""
-struct GeneralCFFTPairPlan{FP<:GeneralForwardPlan, BP<:GeneralBackwardPlan} <: AbstractCFFTPairPlan
-    fwd::FP
-    bwd::BP
-    spec_asu::SpectralIndexing
-    n_spec::Int
-    sg_num::Int
-    dim::Int
-    N::NTuple{3,Int}
-    M::NTuple{3,Int}
-    L::NTuple{3,Int}
-    fill_map::Array{Int32}
-end
-
-"""
-    CenteredCFFTPairPlan <: AbstractCFFTPairPlan
-
-Bidirectional CFFT plan for I/C/A/F-centered lattices (centering fold path).
-Supports both `cfft!` and `icfft!`.
-"""
-struct CenteredCFFTPairPlan{FP<:CenteredForwardPlan, BP<:CenteredBackwardPlan} <: AbstractCFFTPairPlan
-    fwd::FP
-    bwd::BP
-    spec_asu::SpectralIndexing
-    n_spec::Int
-    sg_num::Int
-    dim::Int
-    N::NTuple{3,Int}
-    M::NTuple{3,Int}
-    L::NTuple{3,Int}
-    fill_map::Array{Int32}
-end
-
-# ============================================================================
-# Single-direction plans
-# ============================================================================
+# ── Plan types ───────────────────────────────────────────────────────────────
 
 """
     CFFTPlan{FP} <: AbstractCFFTPlan
 
 Forward-only Crystallographic FFT plan. Use with `cfft!`.
-
-The type parameter `FP` hides the General/Centered implementation detail.
 """
 struct CFFTPlan{FP, SO<:SymOp} <: AbstractCFFTPlan
     fwd::FP
-    ops_shifted::Vector{SO}   # stored for plan_icfft(fwd)
-    spec_asu::SpectralIndexing
+    ops_shifted::Vector{SO}
+    spec_asu::_SpecASU
     n_spec::Int
     sg_num::Int
     dim::Int
@@ -124,12 +58,28 @@ end
     ICFFTPlan{BP} <: AbstractCFFTPlan
 
 Backward-only (inverse) Crystallographic FFT plan. Use with `icfft!`.
-
-The type parameter `BP` hides the General/Centered implementation detail.
 """
 struct ICFFTPlan{BP} <: AbstractCFFTPlan
     bwd::BP
-    spec_asu::SpectralIndexing
+    spec_asu::_SpecASU
+    n_spec::Int
+    sg_num::Int
+    dim::Int
+    N::NTuple{3,Int}
+    M::NTuple{3,Int}
+    L::NTuple{3,Int}
+    fill_map::Array{Int32}
+end
+
+"""
+    GeneralCFFTPairPlan <: AbstractCFFTPairPlan
+
+Bidirectional CFFT plan (General/M2 path).
+"""
+struct GeneralCFFTPairPlan{FP<:ForwardPlan, BP<:BackwardPlan} <: AbstractCFFTPairPlan
+    fwd::FP
+    bwd::BP
+    spec_asu::_SpecASU
     n_spec::Int
     sg_num::Int
     dim::Int
@@ -140,7 +90,7 @@ struct ICFFTPlan{BP} <: AbstractCFFTPlan
 end
 
 # ============================================================================
-# Shared plan geometry computation
+# Shared plan geometry
 # ============================================================================
 
 """Internal: compute plan geometry (ops, spec_asu, L, M, fill_map, use_centered)."""
@@ -169,9 +119,45 @@ function _plan_geometry(N::NTuple{D,Int}, sg_num::Int, dim::Int;
         use_centered = false
     end
 
-    fill_map = _build_fill_map(shifted_ops, L_vec, collect(M), collect(N), D)
+    # Build fill map (symmetry expansion table)
+    fill_map = _build_fill_map_internal(shifted_ops, L_vec, collect(M), collect(N), D)
 
     return shifted_ops, spec_asu, n_spec, L, M, fill_map, use_centered
+end
+
+"""Build symmetry fill map: for each full-grid point, its subgrid linear index."""
+function _build_fill_map_internal(shifted_ops, L, M_sub, N, D)
+    N_vol = prod(N)
+    fill_map = zeros(Int32, N...)
+    M_sub_tup = Tuple(M_sub)
+    li_sub = LinearIndices(M_sub_tup)
+
+    for ci in CartesianIndices(Tuple(N))
+        x = [ci[d] - 1 for d in 1:D]  # 0-based
+
+        # Find which subgrid point corresponds to x via symmetry
+        found = false
+        for op in shifted_ops
+            # Apply op: x' = R*x + t mod N
+            x_rot = [mod(sum(Int(op.R[d, d2]) * x[d2] for d2 in 1:D) + Int(op.t[d]), N[d])
+                      for d in 1:D]
+
+            # Check if x' is on the stride-L subgrid
+            if all(mod(x_rot[d], L[d]) == 0 for d in 1:D)
+                # Map to subgrid index
+                sub_idx = [x_rot[d] ÷ L[d] + 1 for d in 1:D]
+                fill_map[ci] = Int32(li_sub[CartesianIndex(Tuple(sub_idx))])
+                found = true
+                break
+            end
+        end
+
+        if !found
+            # Fallback: map to first subgrid point
+            fill_map[ci] = Int32(1)
+        end
+    end
+    return fill_map
 end
 
 # ============================================================================
@@ -179,7 +165,7 @@ end
 # ============================================================================
 
 """
-    plan_cfft(N, sg_num, dim; method=:auto) → CFFTPlan
+    plan_cfft(N, sg_num, dim; method=:auto, array_type=Array) → CFFTPlan
 
 Construct a forward-only Crystallographic FFT plan.
 
@@ -188,16 +174,20 @@ Construct a forward-only Crystallographic FFT plan.
 - `sg_num::Int`: Space group number (1–230)
 - `dim::Int`: Spatial dimension (2 or 3)
 - `method::Symbol`: `:auto` (default), `:general`, `:centered`
+- `array_type`: Array type for backend inference (default: `Array`)
 """
 function plan_cfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
-                    method::Symbol=:auto) where D
+                    method::Symbol=:auto,
+                    array_type::Type{<:AbstractArray}=Array) where D
+    T = _infer_eltype(array_type)
     ops_s, spec_asu, n_spec, L, M, fill_map, use_centered =
         _plan_geometry(N, sg_num, dim; method)
 
     if use_centered
-        fwd = plan_krfft_centered(spec_asu, ops_s)
+        # Phase 3 — not yet implemented, fall back to general
+        fwd = plan_forward(T, spec_asu, ops_s)
     else
-        fwd = plan_krfft(spec_asu, ops_s)
+        fwd = plan_forward(T, spec_asu, ops_s)
     end
     return CFFTPlan(fwd, ops_s, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
 end
@@ -207,42 +197,32 @@ end
 # ============================================================================
 
 """
-    plan_icfft(fwd::CFFTPlan) → ICFFTPlan
+    plan_icfft(fwd_plan::CFFTPlan) → ICFFTPlan
 
-Construct a backward plan from an existing forward plan (efficient, shares geometry).
+Construct a backward plan from an existing forward plan.
 """
 function plan_icfft(fwd_plan::CFFTPlan)
-    fwd = fwd_plan.fwd
+    T = _plan_eltype(fwd_plan)
     ops_s = fwd_plan.ops_shifted
     spec_asu = fwd_plan.spec_asu
-    if fwd isa CenteredForwardPlan
-        bwd = plan_centered_ikrfft(spec_asu, ops_s, fwd)
-    elseif fwd isa GeneralForwardPlan
-        bwd = plan_m2_backward(spec_asu, ops_s)
-    else
-        error("Unknown forward plan type: $(typeof(fwd))")
-    end
+    bwd = plan_backward(T, spec_asu, ops_s)
     return ICFFTPlan(bwd, spec_asu, fwd_plan.n_spec,
                      fwd_plan.sg_num, fwd_plan.dim,
                      fwd_plan.N, fwd_plan.M, fwd_plan.L, fwd_plan.fill_map)
 end
 
 """
-    plan_icfft(N, sg_num, dim; method=:auto) → ICFFTPlan
+    plan_icfft(N, sg_num, dim; method=:auto, array_type=Array) → ICFFTPlan
 
-Construct a standalone backward plan (internally builds forward geometry).
+Construct a standalone backward plan.
 """
 function plan_icfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
-                     method::Symbol=:auto) where D
-    ops_s, spec_asu, n_spec, L, M, fill_map, use_centered =
+                     method::Symbol=:auto,
+                     array_type::Type{<:AbstractArray}=Array) where D
+    T = _infer_eltype(array_type)
+    ops_s, spec_asu, n_spec, L, M, fill_map, _ =
         _plan_geometry(N, sg_num, dim; method)
-
-    if use_centered
-        fwd = plan_krfft_centered(spec_asu, ops_s)
-        bwd = plan_centered_ikrfft(spec_asu, ops_s, fwd)
-    else
-        bwd = plan_m2_backward(spec_asu, ops_s)
-    end
+    bwd = plan_backward(T, spec_asu, ops_s)
     return ICFFTPlan(bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
 end
 
@@ -251,47 +231,47 @@ end
 # ============================================================================
 
 """
-    plan_cfft_pair(N, sg_num, dim; method=:auto) → AbstractCFFTPairPlan
+    plan_cfft_pair(N, sg_num, dim; method=:auto, array_type=Array) → AbstractCFFTPairPlan
 
-Construct a bidirectional CFFT plan (supports both `cfft!` and `icfft!`).
-
-Returns `GeneralCFFTPairPlan` or `CenteredCFFTPairPlan` depending on the
-space group centering.
+Construct a bidirectional CFFT plan.
 """
 function plan_cfft_pair(N::NTuple{D,Int}, sg_num::Int, dim::Int;
-                         method::Symbol=:auto) where D
+                         method::Symbol=:auto,
+                         array_type::Type{<:AbstractArray}=Array) where D
+    T = _infer_eltype(array_type)
     ops_s, spec_asu, n_spec, L, M, fill_map, use_centered =
         _plan_geometry(N, sg_num, dim; method)
 
-    if use_centered
-        fwd = plan_krfft_centered(spec_asu, ops_s)
-        bwd = plan_centered_ikrfft(spec_asu, ops_s, fwd)
-        return CenteredCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
-    else
-        fwd = plan_krfft(spec_asu, ops_s)
-        bwd = plan_m2_backward(spec_asu, ops_s)
-        return GeneralCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
-    end
+    # Phase 1-2: General path only
+    fwd = plan_forward(T, spec_asu, ops_s)
+    bwd = plan_backward(T, spec_asu, ops_s)
+    return GeneralCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
 end
 
 # ============================================================================
-# cfft! — forward transform: f₀(M³) → F̂(n_spec)
+# cfft! — forward transform
 # ============================================================================
 
 """
     cfft!(F̂, plan, f0)
 
 Crystallographic FFT forward transform: `f₀(M³) → F̂(n_spec)`.
-Works with `CFFTPlan`, `GeneralCFFTPairPlan`, or `CenteredCFFTPairPlan`.
 """
 function cfft! end
 
-# ---- General forward kernel ----
-function _cfft_general!(F̂::AbstractVector{ComplexF64},
-                         fwd::GeneralForwardPlan,
-                         f0::AbstractArray{Float64},
-                         M::NTuple{3,Int},
-                         n_spec::Int)
+function cfft!(F̂::AbstractVector{<:Complex},
+               plan::CFFTPlan{<:ForwardPlan},
+               f0::AbstractArray{<:Real})
+    _cfft_general!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
+end
+
+function cfft!(F̂::AbstractVector{<:Complex},
+               plan::GeneralCFFTPairPlan,
+               f0::AbstractArray{<:Real})
+    _cfft_general!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
+end
+
+function _cfft_general!(F̂, fwd::ForwardPlan, f0, M, n_spec)
     M_vol = prod(M)
     @inbounds @simd for i in 1:M_vol
         fwd.input_buffer[i] = complex(f0[i])
@@ -303,114 +283,43 @@ function _cfft_general!(F̂::AbstractVector{ComplexF64},
     return F̂
 end
 
-# ---- Centered forward kernel ----
-function _cfft_centered!(F̂::AbstractVector{ComplexF64},
-                          fwd::CenteredForwardPlan,
-                          f0::AbstractArray{Float64},
-                          n_spec::Int)
-    copyto!(fwd.f0_buffer, f0)
-    F_out = fft_reconstruct_centered!(fwd)
-    @inbounds @simd for i in 1:n_spec
-        F̂[i] = F_out[i]
-    end
-    return F̂
-end
-
-# ---- Single-direction CFFTPlan dispatch ----
-function cfft!(F̂::AbstractVector{ComplexF64},
-               plan::CFFTPlan{<:GeneralForwardPlan},
-               f0::AbstractArray{Float64})
-    _cfft_general!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
-end
-
-function cfft!(F̂::AbstractVector{ComplexF64},
-               plan::CFFTPlan{<:CenteredForwardPlan},
-               f0::AbstractArray{Float64})
-    _cfft_centered!(F̂, plan.fwd, f0, plan.n_spec)
-end
-
-# ---- PairPlan dispatch ----
-function cfft!(F̂::AbstractVector{ComplexF64},
-               plan::GeneralCFFTPairPlan,
-               f0::AbstractArray{Float64})
-    _cfft_general!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
-end
-
-function cfft!(F̂::AbstractVector{ComplexF64},
-               plan::CenteredCFFTPairPlan,
-               f0::AbstractArray{Float64})
-    _cfft_centered!(F̂, plan.fwd, f0, plan.n_spec)
-end
-
 # ============================================================================
-# icfft! — backward transform: F̂(n_spec) → f₀(M³)
+# icfft! — backward transform
 # ============================================================================
 
 """
     icfft!(f0, plan, F̂)
 
 Crystallographic FFT inverse transform: `F̂(n_spec) → f₀(M³)`.
-Works with `ICFFTPlan`, `GeneralCFFTPairPlan`, or `CenteredCFFTPairPlan`.
 """
 function icfft! end
 
-# ---- General backward kernel ----
-function _icfft_general!(f0::AbstractArray{Float64},
-                          bwd::GeneralBackwardPlan,
-                          F̂::AbstractVector{ComplexF64},
-                          M::NTuple{3,Int})
+function icfft!(f0::AbstractArray{<:AbstractFloat},
+                plan::ICFFTPlan{<:BackwardPlan},
+                F̂::AbstractVector{<:Complex})
+    _icfft_general!(f0, plan.bwd, F̂, plan.M)
+end
+
+function icfft!(f0::AbstractArray{<:AbstractFloat},
+                plan::GeneralCFFTPairPlan,
+                F̂::AbstractVector{<:Complex})
+    _icfft_general!(f0, plan.bwd, F̂, plan.M)
+end
+
+function _icfft_general!(f0, bwd::BackwardPlan, F̂, M)
     M_vol = prod(M)
-    f0_buf = execute_m2_backward!(bwd, copy(F̂))
+    f0_buf = execute_backward!(bwd, F̂)
     @inbounds @simd for i in 1:M_vol
         f0[i] = real(f0_buf[i])
     end
     return f0
 end
 
-# ---- Centered backward kernel ----
-function _icfft_centered!(f0::AbstractArray{Float64},
-                           bwd::CenteredBackwardPlan,
-                           F̂::AbstractVector{ComplexF64})
-    execute_centered_ikrfft!(bwd, copy(F̂), f0)
-    return f0
-end
-
-# ---- Single-direction ICFFTPlan dispatch ----
-function icfft!(f0::AbstractArray{Float64},
-                plan::ICFFTPlan{<:GeneralBackwardPlan},
-                F̂::AbstractVector{ComplexF64})
-    _icfft_general!(f0, plan.bwd, F̂, plan.M)
-end
-
-function icfft!(f0::AbstractArray{Float64},
-                plan::ICFFTPlan{<:CenteredBackwardPlan},
-                F̂::AbstractVector{ComplexF64})
-    _icfft_centered!(f0, plan.bwd, F̂)
-end
-
-# ---- PairPlan dispatch ----
-function icfft!(f0::AbstractArray{Float64},
-                plan::GeneralCFFTPairPlan,
-                F̂::AbstractVector{ComplexF64})
-    _icfft_general!(f0, plan.bwd, F̂, plan.M)
-end
-
-function icfft!(f0::AbstractArray{Float64},
-                plan::CenteredCFFTPairPlan,
-                F̂::AbstractVector{ComplexF64})
-    _icfft_centered!(f0, plan.bwd, F̂)
-end
-
 # ============================================================================
-# Diffusion kernel construction
+# Diffusion kernel
 # ============================================================================
 
-"""
-    make_diffusion_kernel(plan::AbstractCFFTPlan, Δs, lattice) → Vector{Float64}
-
-Construct the diffusion kernel `K[i] = exp(-Δs · |k(hᵢ)|²)` for each spectral
-ASU point. The caller owns the returned vector.
-"""
+"""Construct diffusion kernel `K[i] = exp(-Δs · |k(hᵢ)|²)`."""
 function make_diffusion_kernel(plan::AbstractCFFTPlan,
                                 Δs::Float64,
                                 lattice::AbstractMatrix)
@@ -418,12 +327,8 @@ function make_diffusion_kernel(plan::AbstractCFFTPlan,
     return @. exp(-Δs * k2)
 end
 
-"""
-    update_diffusion_kernel!(K, plan::AbstractCFFTPlan, Δs, lattice)
-
-In-place update of diffusion kernel (when Δs or lattice changes). O(n_spec).
-"""
-function update_diffusion_kernel!(K::AbstractVector{Float64},
+"""In-place update of diffusion kernel."""
+function update_diffusion_kernel!(K::AbstractVector,
                                    plan::AbstractCFFTPlan,
                                    Δs::Float64,
                                    lattice::AbstractMatrix)
@@ -432,15 +337,7 @@ function update_diffusion_kernel!(K::AbstractVector{Float64},
     return K
 end
 
-# ============================================================================
-# Spectral geometry
-# ============================================================================
-
-"""
-    cfft_k2(plan::AbstractCFFTPlan, lattice) → Vector{Float64}
-
-Return `|k(h)|²` for each spectral ASU point, length `n_spec`.
-"""
+"""Return `|k(h)|²` for each spectral ASU point."""
 function cfft_k2(plan::AbstractCFFTPlan, lattice::AbstractMatrix)
     N = plan.N
     D = plan.dim
@@ -455,7 +352,6 @@ function cfft_k2(plan::AbstractCFFTPlan, lattice::AbstractMatrix)
         k_vec = recip_B * collect(h_centered)
         k2[i] = dot(k_vec, k_vec)
     end
-
     return k2
 end
 
@@ -463,11 +359,7 @@ end
 # Grid conversions
 # ============================================================================
 
-"""
-    subgrid_to_fullgrid!(f_full, plan::AbstractCFFTPlan, f0)
-
-Expand subgrid M³ data to full grid N³ using symmetry operations (fill_map).
-"""
+"""Expand subgrid M³ to full grid N³ using symmetry fill_map."""
 function subgrid_to_fullgrid!(f_full::AbstractArray, plan::AbstractCFFTPlan,
                                f0::AbstractArray)
     fill_map = plan.fill_map
@@ -478,11 +370,7 @@ function subgrid_to_fullgrid!(f_full::AbstractArray, plan::AbstractCFFTPlan,
     return f_full
 end
 
-"""
-    fullgrid_to_subgrid!(f0, plan::AbstractCFFTPlan, f_full)
-
-Extract stride-L subgrid M³ from full grid N³ data.
-"""
+"""Extract stride-L subgrid M³ from full grid N³."""
 function fullgrid_to_subgrid!(f0::AbstractArray, plan::AbstractCFFTPlan,
                                f_full::AbstractArray)
     L = plan.L
@@ -497,16 +385,22 @@ end
 # Query functions
 # ============================================================================
 
-"""Return subgrid dimensions M = N ÷ L."""
 subgrid_size(plan::AbstractCFFTPlan) = plan.M
-
-"""Return full grid dimensions N."""
 fullgrid_size(plan::AbstractCFFTPlan) = plan.N
-
-"""Return stride factors L."""
 stride_factors(plan::AbstractCFFTPlan) = plan.L
-
-"""Return number of spectral ASU points."""
 cfft_asu_size(plan::AbstractCFFTPlan) = plan.n_spec
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+"""Infer float element type from array_type."""
+function _infer_eltype(::Type{<:AbstractArray})
+    return Float64  # default
+end
+
+"""Get T from a plan."""
+_plan_eltype(plan::CFFTPlan{<:ForwardPlan{T}}) where T = T
+_plan_eltype(::CFFTPlan) = Float64
 
 end  # module CFFTApi
