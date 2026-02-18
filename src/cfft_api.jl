@@ -14,13 +14,16 @@ const _SpecASU = _SpectralIndexingModule.SpectralIndexing  # the type struct
 # Import plan types and functions from parent module scope
 # (types.jl, planning.jl, execute.jl are included before this file)
 import ..ForwardPlan, ..BackwardPlan
+import ..CenteredForwardPlan, ..CenteredBackwardPlan, ..CenteringFoldPlan
 import ..auto_L, ..plan_forward, ..plan_backward
+import ..plan_centered_forward, ..plan_centered_backward
 import ..fft_reconstruct!, ..execute_backward!
+import ..fft_reconstruct_centered!, ..execute_centered_backward!
 
 # ── Exports ──────────────────────────────────────────────────────────────────
 
 export AbstractCFFTPlan, AbstractCFFTPairPlan
-export GeneralCFFTPairPlan
+export GeneralCFFTPairPlan, CenteredCFFTPairPlan
 export CFFTPlan, ICFFTPlan
 export plan_cfft, plan_icfft, plan_cfft_pair
 export cfft!, icfft!
@@ -77,6 +80,24 @@ end
 Bidirectional CFFT plan (General/M2 path).
 """
 struct GeneralCFFTPairPlan{FP<:ForwardPlan, BP<:BackwardPlan} <: AbstractCFFTPairPlan
+    fwd::FP
+    bwd::BP
+    spec_asu::_SpecASU
+    n_spec::Int
+    sg_num::Int
+    dim::Int
+    N::NTuple{3,Int}
+    M::NTuple{3,Int}
+    L::NTuple{3,Int}
+    fill_map::Array{Int32}
+end
+
+"""
+    CenteredCFFTPairPlan <: AbstractCFFTPairPlan
+
+Bidirectional CFFT plan (Centered path for I/F/C lattices).
+"""
+struct CenteredCFFTPairPlan{FP<:CenteredForwardPlan, BP<:CenteredBackwardPlan} <: AbstractCFFTPairPlan
     fwd::FP
     bwd::BP
     spec_asu::_SpecASU
@@ -184,8 +205,7 @@ function plan_cfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
         _plan_geometry(N, sg_num, dim; method)
 
     if use_centered
-        # Phase 3 — not yet implemented, fall back to general
-        fwd = plan_forward(T, spec_asu, ops_s)
+        fwd = plan_centered_forward(T, spec_asu, ops_s)
     else
         fwd = plan_forward(T, spec_asu, ops_s)
     end
@@ -205,7 +225,11 @@ function plan_icfft(fwd_plan::CFFTPlan)
     T = _plan_eltype(fwd_plan)
     ops_s = fwd_plan.ops_shifted
     spec_asu = fwd_plan.spec_asu
-    bwd = plan_backward(T, spec_asu, ops_s)
+    if fwd_plan.fwd isa CenteredForwardPlan
+        bwd = plan_centered_backward(T, spec_asu, ops_s)
+    else
+        bwd = plan_backward(T, spec_asu, ops_s)
+    end
     return ICFFTPlan(bwd, spec_asu, fwd_plan.n_spec,
                      fwd_plan.sg_num, fwd_plan.dim,
                      fwd_plan.N, fwd_plan.M, fwd_plan.L, fwd_plan.fill_map)
@@ -242,10 +266,15 @@ function plan_cfft_pair(N::NTuple{D,Int}, sg_num::Int, dim::Int;
     ops_s, spec_asu, n_spec, L, M, fill_map, use_centered =
         _plan_geometry(N, sg_num, dim; method)
 
-    # Phase 1-2: General path only
-    fwd = plan_forward(T, spec_asu, ops_s)
-    bwd = plan_backward(T, spec_asu, ops_s)
-    return GeneralCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
+    if use_centered
+        fwd = plan_centered_forward(T, spec_asu, ops_s)
+        bwd = plan_centered_backward(T, spec_asu, ops_s)
+        return CenteredCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
+    else
+        fwd = plan_forward(T, spec_asu, ops_s)
+        bwd = plan_backward(T, spec_asu, ops_s)
+        return GeneralCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
+    end
 end
 
 # ============================================================================
@@ -266,9 +295,21 @@ function cfft!(F̂::AbstractVector{<:Complex},
 end
 
 function cfft!(F̂::AbstractVector{<:Complex},
+               plan::CFFTPlan{<:CenteredForwardPlan},
+               f0::AbstractArray{<:Real})
+    _cfft_centered!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
+end
+
+function cfft!(F̂::AbstractVector{<:Complex},
                plan::GeneralCFFTPairPlan,
                f0::AbstractArray{<:Real})
     _cfft_general!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
+end
+
+function cfft!(F̂::AbstractVector{<:Complex},
+               plan::CenteredCFFTPairPlan,
+               f0::AbstractArray{<:Real})
+    _cfft_centered!(F̂, plan.fwd, f0, plan.M, plan.n_spec)
 end
 
 function _cfft_general!(F̂, fwd::ForwardPlan, f0, M, n_spec)
@@ -279,6 +320,18 @@ function _cfft_general!(F̂, fwd::ForwardPlan, f0, M, n_spec)
     fft_reconstruct!(fwd)
     @inbounds @simd for i in 1:n_spec
         F̂[i] = fwd.output_buffer[i]
+    end
+    return F̂
+end
+
+function _cfft_centered!(F̂, fwd::CenteredForwardPlan, f0, M, n_spec)
+    M_vol = prod(M)
+    @inbounds for k in 1:M[3], j in 1:M[2], i in 1:M[1]
+        fwd.f0_buffer[i,j,k] = f0[i,j,k]
+    end
+    fft_reconstruct_centered!(fwd)
+    @inbounds @simd for i in 1:n_spec
+        F̂[i] = fwd.krfft_plan.output_buffer[i]
     end
     return F̂
 end
@@ -301,14 +354,35 @@ function icfft!(f0::AbstractArray{<:AbstractFloat},
 end
 
 function icfft!(f0::AbstractArray{<:AbstractFloat},
+                plan::ICFFTPlan{<:CenteredBackwardPlan},
+                F̂::AbstractVector{<:Complex})
+    _icfft_centered!(f0, plan.bwd, F̂, plan.M)
+end
+
+function icfft!(f0::AbstractArray{<:AbstractFloat},
                 plan::GeneralCFFTPairPlan,
                 F̂::AbstractVector{<:Complex})
     _icfft_general!(f0, plan.bwd, F̂, plan.M)
 end
 
+function icfft!(f0::AbstractArray{<:AbstractFloat},
+                plan::CenteredCFFTPairPlan,
+                F̂::AbstractVector{<:Complex})
+    _icfft_centered!(f0, plan.bwd, F̂, plan.M)
+end
+
 function _icfft_general!(f0, bwd::BackwardPlan, F̂, M)
     M_vol = prod(M)
     f0_buf = execute_backward!(bwd, F̂)
+    @inbounds @simd for i in 1:M_vol
+        f0[i] = real(f0_buf[i])
+    end
+    return f0
+end
+
+function _icfft_centered!(f0, bwd::CenteredBackwardPlan, F̂, M)
+    M_vol = prod(M)
+    f0_buf = execute_centered_backward!(bwd, F̂)
     @inbounds @simd for i in 1:M_vol
         f0[i] = real(f0_buf[i])
     end
@@ -401,6 +475,7 @@ end
 
 """Get T from a plan."""
 _plan_eltype(plan::CFFTPlan{<:ForwardPlan{T}}) where T = T
+_plan_eltype(plan::CFFTPlan{<:CenteredForwardPlan{T}}) where T = T
 _plan_eltype(::CFFTPlan) = Float64
 
 end  # module CFFTApi

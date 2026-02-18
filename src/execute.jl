@@ -364,29 +364,54 @@ function _centering_unfold_2ch!(plan::CenteringFoldPlan{T},
     end
 end
 
-"""4-channel inverse WHT for I/C/A centering."""
+"""4-channel inverse WHT for I/C/A centering (zero-alloc inner loop)."""
 function _centering_unfold_4ch!(plan::CenteringFoldPlan{T},
                                 f0::AbstractArray{<:Real, 3}) where T
     H1, H2, H3 = plan.H
-    alive_wht_idx = [off[1] + off[2]*2 + off[3]*4 + 1 for off in plan.offsets]
+
+    # Precompute alive WHT indices as NTuple (stack-allocated)
+    off1 = plan.offsets[1]; aidx1 = off1[1] + off1[2]*2 + off1[3]*4 + 1
+    off2 = plan.offsets[2]; aidx2 = off2[1] + off2[2]*2 + off2[3]*4 + 1
+    off3 = plan.offsets[3]; aidx3 = off3[1] + off3[2]*2 + off3[3]*4 + 1
+    off4 = plan.offsets[4]; aidx4 = off4[1] + off4[2]*2 + off4[3]*4 + 1
+
+    # Extract twiddle tables (references, no allocation)
+    tw1_1 = plan.twiddle_1d[1]; tw1_2 = plan.twiddle_1d[2]
+    tw1_3 = plan.twiddle_1d[3]; tw1_4 = plan.twiddle_1d[4]
+
+    buf1 = plan.channel_bufs[1]; buf2 = plan.channel_bufs[2]
+    buf3 = plan.channel_bufs[3]; buf4 = plan.channel_bufs[4]
 
     @inbounds for iz in 0:H3-1
-        tw_z = [conj(plan.twiddle_1d[c][3][iz+1]) for c in 1:4]
+        # Explicit scalars instead of array comprehension
+        tz1 = conj(tw1_1[3][iz+1]); tz2 = conj(tw1_2[3][iz+1])
+        tz3 = conj(tw1_3[3][iz+1]); tz4 = conj(tw1_4[3][iz+1])
         for iy in 0:H2-1
-            tw_yz = [conj(plan.twiddle_1d[c][2][iy+1]) * tw_z[c] for c in 1:4]
+            tyz1 = conj(tw1_1[2][iy+1]) * tz1; tyz2 = conj(tw1_2[2][iy+1]) * tz2
+            tyz3 = conj(tw1_3[2][iy+1]) * tz3; tyz4 = conj(tw1_4[2][iy+1]) * tz4
             for ix in 0:H1-1
-                wht_coeffs = zeros(T, 8)
-                for c in 1:4
-                    tw_full = conj(plan.twiddle_1d[c][1][ix+1]) * tw_yz[c]
-                    wht_coeffs[alive_wht_idx[c]] = real(
-                        plan.channel_bufs[c][ix+1, iy+1, iz+1] * tw_full)
+                # Compute 4 raw WHT coefficients (undo twiddle)
+                tf1 = conj(tw1_1[1][ix+1]) * tyz1
+                tf2 = conj(tw1_2[1][ix+1]) * tyz2
+                tf3 = conj(tw1_3[1][ix+1]) * tyz3
+                tf4 = conj(tw1_4[1][ix+1]) * tyz4
+
+                g1 = real(buf1[ix+1, iy+1, iz+1] * tf1)
+                g2 = real(buf2[ix+1, iy+1, iz+1] * tf2)
+                g3 = real(buf3[ix+1, iy+1, iz+1] * tf3)
+                g4 = real(buf4[ix+1, iy+1, iz+1] * tf4)
+
+                # Scatter into WHT slots via stack-allocated NTuple
+                wht = ntuple(Val(8)) do slot
+                    slot == aidx1 ? g1 : slot == aidx2 ? g2 :
+                    slot == aidx3 ? g3 : slot == aidx4 ? g4 : zero(T)
                 end
 
-                # Inverse WHT (same butterfly as forward, self-inverse up to /8)
-                a0_00 = wht_coeffs[1] + wht_coeffs[2]; a1_00 = wht_coeffs[1] - wht_coeffs[2]
-                a0_10 = wht_coeffs[3] + wht_coeffs[4]; a1_10 = wht_coeffs[3] - wht_coeffs[4]
-                a0_01 = wht_coeffs[5] + wht_coeffs[6]; a1_01 = wht_coeffs[5] - wht_coeffs[6]
-                a0_11 = wht_coeffs[7] + wht_coeffs[8]; a1_11 = wht_coeffs[7] - wht_coeffs[8]
+                # Inverse WHT butterfly (same as forward, self-inverse up to /8)
+                a0_00 = wht[1] + wht[2]; a1_00 = wht[1] - wht[2]
+                a0_10 = wht[3] + wht[4]; a1_10 = wht[3] - wht[4]
+                a0_01 = wht[5] + wht[6]; a1_01 = wht[5] - wht[6]
+                a0_11 = wht[7] + wht[8]; a1_11 = wht[7] - wht[8]
 
                 b00_0 = a0_00 + a0_10; b01_0 = a0_00 - a0_10
                 b10_0 = a1_00 + a1_10; b11_0 = a1_00 - a1_10
