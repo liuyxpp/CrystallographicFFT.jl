@@ -550,17 +550,34 @@ function plan_centering_fold(::Type{T}, centering::CenteringType,
     offsets = _alive_offsets(centering)
     n_ch = length(offsets)
 
-    # Per-channel buffers on CPU (then transfer)
+    # Per-channel buffers (CPU path: individual arrays; GPU path: views into batch)
     channel_bufs_cpu = [zeros(CT, H...) for _ in 1:n_ch]
     channel_fft_out_cpu = [zeros(CT, H...) for _ in 1:n_ch]
 
-    # Transfer to device
-    channel_bufs = [_to_device(backend, channel_bufs_cpu[c]) for c in 1:n_ch]
-    channel_fft_out = [_to_device(backend, channel_fft_out_cpu[c]) for c in 1:n_ch]
+    # Batched 4D arrays: (H1, H2, H3, n_ch)
+    batch_buf_cpu = zeros(CT, H..., n_ch)
+    batch_fft_out_cpu = zeros(CT, H..., n_ch)
 
-    # FFT/IFFT plans — created on device arrays so CUFFT dispatches for GPU
+    # Transfer to device
+    batch_buf = _to_device(backend, batch_buf_cpu)
+    batch_fft_out = _to_device(backend, batch_fft_out_cpu)
+
+    # Per-channel arrays: on GPU use views into batch arrays; on CPU use independent
+    if backend isa CPU
+        channel_bufs = [_to_device(backend, channel_bufs_cpu[c]) for c in 1:n_ch]
+        channel_fft_out = [_to_device(backend, channel_fft_out_cpu[c]) for c in 1:n_ch]
+    else
+        channel_bufs = [view(batch_buf, :, :, :, c) for c in 1:n_ch]
+        channel_fft_out = [view(batch_fft_out, :, :, :, c) for c in 1:n_ch]
+    end
+
+    # Per-channel FFT/IFFT plans (CPU path)
     fft_plans = [plan_fft(channel_bufs[c]) for c in 1:n_ch]
     ifft_plans = [plan_ifft(channel_fft_out[c]) for c in 1:n_ch]
+
+    # Batched FFT/IFFT plans (GPU path: FFT along dims 1,2,3, batch over dim 4)
+    batch_fft_plan = plan_fft(batch_buf, (1, 2, 3))
+    batch_ifft_plan = plan_ifft(batch_fft_out, (1, 2, 3))
 
     # Twiddle tables: tw_d[n+1] = cispi(-2 * off_d * n / M_d) for n in 0:H_d-1
     # Compute on CPU, then transfer to device
@@ -600,6 +617,7 @@ function plan_centering_fold(::Type{T}, centering::CenteringType,
     return CenteringFoldPlan(
         cent_sym, M, H, n_ch, offsets,
         channel_bufs, fft_plans, ifft_plans, channel_fft_out,
+        batch_buf, batch_fft_out, batch_fft_plan, batch_ifft_plan,
         twiddle_1d, sign_table
     )
 end

@@ -108,7 +108,6 @@ function _reconstruct_general!(plan::ForwardPlan{T}) where T
     else
         kernel = reconstruct_general_kernel!(backend)
         kernel(out, buf, idx, w, n_ops; ndrange=n_spec)
-        KernelAbstractions.synchronize(backend)
     end
     return out
 end
@@ -163,10 +162,8 @@ function _inv_reconstruct!(bplan::BackwardPlan{T}, F_spec::AbstractVector{<:Comp
     else
         # Fill F_work on device
         fill_fwork_kernel!(backend)(F_work, F_spec, n; ndrange=n)
-        KernelAbstractions.synchronize(backend)
         # Inverse reconstruct on device
         inv_reconstruct_kernel!(backend)(Y, F_work, widx, w, d; ndrange=M_vol)
-        KernelAbstractions.synchronize(backend)
     end
 end
 
@@ -233,7 +230,6 @@ function _centering_fold_2ch!(plan::CenteringFoldPlan{T},
             s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8],
             Int32(H1), Int32(H2), Int32(H3);
             ndrange=H_vol)
-        KernelAbstractions.synchronize(backend)
     end
 end
 
@@ -304,23 +300,38 @@ function _centering_fold_4ch!(plan::CenteringFoldPlan{T},
             Int32(idx2), Int32(idx3), Int32(idx4),
             Int32(H1), Int32(H2), Int32(H3);
             ndrange=H_vol)
-        KernelAbstractions.synchronize(backend)
     end
 end
 
 # ── FFT channels ─────────────────────────────────────────────────────────────
 
-"""Execute FFT on all folded channels (out-of-place: bufs → fft_out)."""
+"""Execute FFT on all folded channels.
+On CPU: per-channel loops (n_ch × plan_fft). On GPU: single batched CUFFT.
+"""
 function fft_channels!(plan::CenteringFoldPlan)
-    @inbounds for c in 1:plan.n_channels
-        mul!(plan.channel_fft_out[c], plan.channel_fft_plans[c], plan.channel_bufs[c])
+    backend = get_backend(plan.batch_buf)
+    if backend isa CPU
+        @inbounds for c in 1:plan.n_channels
+            mul!(plan.channel_fft_out[c], plan.channel_fft_plans[c], plan.channel_bufs[c])
+        end
+    else
+        # GPU: single batched CUFFT over 4D array (H1, H2, H3, n_ch)
+        mul!(plan.batch_fft_out, plan.batch_fft_plan, plan.batch_buf)
     end
 end
 
-"""Execute IFFT on all folded channels (out-of-place: fft_out → bufs)."""
+"""Execute IFFT on all folded channels.
+On CPU: per-channel loops. On GPU: single batched CUFFT inverse.
+"""
 function ifft_channels!(plan::CenteringFoldPlan)
-    @inbounds for c in 1:plan.n_channels
-        mul!(plan.channel_bufs[c], plan.channel_ifft_plans[c], plan.channel_fft_out[c])
+    backend = get_backend(plan.batch_buf)
+    if backend isa CPU
+        @inbounds for c in 1:plan.n_channels
+            mul!(plan.channel_bufs[c], plan.channel_ifft_plans[c], plan.channel_fft_out[c])
+        end
+    else
+        # GPU: single batched inverse CUFFT
+        mul!(plan.batch_buf, plan.batch_ifft_plan, plan.batch_fft_out)
     end
 end
 
@@ -355,7 +366,6 @@ function assemble_G0!(G0::AbstractArray{<:Complex, 3}, plan::CenteringFoldPlan)
                 Int32(H1), Int32(H2), Int32(H3);
                 ndrange=H_vol)
         end
-        KernelAbstractions.synchronize(backend)
     end
 end
 
@@ -387,7 +397,6 @@ function disassemble_G0!(plan::CenteringFoldPlan,
                 Int32(H1), Int32(H2), Int32(H3);
                 ndrange=H_vol)
         end
-        KernelAbstractions.synchronize(backend)
     end
 end
 
@@ -442,7 +451,6 @@ function _centering_unfold_2ch!(plan::CenteringFoldPlan{T},
             s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8],
             Int32(H1), Int32(H2), Int32(H3);
             ndrange=H_vol)
-        KernelAbstractions.synchronize(backend)
     end
 end
 
@@ -522,7 +530,6 @@ function _centering_unfold_4ch!(plan::CenteringFoldPlan{T},
             Int32(aidx1), Int32(aidx2), Int32(aidx3), Int32(aidx4),
             Int32(H1), Int32(H2), Int32(H3);
             ndrange=H_vol)
-        KernelAbstractions.synchronize(backend)
     end
 end
 
@@ -601,7 +608,6 @@ function _inv_recon_orbit!(G0::AbstractArray{<:Complex, 3},
         orbit_gather_kernel!(backend)(
             G0_reps, F_spec, offsets, sidx, wt;
             ndrange=n_orbits)
-        KernelAbstractions.synchronize(backend)
 
         # Step 2: Orbit expand on device
         G0_flat = vec(G0)
@@ -610,7 +616,6 @@ function _inv_recon_orbit!(G0::AbstractArray{<:Complex, 3},
         orbit_expand_kernel!(backend)(
             G0_flat, G0_reps, oid, oph;
             ndrange=length(G0_flat))
-        KernelAbstractions.synchronize(backend)
     end
 end
 

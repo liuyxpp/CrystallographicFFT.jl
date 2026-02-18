@@ -346,7 +346,6 @@ function _cfft_general!(F̂, fwd::ForwardPlan, f0, M, n_spec)
     else
         copy_real_to_complex_kernel!(backend)(
             fwd.input_buffer, f0; ndrange=M_vol)
-        KernelAbstractions.synchronize(backend)
     end
     fft_reconstruct!(fwd)
     if backend isa KA_CPU
@@ -426,7 +425,6 @@ function _icfft_general!(f0, bwd::BackwardPlan, F̂, M)
     else
         copy_complex_to_real_kernel!(backend)(
             f0, f0_buf; ndrange=M_vol)
-        KernelAbstractions.synchronize(backend)
     end
     return f0
 end
@@ -442,7 +440,6 @@ function _icfft_centered!(f0, bwd::CenteredBackwardPlan, F̂, M)
     else
         copy_complex_to_real_kernel!(backend)(
             f0, f0_buf; ndrange=M_vol)
-        KernelAbstractions.synchronize(backend)
     end
     return f0
 end

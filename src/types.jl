@@ -102,9 +102,13 @@ end
 
 Plan for centering fold / unfold on stride-2 subgrids.
 Supports 2-channel (F centering) and 4-channel (I/C/A centering).
+
+On GPU, uses batched CUFFT via 4D arrays (H1×H2×H3×n_ch) for a single
+kernel launch instead of n_ch sequential FFT calls.
 """
-struct CenteringFoldPlan{T<:AbstractFloat, P, IP,
+struct CenteringFoldPlan{T<:AbstractFloat, P, IP, BP, BIP,
                          VA<:AbstractArray{Complex{T}, 3},
+                         BA<:AbstractArray{Complex{T}, 4},
                          VT<:AbstractVector{Complex{T}}}
     centering::Symbol             # :P, :I, :F, :C, :A
     M::NTuple{3, Int}         # subgrid dims (must be even)
@@ -112,11 +116,17 @@ struct CenteringFoldPlan{T<:AbstractFloat, P, IP,
     n_channels::Int
     offsets::Vector{NTuple{3, Int}}  # (n_ch,) — small, stays on CPU
 
-    # ── Per-channel buffers & FFT plans (on device) ──
+    # ── Per-channel buffers & FFT plans (CPU path) ──
     channel_bufs::Vector{VA}
     channel_fft_plans::Vector{P}
     channel_ifft_plans::Vector{IP}
     channel_fft_out::Vector{VA}
+
+    # ── Batched buffers & FFT plans (GPU path: single CUFFT call) ──
+    batch_buf::BA              # (H1, H2, H3, n_ch)
+    batch_fft_out::BA          # (H1, H2, H3, n_ch)
+    batch_fft_plan::BP         # batched plan_fft over dims (1,2,3)
+    batch_ifft_plan::BIP       # batched plan_ifft over dims (1,2,3)
 
     # ── Twiddle factors (per-channel, per-dimension, on device) ──
     twiddle_1d::Vector{NTuple{3, VT}}
