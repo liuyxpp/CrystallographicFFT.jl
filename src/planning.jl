@@ -227,29 +227,28 @@ function plan_forward(::Type{T}, spec_asu::SpecASU,
     work_buf_cpu  = zeros(CT, M_vol)
     out_buf_cpu   = zeros(CT, n_spec)
 
-    # 5. FFT plan (on CPU array with target precision)
-    M_tup = NTuple{dim, Int}(M_sub)
-    dummy = zeros(CT, M_tup)
-    fft_plan = plan_fft(dummy)
-
-    # 6. Pmmm detection and phase factors
-    is_pmmm = _is_pmmm_pattern(rep_ops, L_vec, N, dim)
-    if is_pmmm
-        phase_factors = _build_phase_factors(T, M_sub, N, dim)
-    else
-        phase_factors = Vector{CT}[]
-    end
-
-    # 7. Transfer to device
+    # 5. Transfer to device (before creating FFT plan)
     input_buf = _to_device(backend, input_buf_cpu)
     work_buf  = _to_device(backend, work_buf_cpu)
     out_buf   = _to_device(backend, out_buf_cpu)
     fiber_idx = _to_device(backend, fiber_idx_cpu)
     weight_dev = _to_device(backend, weight_cpu_T)
 
-    # 8. Reshape views
+    # 6. FFT plan on device array (CUFFT auto-dispatches for GPU)
+    M_tup = NTuple{dim, Int}(M_sub)
     input_view = reshape(input_buf, M_tup)
     work_view  = reshape(work_buf, M_tup)
+    fft_plan = plan_fft(input_view)
+
+    # 7. Pmmm detection and phase factors
+    is_pmmm = _is_pmmm_pattern(rep_ops, L_vec, N, dim)
+    VA = typeof(out_buf)  # Get concrete device array type
+    if is_pmmm
+        phase_cpu = _build_phase_factors(T, M_sub, N, dim)
+        phase_factors = VA[_to_device(backend, p) for p in phase_cpu]
+    else
+        phase_factors = VA[]
+    end
 
     N_tup = NTuple{dim, Int}(N)
     L_tup = NTuple{dim, Int}(L_vec)
@@ -475,30 +474,32 @@ function plan_backward(::Type{T}, spec_asu::SpecASU,
     Y_buf_cpu = zeros(CT, M_vol)
     f0_buf_cpu = zeros(CT, M_vol)
 
-    # 7. IFFT plan
-    M_tup = NTuple{dim, Int}(M_sub)
-    dummy = zeros(CT, M_tup)
-    ifft_plan = plan_ifft(dummy)
-
-    # 8. Pmmm detection
-    is_sep = _is_pmmm_pattern(rep_ops, L_vec, N, dim)
-    inv_phase_factors = Vector{CT}[]
-    if is_sep
-        inv_phase_factors = Vector{Vector{CT}}(undef, dim)
-        for dd in 1:dim
-            inv_phase_factors[dd] = [CT(cispi(-2 * q / N[dd])) for q in 0:M_sub[dd]-1]
-        end
-    end
-
-    # 9. Transfer to device
+    # 7. Transfer to device (before creating IFFT plan)
     inv_work_idx = _to_device(backend, inv_work_idx_cpu)
     inv_weight_dev = _to_device(backend, inv_weight_T)
     F_work = _to_device(backend, F_work_cpu)
     Y_buf = _to_device(backend, Y_buf_cpu)
     f0_buf = _to_device(backend, f0_buf_cpu)
 
+    M_tup = NTuple{dim, Int}(M_sub)
     Y_view = reshape(Y_buf, M_tup)
     f0_view = reshape(f0_buf, M_tup)
+
+    # 8. IFFT plan on device array (CUFFT auto-dispatches for GPU)
+    ifft_plan = plan_ifft(Y_view)
+
+    # 9. Pmmm detection
+    is_sep = _is_pmmm_pattern(rep_ops, L_vec, N, dim)
+    VA = typeof(Y_buf)  # Get concrete device array type
+    if is_sep
+        inv_phase_factors = Vector{VA}(undef, dim)
+        for dd in 1:dim
+            pf_cpu = [CT(cispi(-2 * q / N[dd])) for q in 0:M_sub[dd]-1]
+            inv_phase_factors[dd] = _to_device(backend, pf_cpu)
+        end
+    else
+        inv_phase_factors = VA[]
+    end
 
     N_tup = NTuple{dim, Int}(N)
     L_tup = NTuple{dim, Int}(L_vec)
@@ -553,16 +554,17 @@ function plan_centering_fold(::Type{T}, centering::CenteringType,
     channel_bufs_cpu = [zeros(CT, H...) for _ in 1:n_ch]
     channel_fft_out_cpu = [zeros(CT, H...) for _ in 1:n_ch]
 
-    # FFT/IFFT plans
-    fft_plans = [plan_fft(channel_bufs_cpu[c]) for c in 1:n_ch]
-    ifft_plans = [plan_ifft(channel_fft_out_cpu[c]) for c in 1:n_ch]
-
     # Transfer to device
     channel_bufs = [_to_device(backend, channel_bufs_cpu[c]) for c in 1:n_ch]
     channel_fft_out = [_to_device(backend, channel_fft_out_cpu[c]) for c in 1:n_ch]
 
+    # FFT/IFFT plans — created on device arrays so CUFFT dispatches for GPU
+    fft_plans = [plan_fft(channel_bufs[c]) for c in 1:n_ch]
+    ifft_plans = [plan_ifft(channel_fft_out[c]) for c in 1:n_ch]
+
     # Twiddle tables: tw_d[n+1] = cispi(-2 * off_d * n / M_d) for n in 0:H_d-1
-    twiddle_1d = Vector{NTuple{3, Vector{CT}}}(undef, n_ch)
+    # Compute on CPU, then transfer to device
+    twiddle_1d_cpu = Vector{NTuple{3, Vector{CT}}}(undef, n_ch)
     for c in 1:n_ch
         off = offsets[c]
         tw = ntuple(3) do d
@@ -572,8 +574,11 @@ function plan_centering_fold(::Type{T}, centering::CenteringType,
                 CT[cispi(T(-2 * off[d] * n / M[d])) for n in 0:H[d]-1]
             end
         end
-        twiddle_1d[c] = tw
+        twiddle_1d_cpu[c] = tw
     end
+
+    # Transfer twiddle vectors to device
+    twiddle_1d = [ntuple(d -> _to_device(backend, twiddle_1d_cpu[c][d]), 3) for c in 1:n_ch]
 
     # Sign table: signs[(ez*4+ey*2+ex)+1] = (-1)^(off·ε)
     sign_table = Vector{NTuple{8,Int}}(undef, n_ch)

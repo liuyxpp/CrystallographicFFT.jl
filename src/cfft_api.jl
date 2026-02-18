@@ -19,6 +19,10 @@ import ..auto_L, ..plan_forward, ..plan_backward
 import ..plan_centered_forward, ..plan_centered_backward
 import ..fft_reconstruct!, ..execute_backward!
 import ..fft_reconstruct_centered!, ..execute_centered_backward!
+import ..copy_real_to_complex_kernel!, ..copy_complex_to_real_kernel!
+
+import KernelAbstractions
+using KernelAbstractions: get_backend, CPU as KA_CPU
 
 # ── Exports ──────────────────────────────────────────────────────────────────
 
@@ -31,6 +35,17 @@ export make_diffusion_kernel, update_diffusion_kernel!
 export cfft_k2
 export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size
 export subgrid_to_fullgrid!, fullgrid_to_subgrid!
+
+# ── Backend inference (extensible by CUDA extension) ─────────────────────────
+
+"""
+    _infer_backend(array_type) → KernelAbstractions backend
+
+Return the KA backend for the given array type.
+Defaults to `CPU()`. Overridden by CUDAExt for `CuArray`.
+"""
+_infer_backend(::Type{<:AbstractArray}) = KA_CPU()
+_infer_backend(::Type{<:Array}) = KA_CPU()
 
 # ── Abstract types ───────────────────────────────────────────────────────────
 
@@ -201,13 +216,14 @@ function plan_cfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
                     method::Symbol=:auto,
                     array_type::Type{<:AbstractArray}=Array) where D
     T = _infer_eltype(array_type)
+    backend = _infer_backend(array_type)
     ops_s, spec_asu, n_spec, L, M, fill_map, use_centered =
         _plan_geometry(N, sg_num, dim; method)
 
     if use_centered
-        fwd = plan_centered_forward(T, spec_asu, ops_s)
+        fwd = plan_centered_forward(T, spec_asu, ops_s; backend)
     else
-        fwd = plan_forward(T, spec_asu, ops_s)
+        fwd = plan_forward(T, spec_asu, ops_s; backend)
     end
     return CFFTPlan(fwd, ops_s, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
 end
@@ -225,10 +241,16 @@ function plan_icfft(fwd_plan::CFFTPlan)
     T = _plan_eltype(fwd_plan)
     ops_s = fwd_plan.ops_shifted
     spec_asu = fwd_plan.spec_asu
-    if fwd_plan.fwd isa CenteredForwardPlan
-        bwd = plan_centered_backward(T, spec_asu, ops_s)
+    # Infer backend from existing forward plan buffers
+    backend = if fwd_plan.fwd isa CenteredForwardPlan
+        get_backend(fwd_plan.fwd.f0_buffer)
     else
-        bwd = plan_backward(T, spec_asu, ops_s)
+        get_backend(fwd_plan.fwd.input_buffer)
+    end
+    if fwd_plan.fwd isa CenteredForwardPlan
+        bwd = plan_centered_backward(T, spec_asu, ops_s; backend)
+    else
+        bwd = plan_backward(T, spec_asu, ops_s; backend)
     end
     return ICFFTPlan(bwd, spec_asu, fwd_plan.n_spec,
                      fwd_plan.sg_num, fwd_plan.dim,
@@ -244,9 +266,10 @@ function plan_icfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
                      method::Symbol=:auto,
                      array_type::Type{<:AbstractArray}=Array) where D
     T = _infer_eltype(array_type)
+    backend = _infer_backend(array_type)
     ops_s, spec_asu, n_spec, L, M, fill_map, _ =
         _plan_geometry(N, sg_num, dim; method)
-    bwd = plan_backward(T, spec_asu, ops_s)
+    bwd = plan_backward(T, spec_asu, ops_s; backend)
     return ICFFTPlan(bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
 end
 
@@ -263,16 +286,17 @@ function plan_cfft_pair(N::NTuple{D,Int}, sg_num::Int, dim::Int;
                          method::Symbol=:auto,
                          array_type::Type{<:AbstractArray}=Array) where D
     T = _infer_eltype(array_type)
+    backend = _infer_backend(array_type)
     ops_s, spec_asu, n_spec, L, M, fill_map, use_centered =
         _plan_geometry(N, sg_num, dim; method)
 
     if use_centered
-        fwd = plan_centered_forward(T, spec_asu, ops_s)
-        bwd = plan_centered_backward(T, spec_asu, ops_s)
+        fwd = plan_centered_forward(T, spec_asu, ops_s; backend)
+        bwd = plan_centered_backward(T, spec_asu, ops_s; backend)
         return CenteredCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
     else
-        fwd = plan_forward(T, spec_asu, ops_s)
-        bwd = plan_backward(T, spec_asu, ops_s)
+        fwd = plan_forward(T, spec_asu, ops_s; backend)
+        bwd = plan_backward(T, spec_asu, ops_s; backend)
         return GeneralCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
     end
 end
@@ -314,24 +338,44 @@ end
 
 function _cfft_general!(F̂, fwd::ForwardPlan, f0, M, n_spec)
     M_vol = prod(M)
-    @inbounds @simd for i in 1:M_vol
-        fwd.input_buffer[i] = complex(f0[i])
+    backend = get_backend(fwd.input_buffer)
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:M_vol
+            fwd.input_buffer[i] = complex(f0[i])
+        end
+    else
+        copy_real_to_complex_kernel!(backend)(
+            fwd.input_buffer, f0; ndrange=M_vol)
+        KernelAbstractions.synchronize(backend)
     end
     fft_reconstruct!(fwd)
-    @inbounds @simd for i in 1:n_spec
-        F̂[i] = fwd.output_buffer[i]
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:n_spec
+            F̂[i] = fwd.output_buffer[i]
+        end
+    else
+        copyto!(F̂, fwd.output_buffer)
     end
     return F̂
 end
 
 function _cfft_centered!(F̂, fwd::CenteredForwardPlan, f0, M, n_spec)
     M_vol = prod(M)
-    @inbounds for k in 1:M[3], j in 1:M[2], i in 1:M[1]
-        fwd.f0_buffer[i,j,k] = f0[i,j,k]
+    backend = get_backend(fwd.f0_buffer)
+    if backend isa KA_CPU
+        @inbounds for k in 1:M[3], j in 1:M[2], i in 1:M[1]
+            fwd.f0_buffer[i,j,k] = f0[i,j,k]
+        end
+    else
+        copyto!(fwd.f0_buffer, f0)
     end
     fft_reconstruct_centered!(fwd)
-    @inbounds @simd for i in 1:n_spec
-        F̂[i] = fwd.krfft_plan.output_buffer[i]
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:n_spec
+            F̂[i] = fwd.krfft_plan.output_buffer[i]
+        end
+    else
+        copyto!(F̂, fwd.krfft_plan.output_buffer)
     end
     return F̂
 end
@@ -374,8 +418,15 @@ end
 function _icfft_general!(f0, bwd::BackwardPlan, F̂, M)
     M_vol = prod(M)
     f0_buf = execute_backward!(bwd, F̂)
-    @inbounds @simd for i in 1:M_vol
-        f0[i] = real(f0_buf[i])
+    backend = get_backend(f0_buf)
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:M_vol
+            f0[i] = real(f0_buf[i])
+        end
+    else
+        copy_complex_to_real_kernel!(backend)(
+            f0, f0_buf; ndrange=M_vol)
+        KernelAbstractions.synchronize(backend)
     end
     return f0
 end
@@ -383,8 +434,15 @@ end
 function _icfft_centered!(f0, bwd::CenteredBackwardPlan, F̂, M)
     M_vol = prod(M)
     f0_buf = execute_centered_backward!(bwd, F̂)
-    @inbounds @simd for i in 1:M_vol
-        f0[i] = real(f0_buf[i])
+    backend = get_backend(f0_buf)
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:M_vol
+            f0[i] = real(f0_buf[i])
+        end
+    else
+        copy_complex_to_real_kernel!(backend)(
+            f0, f0_buf; ndrange=M_vol)
+        KernelAbstractions.synchronize(backend)
     end
     return f0
 end
