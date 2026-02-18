@@ -131,6 +131,9 @@ struct CenteringFoldPlan{T<:AbstractFloat, P, IP, BP, BIP,
     # ── Twiddle factors (per-channel, per-dimension, on device) ──
     twiddle_1d::Vector{NTuple{3, VT}}
     sign_table::Vector{NTuple{8, Int}}  # small constants, stays CPU
+
+    # ── GPU fused assemble: parity → channel index (0=dead) ──
+    alive_mask::Vector{Int32}           # (8,) stays on CPU, transferred at execute
 end
 
 # ── Centered Forward Plan (composition) ──────────────────────────────────────

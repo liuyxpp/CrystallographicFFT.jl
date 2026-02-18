@@ -39,7 +39,7 @@ end
     @inbounds Y[q] = val
 end
 
-# ── Fill F_work = [F; conj(F)] ───────────────────────────────────────────────
+# ── Fill F_work = [F; conj(F)] (CPU path only after Phase B) ─────────────────
 
 @kernel function fill_fwork_kernel!(F_work, @Const(F_spec), n)
     i = @index(Global)
@@ -49,7 +49,34 @@ end
     end
 end
 
-# ── Assemble G₀ from channel FFT outputs ─────────────────────────────────────
+# ── Fused inverse reconstruction (GPU: no F_work buffer needed) ──────────────
+#
+#  Reuses existing inv_work_idx layout:
+#    widx[k] in 1..n_spec    → F_spec[idx]         (direct)
+#    widx[k] in n_spec+1..2n → conj(F_spec[idx-n])  (conjugate)
+#
+# Eliminates fill_fwork_kernel! + F_work buffer entirely on GPU.
+
+@kernel function inv_reconstruct_fused_kernel!(Y, @Const(F_spec),
+                                               @Const(widx), @Const(w),
+                                               d, n_spec::Int32)
+    q = @index(Global)
+    CT = eltype(Y)
+    base = (q - 1) * d
+    val = zero(CT)
+    @inbounds for a in 1:d
+        k = base + a
+        idx = widx[k]
+        if idx <= n_spec
+            val += w[k] * F_spec[idx]
+        else
+            val += w[k] * conj(F_spec[idx - n_spec])
+        end
+    end
+    @inbounds Y[q] = val
+end
+
+# ── Assemble G₀ from channel FFT outputs (per-channel, legacy) ───────────────
 
 @kernel function assemble_g0_channel_kernel!(G0, @Const(fft_out),
                                               off1::Int32, off2::Int32, off3::Int32,
@@ -63,6 +90,39 @@ end
         h2 = 2 * iy + off2
         h3 = 2 * iz + off3
         G0[h1 + 1, h2 + 1, h3 + 1] = fft_out[ix + 1, iy + 1, iz + 1]
+    end
+end
+
+# ── Fused assemble G₀ from batch FFT output (GPU: single kernel over M_vol) ──
+#
+# Replaces fill!(G0, 0) + n_ch separate assemble_g0_channel_kernel! calls
+# with a single kernel that iterates over ALL M_vol positions.
+# alive_mask[parity+1] maps 3-bit parity (εx + 2εy + 4εz) to channel index
+# (1..n_ch = alive channel, 0 = dead → write zero).
+
+@kernel function assemble_g0_fused_kernel!(G0, @Const(batch_fft_out),
+                                            @Const(alive_mask),
+                                            M1::Int32, M2::Int32, M3::Int32,
+                                            H1::Int32, H2::Int32, H3::Int32)
+    lin = @index(Global)
+    @inbounds begin
+        m1 = ((lin - 1) % M1)
+        m2 = (((lin - 1) ÷ M1) % M2)
+        m3 = ((lin - 1) ÷ (M1 * M2))
+
+        # 3-bit parity: εx + 2*εy + 4*εz
+        parity = (m1 & 1) + ((m2 & 1) << 1) + ((m3 & 1) << 2)
+        ch = alive_mask[parity + 1]
+
+        if ch > Int32(0)
+            # This parity has an alive channel: read from batch_fft_out
+            ix = m1 >> 1  # = (m1 - off) ÷ 2, since off = m1 & 1 for alive
+            iy = m2 >> 1
+            iz = m3 >> 1
+            G0[m1 + 1, m2 + 1, m3 + 1] = batch_fft_out[ix + 1, iy + 1, iz + 1, ch]
+        else
+            G0[m1 + 1, m2 + 1, m3 + 1] = zero(eltype(G0))
+        end
     end
 end
 

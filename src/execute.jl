@@ -160,10 +160,9 @@ function _inv_reconstruct!(bplan::BackwardPlan{T}, F_spec::AbstractVector{<:Comp
             Y[q] = val
         end
     else
-        # Fill F_work on device
-        fill_fwork_kernel!(backend)(F_work, F_spec, n; ndrange=n)
-        # Inverse reconstruct on device
-        inv_reconstruct_kernel!(backend)(Y, F_work, widx, w, d; ndrange=M_vol)
+        # GPU: fused inv_reconstruct — skip F_work, read F_spec directly
+        inv_reconstruct_fused_kernel!(backend)(
+            Y, F_spec, widx, w, d, Int32(n); ndrange=M_vol)
     end
 end
 
@@ -341,11 +340,12 @@ end
 function assemble_G0!(G0::AbstractArray{<:Complex, 3}, plan::CenteringFoldPlan)
     H1, H2, H3 = plan.H
     H_vol = H1 * H2 * H3
-
-    fill!(G0, zero(eltype(G0)))
+    M1, M2, M3 = plan.M
+    M_vol = M1 * M2 * M3
 
     backend = get_backend(G0)
     if backend isa CPU
+        fill!(G0, zero(eltype(G0)))
         @inbounds for c in 1:plan.n_channels
             off = plan.offsets[c]
             fft_out = plan.channel_fft_out[c]
@@ -357,15 +357,14 @@ function assemble_G0!(G0::AbstractArray{<:Complex, 3}, plan::CenteringFoldPlan)
             end
         end
     else
-        for c in 1:plan.n_channels
-            off = plan.offsets[c]
-            fft_out = plan.channel_fft_out[c]
-            assemble_g0_channel_kernel!(backend)(
-                G0, fft_out,
-                Int32(off[1]), Int32(off[2]), Int32(off[3]),
-                Int32(H1), Int32(H2), Int32(H3);
-                ndrange=H_vol)
-        end
+        # GPU: fused assemble — single kernel, no fill needed
+        alive_mask_dev = _to_device(backend, plan.alive_mask)
+
+        assemble_g0_fused_kernel!(backend)(
+            G0, plan.batch_fft_out, alive_mask_dev,
+            Int32(M1), Int32(M2), Int32(M3),
+            Int32(H1), Int32(H2), Int32(H3);
+            ndrange=M_vol)
     end
 end
 
