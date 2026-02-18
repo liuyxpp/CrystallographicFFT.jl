@@ -342,6 +342,12 @@ include("test_helpers.jl")
         @testset "Plan dispatch" begin
             fwd = plan_rcfft(N16, 221, 3)
             @test fwd isa RCFFTPlan
+
+            # Centered groups also work
+            fwd_f = plan_rcfft(N16, 225, 3)
+            @test fwd_f isa RCFFTPlan
+            fwd_i = plan_rcfft(N16, 229, 3)
+            @test fwd_i isa RCFFTPlan
             @test subgrid_size(fwd) == (8, 8, 8)
             @test fullgrid_size(fwd) == N16
             @test stride_factors(fwd) == (2, 2, 2)
@@ -361,6 +367,8 @@ include("test_helpers.jl")
                 (47,  "Pmmm"),
                 (2,   "P-1"),
                 (123, "P4/mmm"),
+                (225, "Fm-3m"),
+                (229, "Im-3m"),
             ]
                 @testset "$name (SG$sg)" begin
                     p = prep[sg]
@@ -379,7 +387,8 @@ include("test_helpers.jl")
         end
 
         @testset "rcfft! ≈ cfft!" begin
-            for (sg, name) in [(221, "Pm-3m"), (47, "Pmmm"), (2, "P-1")]
+            for (sg, name) in [(221, "Pm-3m"), (47, "Pmmm"), (2, "P-1"),
+                               (225, "Fm-3m"), (229, "Im-3m")]
                 @testset "$name (SG$sg)" begin
                     p = prep[sg]
                     pair_c = plan_cfft_pair(N16, sg, 3; method=:general)
@@ -399,7 +408,8 @@ include("test_helpers.jl")
         end
 
         @testset "SCFT diffusion" begin
-            for (sg, name) in [(221, "Pm-3m"), (47, "Pmmm"), (10, "P2/m")]
+            for (sg, name) in [(221, "Pm-3m"), (47, "Pmmm"), (10, "P2/m"),
+                               (225, "Fm-3m"), (229, "Im-3m")]
                 @testset "$name (SG$sg)" begin
                     p = prep[sg]
                     pair = plan_rcfft_pair(N16, sg, 3)

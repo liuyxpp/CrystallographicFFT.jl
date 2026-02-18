@@ -36,13 +36,15 @@ function bench(f, args...; n_warmup=N_WARMUP, n_trials=N_TRIALS)
     return median(times)
 end
 
-# Space groups to benchmark (General/P lattice only)
+# Space groups to benchmark (General + Centered)
 const GROUPS = [
     (221, "Pm-3m",  48),
     (47,  "Pmmm",    8),
     (123, "P4/mmm", 16),
     (10,  "P2/m",    4),
     (2,   "P-1",     2),
+    (225, "Fm-3m",  48),  # F-centered
+    (229, "Im-3m",  48),  # I-centered
 ]
 
 function run_benchmark(N_val::Int)

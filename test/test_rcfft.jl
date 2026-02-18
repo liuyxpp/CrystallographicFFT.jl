@@ -16,9 +16,9 @@ include("test_helpers.jl")
     lattice = Matrix{Float64}(I, 3, 3)
     Δs = 0.05
 
-    # Pre-compute shifted ops for general groups only
+    # Pre-compute shifted ops for all test groups (general + centered)
     prep = Dict{Int, NamedTuple}()
-    for sg in [221, 47, 2, 123, 10]
+    for sg in [221, 47, 2, 123, 10, 225, 229]
         ops = get_ops(sg, 3, N)
         _, ops_s = find_optimal_shift(ops, N)
         spec = calc_spectral_asu(ops_s, 3, N)
@@ -57,6 +57,8 @@ include("test_helpers.jl")
             (2,   "P-1"),
             (123, "P4/mmm"),
             (10,  "P2/m"),
+            (225, "Fm-3m"),
+            (229, "Im-3m"),
         ]
             @testset "$name (SG$sg)" begin
                 p = prep[sg]
@@ -82,6 +84,8 @@ include("test_helpers.jl")
             (47,  "Pmmm"),
             (2,   "P-1"),
             (123, "P4/mmm"),
+            (225, "Fm-3m"),
+            (229, "Im-3m"),
         ]
             @testset "$name (SG$sg)" begin
                 p = prep[sg]
@@ -111,6 +115,8 @@ include("test_helpers.jl")
             (221, "Pm-3m"),
             (47,  "Pmmm"),
             (2,   "P-1"),
+            (225, "Fm-3m"),
+            (229, "Im-3m"),
         ]
             @testset "$name (SG$sg)" begin
                 p = prep[sg]
@@ -136,6 +142,8 @@ include("test_helpers.jl")
             (221, "Pm-3m"),
             (47,  "Pmmm"),
             (10,  "P2/m"),
+            (225, "Fm-3m"),
+            (229, "Im-3m"),
         ]
             @testset "$name (SG$sg)" begin
                 p = prep[sg]

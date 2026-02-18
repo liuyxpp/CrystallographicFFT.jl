@@ -602,7 +602,8 @@ _plan_eltype(::RCFFTPlan) = Float64
     plan_rcfft(N, sg_num, dim; array_type=Array) → RCFFTPlan
 
 Construct a forward-only real CFFT plan using rfft.
-Only supports general (P) lattices; for centered lattices use `plan_cfft`.
+Supports all space groups (general and centered lattices).
+Always uses the general reconstruction path internally.
 """
 function plan_rcfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
                      array_type::Type{<:AbstractArray}=Array) where D
@@ -659,7 +660,8 @@ end
     plan_rcfft_pair(N, sg_num, dim; array_type=Array) → GeneralRCFFTPairPlan
 
 Construct a bidirectional real CFFT plan using rfft/irfft.
-Only supports general (P) lattices.
+Supports all space groups (general and centered lattices).
+Always uses the general reconstruction path internally.
 """
 function plan_rcfft_pair(N::NTuple{D,Int}, sg_num::Int, dim::Int;
                           array_type::Type{<:AbstractArray}=Array) where D
