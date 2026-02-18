@@ -336,4 +336,88 @@ include("test_helpers.jl")
         end
     end
 
+    # ── 9. Real CFFT (rcfft/ircfft) ──────────────────────────────────────
+    @testset "Real CFFT (rcfft/ircfft)" begin
+
+        @testset "Plan dispatch" begin
+            fwd = plan_rcfft(N16, 221, 3)
+            @test fwd isa RCFFTPlan
+            @test subgrid_size(fwd) == (8, 8, 8)
+            @test fullgrid_size(fwd) == N16
+            @test stride_factors(fwd) == (2, 2, 2)
+            @test cfft_asu_size(fwd) > 0
+
+            bwd = plan_ircfft(fwd)
+            @test bwd isa IRCFFTPlan
+            @test subgrid_size(bwd) == (8, 8, 8)
+
+            pair = plan_rcfft_pair(N16, 221, 3)
+            @test pair isa GeneralRCFFTPairPlan
+        end
+
+        @testset "Roundtrip" begin
+            for (sg, name) in [
+                (221, "Pm-3m"),
+                (47,  "Pmmm"),
+                (2,   "P-1"),
+                (123, "P4/mmm"),
+            ]
+                @testset "$name (SG$sg)" begin
+                    p = prep[sg]
+                    pair = plan_rcfft_pair(N16, sg, 3)
+                    L = stride_factors(pair)
+                    f0 = extract_subgrid(p.u, N16, collect(L))
+
+                    F̂ = Vector{ComplexF64}(undef, cfft_asu_size(pair))
+                    rcfft!(F̂, pair, f0)
+                    f0_out = zeros(subgrid_size(pair)...)
+                    ircfft!(f0_out, pair, F̂)
+
+                    @test maximum(abs.(f0 .- f0_out)) < 1e-10
+                end
+            end
+        end
+
+        @testset "rcfft! ≈ cfft!" begin
+            for (sg, name) in [(221, "Pm-3m"), (47, "Pmmm"), (2, "P-1")]
+                @testset "$name (SG$sg)" begin
+                    p = prep[sg]
+                    pair_c = plan_cfft_pair(N16, sg, 3; method=:general)
+                    pair_r = plan_rcfft_pair(N16, sg, 3)
+
+                    L = stride_factors(pair_c)
+                    f0 = extract_subgrid(p.u, N16, collect(L))
+
+                    F̂_c = Vector{ComplexF64}(undef, cfft_asu_size(pair_c))
+                    F̂_r = Vector{ComplexF64}(undef, cfft_asu_size(pair_r))
+                    cfft!(F̂_c, pair_c, f0)
+                    rcfft!(F̂_r, pair_r, f0)
+
+                    @test maximum(abs.(F̂_c .- F̂_r)) < 1e-12
+                end
+            end
+        end
+
+        @testset "SCFT diffusion" begin
+            for (sg, name) in [(221, "Pm-3m"), (47, "Pmmm"), (10, "P2/m")]
+                @testset "$name (SG$sg)" begin
+                    p = prep[sg]
+                    pair = plan_rcfft_pair(N16, sg, 3)
+                    L = stride_factors(pair)
+                    f0 = extract_subgrid(p.u, N16, collect(L))
+
+                    K = make_diffusion_kernel(pair, Δs, lattice)
+                    F̂ = Vector{ComplexF64}(undef, cfft_asu_size(pair))
+                    f0_new = copy(f0)
+                    rcfft!(F̂, pair, f0_new)
+                    @. F̂ *= K
+                    ircfft!(f0_new, pair, F̂)
+
+                    f0_ref = fullgrid_reference(p.u, N16, Δs, lattice, collect(L))
+                    @test maximum(abs.(f0_new .- f0_ref)) < 1e-10
+                end
+            end
+        end
+    end
+
 end

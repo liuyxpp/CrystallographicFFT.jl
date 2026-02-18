@@ -27,6 +27,9 @@ export GeneralCFFTPairPlan, CenteredCFFTPairPlan
 export CFFTPlan, ICFFTPlan
 export plan_cfft, plan_icfft, plan_cfft_pair
 export cfft!, icfft!
+export RCFFTPlan, IRCFFTPlan, GeneralRCFFTPairPlan
+export plan_rcfft, plan_ircfft, plan_rcfft_pair
+export rcfft!, ircfft!
 export make_diffusion_kernel, update_diffusion_kernel!
 export cfft_k2
 export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size

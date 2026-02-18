@@ -641,3 +641,110 @@ function execute_centered_backward!(bplan::CenteredBackwardPlan,
 
     return bplan.f0_buffer
 end
+
+# ============================================================================
+# Phase 4 — Real-valued (rfft/irfft) execute-time functions
+# ============================================================================
+
+# ── Real Forward pipeline ────────────────────────────────────────────────────
+
+"""
+    rfft_reconstruct!(plan::RealForwardPlan)
+
+Combined rfft + reconstruct for forward real-valued CFFT.
+Assumes subgrid data is already in `plan.input_buffer`.
+Writes spectral ASU result to `plan.output_buffer`.
+"""
+function rfft_reconstruct!(plan::RealForwardPlan)
+    # 1. rfft: real M³ → complex M̂₁×M₂×M₃
+    mul!(plan.work_view, plan.rfft_plan, plan.input_view)
+
+    # 2. Reconstruct spectral ASU from rfft half-spectrum
+    _reconstruct_rfft!(plan)
+
+    return plan.output_buffer
+end
+
+"""General rfft-aware reconstruction (sign-encoded indices)."""
+function _reconstruct_rfft!(plan::RealForwardPlan{T}) where T
+    n_ops = plan.n_ops
+    n_spec = plan.n_spec
+    buf = plan.work_buffer
+    idx = plan.recon_fiber_idx
+    w = plan.recon_weight
+    out = plan.output_buffer
+
+    backend = get_backend(buf)
+    if backend isa CPU
+        @inbounds for h in 1:n_spec
+            val = zero(Complex{T})
+            base = (h - 1) * n_ops
+            for g in 1:n_ops
+                k = base + g
+                i = idx[k]
+                if i > Int32(0)
+                    val += w[k] * buf[i]
+                else
+                    val += w[k] * conj(buf[-i])
+                end
+            end
+            out[h] = val
+        end
+    else
+        kernel = reconstruct_rfft_kernel!(backend)
+        kernel(out, buf, idx, w, n_ops; ndrange=n_spec)
+    end
+    return out
+end
+
+# ── Real Backward pipeline ───────────────────────────────────────────────────
+
+"""
+    execute_real_backward!(bplan::RealBackwardPlan, F_spec)
+
+Execute backward transform: spectral ASU → real subgrid via irfft.
+Returns `bplan.f0_buffer`.
+"""
+function execute_real_backward!(bplan::RealBackwardPlan,
+                                F_spec::AbstractVector{<:Complex})
+    # 1. Inverse reconstruction → half-spectrum
+    _inv_reconstruct_rfft!(bplan, F_spec)
+
+    # 2. irfft: complex M̂₁×M₂×M₃ → real M³
+    mul!(bplan.f0_view, bplan.irfft_plan, bplan.Y_view)
+
+    return bplan.f0_buffer
+end
+
+"""SoA rfft-aware inverse reconstruction: F_spec → Y₀(half-spectrum)."""
+function _inv_reconstruct_rfft!(bplan::RealBackwardPlan{T},
+                                 F_spec::AbstractVector{<:Complex}) where T
+    d = bplan.d
+    M̂_vol = prod(bplan.M̂)
+    Y = bplan.Y_buffer
+    widx = bplan.inv_work_idx
+    w = bplan.inv_weight
+
+    backend = get_backend(Y)
+    if backend isa CPU
+        # Sign-encoded SoA gather-multiply-accumulate
+        @inbounds for q in 1:M̂_vol
+            base = (q - 1) * d
+            val = zero(Complex{T})
+            for a in 1:d
+                k = base + a
+                i = widx[k]
+                if i > Int32(0)
+                    val += w[k] * F_spec[i]
+                else
+                    val += w[k] * conj(F_spec[-i])
+                end
+            end
+            Y[q] = val
+        end
+    else
+        # GPU: sign-encoded kernel — no F_work buffer needed
+        inv_reconstruct_rfft_kernel!(backend)(
+            Y, F_spec, widx, w, d; ndrange=M̂_vol)
+    end
+end

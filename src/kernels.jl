@@ -369,3 +369,45 @@ end
     i = @index(Global)
     @inbounds dst[i] = real(src[i])
 end
+
+# ── rfft-aware forward reconstruction ────────────────────────────────────────
+# Sign-encoded indices: positive = direct, negative = conjugate
+
+@kernel function reconstruct_rfft_kernel!(out, @Const(buf), @Const(idx),
+                                           @Const(w), n_ops)
+    h = @index(Global)
+    CT = eltype(out)
+    val = zero(CT)
+    base = (h - 1) * n_ops
+    @inbounds for g in 1:n_ops
+        k = base + g
+        i = idx[k]
+        if i > Int32(0)
+            val += w[k] * buf[i]
+        else
+            val += w[k] * conj(buf[-i])
+        end
+    end
+    @inbounds out[h] = val
+end
+
+# ── rfft-aware inverse reconstruction ────────────────────────────────────────
+# Sign-encoded: positive = F_spec[idx], negative = conj(F_spec[-idx])
+
+@kernel function inv_reconstruct_rfft_kernel!(Y, @Const(F_spec),
+                                               @Const(widx), @Const(w), d)
+    q = @index(Global)
+    CT = eltype(Y)
+    base = (q - 1) * d
+    val = zero(CT)
+    @inbounds for a in 1:d
+        k = base + a
+        i = widx[k]
+        if i > Int32(0)
+            val += w[k] * F_spec[i]
+        else
+            val += w[k] * conj(F_spec[-i])
+        end
+    end
+    @inbounds Y[q] = val
+end

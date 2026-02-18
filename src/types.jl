@@ -187,3 +187,89 @@ struct CenteredBackwardPlan{T<:AbstractFloat,
     M::NTuple{3, Int}
     n_spec::Int
 end
+
+# ── Real Forward Plan (rfft-based) ───────────────────────────────────────────
+
+"""
+    RealForwardPlan{T, D, ...}
+
+Device-agnostic forward KRFFT plan using `rfft` for real-valued inputs.
+The FFT output is a half-spectrum of size M̂₁×M₂×M₃ where M̂₁ = M₁÷2+1.
+
+Reconstruction table `recon_fiber_idx` uses sign encoding:
+  idx > 0 → direct access:    weight * rfft_buf[idx]
+  idx < 0 → conjugate access: weight * conj(rfft_buf[-idx])
+"""
+struct RealForwardPlan{T<:AbstractFloat, D,
+                       P,
+                       RA<:AbstractArray{T, D},
+                       CA<:AbstractArray{Complex{T}},
+                       VA<:AbstractVector{Complex{T}},
+                       VI<:AbstractVector{Int32}} <: AbstractFFTs.Plan{T}
+    # ── rfft ──
+    rfft_plan::P
+    input_buffer::RA          # real M³ input (no real→complex copy needed)
+    work_buffer::CA           # rfft output: flat (M̂_vol,)
+    output_buffer::VA         # spectral ASU output (n_spec,)
+
+    # ── Precomputed views ──
+    input_view::RA            # reshape(input_buffer, M) — same array
+    work_view::AbstractArray{Complex{T}}  # reshape(work_buffer, M̂)
+
+    # ── SoA reconstruct table (rfft-aware, on device) ──
+    recon_fiber_idx::VI       # (n_ops × n_spec,) → rfft half-spectrum index (±)
+    recon_weight::VA          # (n_ops × n_spec,) → combined phase weight
+    n_ops::Int
+    n_spec::Int
+
+    # ── Pmmm separable fast path ──
+    is_pmmm::Bool
+    phase_factors::Vector{VA}
+
+    # ── Metadata ──
+    M::NTuple{D, Int}         # subgrid dims
+    M̂::NTuple{D, Int}         # rfft output dims
+    N::NTuple{D, Int}         # full grid dims
+    L::NTuple{D, Int}         # stride factors
+end
+
+# ── Real Backward Plan (irfft-based) ─────────────────────────────────────────
+
+"""
+    RealBackwardPlan{T, D, ...}
+
+Device-agnostic backward KRFFT plan using `irfft` for real-valued outputs.
+Inverse reconstruction fills only the half-spectrum Y₀(M̂₁×M₂×M₃),
+then `irfft` produces the real M³ output directly.
+"""
+struct RealBackwardPlan{T<:AbstractFloat, D,
+                        IP,
+                        RA<:AbstractArray{T, D},
+                        CA<:AbstractArray{Complex{T}},
+                        VA<:AbstractVector{Complex{T}},
+                        VI<:AbstractVector{Int32}} <: AbstractFFTs.Plan{T}
+    # ── irfft ──
+    irfft_plan::IP
+    Y_buffer::CA              # inv_recon output: flat (M̂_vol,)
+    f0_buffer::RA             # irfft output: real M³
+
+    # ── Precomputed views ──
+    Y_view::AbstractArray{Complex{T}}  # reshape(Y_buffer, M̂)
+    f0_view::RA                        # reshape(f0_buffer, M)
+
+    # ── SoA inv_recon table (rfft-aware, half-spectrum only) ──
+    inv_work_idx::VI          # → points into F_spec (positive=direct, negative=conj)
+    inv_weight::VA
+    d::Int                    # fiber length = prod(L)
+    n_spec::Int
+
+    # ── Pmmm separable fast path ──
+    is_separable::Bool
+    inv_phase_factors::Vector{VA}
+
+    # ── Metadata ──
+    M::NTuple{D, Int}
+    M̂::NTuple{D, Int}
+    N::NTuple{D, Int}
+    L::NTuple{D, Int}
+end

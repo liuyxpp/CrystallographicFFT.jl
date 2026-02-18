@@ -15,10 +15,13 @@ const _SpecASU = _SpectralIndexingModule.SpectralIndexing  # the type struct
 # (types.jl, planning.jl, execute.jl are included before this file)
 import ..ForwardPlan, ..BackwardPlan
 import ..CenteredForwardPlan, ..CenteredBackwardPlan, ..CenteringFoldPlan
+import ..RealForwardPlan, ..RealBackwardPlan
 import ..auto_L, ..plan_forward, ..plan_backward
 import ..plan_centered_forward, ..plan_centered_backward
+import ..plan_real_forward, ..plan_real_backward
 import ..fft_reconstruct!, ..execute_backward!
 import ..fft_reconstruct_centered!, ..execute_centered_backward!
+import ..rfft_reconstruct!, ..execute_real_backward!
 import ..copy_real_to_complex_kernel!, ..copy_complex_to_real_kernel!
 
 import KernelAbstractions
@@ -31,6 +34,9 @@ export GeneralCFFTPairPlan, CenteredCFFTPairPlan
 export CFFTPlan, ICFFTPlan
 export plan_cfft, plan_icfft, plan_cfft_pair
 export cfft!, icfft!
+export RCFFTPlan, IRCFFTPlan, GeneralRCFFTPairPlan
+export plan_rcfft, plan_ircfft, plan_rcfft_pair
+export rcfft!, ircfft!
 export make_diffusion_kernel, update_diffusion_kernel!
 export cfft_k2
 export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size
@@ -113,6 +119,59 @@ end
 Bidirectional CFFT plan (Centered path for I/F/C lattices).
 """
 struct CenteredCFFTPairPlan{FP<:CenteredForwardPlan, BP<:CenteredBackwardPlan} <: AbstractCFFTPairPlan
+    fwd::FP
+    bwd::BP
+    spec_asu::_SpecASU
+    n_spec::Int
+    sg_num::Int
+    dim::Int
+    N::NTuple{3,Int}
+    M::NTuple{3,Int}
+    L::NTuple{3,Int}
+    fill_map::Array{Int32}
+end
+
+"""
+    RCFFTPlan{FP} <: AbstractCFFTPlan
+
+Forward-only real CFFT plan using rfft. Use with `rcfft!`.
+"""
+struct RCFFTPlan{FP, SO<:SymOp} <: AbstractCFFTPlan
+    fwd::FP
+    ops_shifted::Vector{SO}
+    spec_asu::_SpecASU
+    n_spec::Int
+    sg_num::Int
+    dim::Int
+    N::NTuple{3,Int}
+    M::NTuple{3,Int}
+    L::NTuple{3,Int}
+    fill_map::Array{Int32}
+end
+
+"""
+    IRCFFTPlan{BP} <: AbstractCFFTPlan
+
+Backward-only real CFFT plan using irfft. Use with `ircfft!`.
+"""
+struct IRCFFTPlan{BP} <: AbstractCFFTPlan
+    bwd::BP
+    spec_asu::_SpecASU
+    n_spec::Int
+    sg_num::Int
+    dim::Int
+    N::NTuple{3,Int}
+    M::NTuple{3,Int}
+    L::NTuple{3,Int}
+    fill_map::Array{Int32}
+end
+
+"""
+    GeneralRCFFTPairPlan <: AbstractCFFTPairPlan
+
+Bidirectional real CFFT plan (General path, rfft/irfft).
+"""
+struct GeneralRCFFTPairPlan{FP<:RealForwardPlan, BP<:RealBackwardPlan} <: AbstractCFFTPairPlan
     fwd::FP
     bwd::BP
     spec_asu::_SpecASU
@@ -532,5 +591,171 @@ end
 _plan_eltype(plan::CFFTPlan{<:ForwardPlan{T}}) where T = T
 _plan_eltype(plan::CFFTPlan{<:CenteredForwardPlan{T}}) where T = T
 _plan_eltype(::CFFTPlan) = Float64
+_plan_eltype(plan::RCFFTPlan{<:RealForwardPlan{T}}) where T = T
+_plan_eltype(::RCFFTPlan) = Float64
+
+# ============================================================================
+# plan_rcfft — forward-only real CFFT
+# ============================================================================
+
+"""
+    plan_rcfft(N, sg_num, dim; array_type=Array) → RCFFTPlan
+
+Construct a forward-only real CFFT plan using rfft.
+Only supports general (P) lattices; for centered lattices use `plan_cfft`.
+"""
+function plan_rcfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
+                     array_type::Type{<:AbstractArray}=Array) where D
+    T = _infer_eltype(array_type)
+    backend = _infer_backend(array_type)
+    ops_s, spec_asu, n_spec, L, M, fill_map, _ =
+        _plan_geometry(N, sg_num, dim; method=:general)
+
+    fwd = plan_real_forward(T, spec_asu, ops_s; backend)
+    return RCFFTPlan(fwd, ops_s, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
+end
+
+# ============================================================================
+# plan_ircfft — backward-only real CFFT
+# ============================================================================
+
+"""
+    plan_ircfft(fwd_plan::RCFFTPlan) → IRCFFTPlan
+
+Construct a backward plan from an existing real forward plan.
+"""
+function plan_ircfft(fwd_plan::RCFFTPlan)
+    T = _plan_eltype(fwd_plan)
+    ops_s = fwd_plan.ops_shifted
+    spec_asu = fwd_plan.spec_asu
+    backend = get_backend(fwd_plan.fwd.input_buffer)
+
+    bwd = plan_real_backward(T, spec_asu, ops_s; backend)
+    return IRCFFTPlan(bwd, spec_asu, fwd_plan.n_spec,
+                      fwd_plan.sg_num, fwd_plan.dim,
+                      fwd_plan.N, fwd_plan.M, fwd_plan.L, fwd_plan.fill_map)
+end
+
+"""
+    plan_ircfft(N, sg_num, dim; array_type=Array) → IRCFFTPlan
+
+Construct a standalone backward real CFFT plan.
+"""
+function plan_ircfft(N::NTuple{D,Int}, sg_num::Int, dim::Int;
+                      array_type::Type{<:AbstractArray}=Array) where D
+    T = _infer_eltype(array_type)
+    backend = _infer_backend(array_type)
+    ops_s, spec_asu, n_spec, L, M, fill_map, _ =
+        _plan_geometry(N, sg_num, dim; method=:general)
+    bwd = plan_real_backward(T, spec_asu, ops_s; backend)
+    return IRCFFTPlan(bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
+end
+
+# ============================================================================
+# plan_rcfft_pair — bidirectional real CFFT
+# ============================================================================
+
+"""
+    plan_rcfft_pair(N, sg_num, dim; array_type=Array) → GeneralRCFFTPairPlan
+
+Construct a bidirectional real CFFT plan using rfft/irfft.
+Only supports general (P) lattices.
+"""
+function plan_rcfft_pair(N::NTuple{D,Int}, sg_num::Int, dim::Int;
+                          array_type::Type{<:AbstractArray}=Array) where D
+    T = _infer_eltype(array_type)
+    backend = _infer_backend(array_type)
+    ops_s, spec_asu, n_spec, L, M, fill_map, _ =
+        _plan_geometry(N, sg_num, dim; method=:general)
+
+    fwd = plan_real_forward(T, spec_asu, ops_s; backend)
+    bwd = plan_real_backward(T, spec_asu, ops_s; backend)
+    return GeneralRCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
+end
+
+# ============================================================================
+# rcfft! — forward real transform
+# ============================================================================
+
+"""
+    rcfft!(F̂, plan, f0)
+
+Real Crystallographic FFT forward transform: `f₀(real M³) → F̂(n_spec)`.
+Uses rfft internally for ~2x speedup over cfft!.
+"""
+function rcfft! end
+
+function rcfft!(F̂::AbstractVector{<:Complex},
+                plan::RCFFTPlan{<:RealForwardPlan},
+                f0::AbstractArray{<:Real})
+    _rcfft_general!(F̂, plan.fwd, f0, plan.n_spec)
+end
+
+function rcfft!(F̂::AbstractVector{<:Complex},
+                plan::GeneralRCFFTPairPlan,
+                f0::AbstractArray{<:Real})
+    _rcfft_general!(F̂, plan.fwd, f0, plan.n_spec)
+end
+
+function _rcfft_general!(F̂, fwd::RealForwardPlan, f0, n_spec)
+    M_vol = prod(fwd.M)
+    backend = get_backend(fwd.input_buffer)
+    # Copy real input directly (no real→complex conversion needed)
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:M_vol
+            fwd.input_buffer[i] = f0[i]
+        end
+    else
+        copyto!(fwd.input_buffer, f0)
+    end
+    rfft_reconstruct!(fwd)
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:n_spec
+            F̂[i] = fwd.output_buffer[i]
+        end
+    else
+        copyto!(F̂, fwd.output_buffer)
+    end
+    return F̂
+end
+
+# ============================================================================
+# ircfft! — backward real transform
+# ============================================================================
+
+"""
+    ircfft!(f0, plan, F̂)
+
+Real Crystallographic FFT inverse transform: `F̂(n_spec) → f₀(real M³)`.
+Uses irfft internally for ~2x speedup over icfft!.
+"""
+function ircfft! end
+
+function ircfft!(f0::AbstractArray{<:AbstractFloat},
+                 plan::IRCFFTPlan{<:RealBackwardPlan},
+                 F̂::AbstractVector{<:Complex})
+    _ircfft_general!(f0, plan.bwd, F̂)
+end
+
+function ircfft!(f0::AbstractArray{<:AbstractFloat},
+                 plan::GeneralRCFFTPairPlan,
+                 F̂::AbstractVector{<:Complex})
+    _ircfft_general!(f0, plan.bwd, F̂)
+end
+
+function _ircfft_general!(f0, bwd::RealBackwardPlan, F̂)
+    M_vol = prod(bwd.M)
+    f0_buf = execute_real_backward!(bwd, F̂)
+    backend = get_backend(f0_buf)
+    # irfft output is already real — direct copy
+    if backend isa KA_CPU
+        @inbounds @simd for i in 1:M_vol
+            f0[i] = f0_buf[i]
+        end
+    else
+        copyto!(f0, f0_buf)
+    end
+    return f0
+end
 
 end  # module CFFTApi

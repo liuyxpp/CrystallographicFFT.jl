@@ -513,6 +513,336 @@ function plan_backward(::Type{T}, spec_asu::SpecASU,
 end
 
 # ============================================================================
+# Phase 4 — Real-valued (rfft/irfft) planning
+# ============================================================================
+
+# ── rfft-aware SoA reconstruction table ──────────────────────────────────────
+
+"""
+    _build_recon_soa_rfft(spec_asu, rep_ops, M_sub, M̂, N, dim)
+
+Build SoA reconstruction table for rfft half-spectrum layout.
+For frequencies with rot_h[1] >= M̂[1], Hermitian-map to (-rot_h mod M)
+and encode conjugation via negative index.
+
+Returns (recon_fiber_idx, recon_weight) with sign-encoded indices.
+"""
+function _build_recon_soa_rfft(spec_asu::SpecASU, rep_ops::Vector{<:SymOp},
+                               M_sub::Vector{Int}, M̂::Vector{Int},
+                               N, dim)
+    n_spec = length(spec_asu.points)
+    n_ops = length(rep_ops)
+    total = n_ops * n_spec
+    M̂1 = M̂[1]
+
+    recon_fiber_idx = Vector{Int32}(undef, total)
+    recon_weight = Vector{ComplexF64}(undef, total)
+
+    rot_h = zeros(Int, dim)
+
+    for (h_idx, _) in enumerate(spec_asu.points)
+        h_vec = get_k_vector(spec_asu, h_idx)
+        for (g_idx, g) in enumerate(rep_ops)
+            # Phase: exp(-2πi h·t_g/N)
+            phase_val = 0.0
+            for d in 1:dim
+                phase_val += h_vec[d] * g.t[d] / N[d]
+            end
+            weight = exp(-im * 2π * phase_val)
+
+            # Rotated frequency: R_g^T h mod M
+            for d in 1:dim
+                rot_h[d] = mod(sum(g.R[d2, d] * h_vec[d2] for d2 in 1:dim), M_sub[d])
+            end
+
+            k = (h_idx - 1) * n_ops + g_idx
+
+            if rot_h[1] < M̂1
+                # Direct access in rfft output
+                lin_idx = 1 + rot_h[1] + M̂1 * rot_h[2]
+                for dd in 3:dim
+                    stride = M̂1
+                    for dd2 in 2:dd-1
+                        stride *= M_sub[dd2]
+                    end
+                    lin_idx += rot_h[dd] * stride
+                end
+                recon_fiber_idx[k] = Int32(lin_idx)
+                recon_weight[k] = weight
+            else
+                # Hermitian map: h' = (-rot_h) mod M → guaranteed h'[1] < M̂1
+                herm = [mod(-rot_h[d], M_sub[d]) for d in 1:dim]
+                lin_idx = 1 + herm[1] + M̂1 * herm[2]
+                for dd in 3:dim
+                    stride = M̂1
+                    for dd2 in 2:dd-1
+                        stride *= M_sub[dd2]
+                    end
+                    lin_idx += herm[dd] * stride
+                end
+                recon_fiber_idx[k] = Int32(-lin_idx)  # negative = conjugate
+                recon_weight[k] = weight
+            end
+        end
+    end
+
+    return recon_fiber_idx, recon_weight
+end
+
+# ── plan_real_forward ────────────────────────────────────────────────────────
+
+"""
+    plan_real_forward(::Type{T}, spec_asu, ops_shifted; backend=CPU()) → RealForwardPlan
+
+Construct a device-agnostic forward KRFFT plan using rfft for real inputs.
+"""
+function plan_real_forward(::Type{T}, spec_asu::SpecASU,
+                           ops_shifted::Vector{<:SymOp};
+                           backend=CPU()) where {T<:AbstractFloat}
+    CT = Complex{T}
+    N = spec_asu.N
+    dim = length(N)
+
+    # 1. Auto L and M
+    L_vec = auto_L(ops_shifted)
+    M_sub = [N[d] ÷ L_vec[d] for d in 1:dim]
+    M_vol = prod(M_sub)
+    n_spec = length(spec_asu.points)
+
+    # rfft output dimensions: first dim halved
+    M̂_sub = copy(M_sub)
+    M̂_sub[1] = M_sub[1] ÷ 2 + 1
+    M̂_vol = prod(M̂_sub)
+
+    # 2. Representative ops
+    rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+    n_ops = prod(L_vec)
+
+    # 3. SoA reconstruction table (rfft-aware, CPU)
+    fiber_idx_cpu, weight_cpu = _build_recon_soa_rfft(
+        spec_asu, rep_ops, M_sub, M̂_sub, N, dim)
+    weight_cpu_T = CT.(weight_cpu)
+
+    # 4. Buffers (CPU first)
+    input_buf_cpu = zeros(T, M_sub...)
+    work_buf_cpu  = zeros(CT, M̂_vol)
+    out_buf_cpu   = zeros(CT, n_spec)
+
+    # 5. Transfer to device
+    input_buf = _to_device(backend, input_buf_cpu)
+    work_buf  = _to_device(backend, work_buf_cpu)
+    out_buf   = _to_device(backend, out_buf_cpu)
+    fiber_idx = _to_device(backend, fiber_idx_cpu)
+    weight_dev = _to_device(backend, weight_cpu_T)
+
+    # 6. Views
+    M_tup = NTuple{dim, Int}(M_sub)
+    M̂_tup = NTuple{dim, Int}(M̂_sub)
+    input_view = reshape(input_buf, M_tup)
+    work_view  = reshape(work_buf, M̂_tup)
+
+    # 7. rfft plan on device array
+    rfft_plan = plan_rfft(input_view)
+
+    # 8. Pmmm detection and phase factors
+    is_pmmm = _is_pmmm_pattern(rep_ops, L_vec, N, dim)
+    VA = typeof(out_buf)
+    if is_pmmm
+        phase_cpu = _build_phase_factors(T, M_sub, N, dim)
+        phase_factors = VA[_to_device(backend, p) for p in phase_cpu]
+    else
+        phase_factors = VA[]
+    end
+
+    N_tup = NTuple{dim, Int}(N)
+    L_tup = NTuple{dim, Int}(L_vec)
+
+    return RealForwardPlan(
+        rfft_plan, input_buf, work_buf, out_buf,
+        input_view, work_view,
+        fiber_idx, weight_dev, n_ops, n_spec,
+        is_pmmm, phase_factors,
+        M_tup, M̂_tup, N_tup, L_tup
+    )
+end
+
+# ── rfft-aware inverse reconstruction table ──────────────────────────────────
+
+"""Build inv_recon table for rfft half-spectrum.
+Only fills entries for q with q[1] ∈ [0, M̂₁-1]."""
+function _build_inv_recon_table_rfft!(inv_spec_idx::Vector{Int32},
+                                      inv_weight_cpu::Vector{ComplexF64},
+                                      inv_conj_flag::Vector{Bool},
+                                      rep_ops::Vector{<:SymOp},
+                                      alphas::Vector{NTuple{3,Int}},
+                                      h_to_spec::Dict{NTuple{3,Int}, Tuple{Int, ComplexF64, Bool}},
+                                      M_sub::Vector{Int}, M̂::Vector{Int},
+                                      N, d::Int, dim::Int)
+    M̂_vol = prod(M̂)
+    B_matrix = zeros(ComplexF64, d, d)
+    h_vecs = [zeros(Int, dim) for _ in 1:d]
+    ipiv = Vector{Int64}(undef, d)
+    rhs = zeros(ComplexF64, d, 1)
+    rhs[1] = 1.0
+    rhs_work = similar(rhs)
+    q_vec = zeros(Int, dim)
+
+    rep_translations = NTuple{3,Int}[(Int(g.t[1]), Int(g.t[2]), Int(g.t[3])) for g in rep_ops]
+    N1, N2, N3 = N[1], N[2], N[3]
+    M̂_tup = Tuple(M̂)
+    ci = CartesianIndices(M̂_tup)
+    li = LinearIndices(M̂_tup)
+
+    for q_cart in ci
+        for dd in 1:dim
+            q_vec[dd] = q_cart[dd] - 1
+        end
+        q_lin = li[q_cart]
+
+        # Full-grid frequencies in this fiber
+        for a in 1:d
+            α = alphas[a]
+            for dd in 1:dim
+                h_vecs[a][dd] = q_vec[dd] + M_sub[dd] * α[dd]
+            end
+        end
+
+        # Build butterfly matrix
+        fill!(B_matrix, zero(ComplexF64))
+        for a in 1:d
+            h = h_vecs[a]
+            for b in 1:d
+                t_b = rep_translations[b]
+                phase_val = h[1] * t_b[1] / N1 + h[2] * t_b[2] / N2 + h[3] * t_b[3] / N3
+                B_matrix[a, b] = cispi(-2 * phase_val)
+            end
+        end
+
+        # Solve B^T · x = e₁
+        copyto!(rhs_work, rhs)
+        LAPACK.getrf!(B_matrix, ipiv)
+        LAPACK.getrs!('T', B_matrix, ipiv, rhs_work)
+
+        # Map to spectral ASU
+        for a in 1:d
+            h = h_vecs[a]
+            h_key = (mod(h[1], N1), mod(h[2], N2), mod(h[3], N3))
+            k = (q_lin - 1) * d + a
+
+            if haskey(h_to_spec, h_key)
+                spec_idx, sym_phase, conj_f = h_to_spec[h_key]
+                inv_spec_idx[k] = Int32(spec_idx)
+                inv_weight_cpu[k] = rhs_work[a] * sym_phase
+                inv_conj_flag[k] = conj_f
+            else
+                inv_spec_idx[k] = Int32(1)
+                inv_weight_cpu[k] = zero(ComplexF64)
+                inv_conj_flag[k] = false
+            end
+        end
+    end
+end
+
+# ── plan_real_backward ───────────────────────────────────────────────────────
+
+"""
+    plan_real_backward(::Type{T}, spec_asu, ops_shifted; backend=CPU()) → RealBackwardPlan
+
+Construct a device-agnostic backward KRFFT plan using irfft.
+Inverse reconstruction only fills the half-spectrum (M̂₁×M₂×M₃).
+"""
+function plan_real_backward(::Type{T}, spec_asu::SpecASU,
+                            ops_shifted::Vector{<:SymOp};
+                            backend=CPU()) where {T<:AbstractFloat}
+    CT = Complex{T}
+    N = spec_asu.N
+    dim = length(N)
+    N_vec = collect(N)
+
+    # 1. L and M
+    L_vec = auto_L(ops_shifted)
+    M_sub = [N[d] ÷ L_vec[d] for d in 1:dim]
+    M_vol = prod(M_sub)
+    n_spec = length(spec_asu.points)
+    d = prod(L_vec)
+
+    # rfft output dimensions
+    M̂_sub = copy(M_sub)
+    M̂_sub[1] = M_sub[1] ÷ 2 + 1
+    M̂_vol = prod(M̂_sub)
+
+    # 2. Representative ops
+    rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+
+    # 3. Spectral reverse lookup
+    h_to_spec = _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)
+
+    # 4. Inverse reconstruction table (rfft half-spectrum)
+    soa_len = d * M̂_vol
+    inv_spec_idx_cpu = Vector{Int32}(undef, soa_len)
+    inv_weight_cpu = Vector{ComplexF64}(undef, soa_len)
+    inv_conj_flag = Vector{Bool}(undef, soa_len)
+
+    alphas = Vector{NTuple{3,Int}}(undef, d)
+    a_idx = 0
+    for x0 in Iterators.product([0:L_vec[dd]-1 for dd in 1:dim]...)
+        a_idx += 1
+        alphas[a_idx] = (x0[1], x0[2], x0[3])
+    end
+    _build_inv_recon_table_rfft!(inv_spec_idx_cpu, inv_weight_cpu, inv_conj_flag,
+                                  rep_ops, alphas, h_to_spec, M_sub, M̂_sub, N, d, dim)
+
+    # 5. SoA work indices (sign-encoded: positive=direct, negative=conjugate)
+    inv_work_idx_cpu = Vector{Int32}(undef, soa_len)
+    for k in 1:soa_len
+        inv_work_idx_cpu[k] = inv_conj_flag[k] ?
+            Int32(-inv_spec_idx_cpu[k]) : inv_spec_idx_cpu[k]
+    end
+    inv_weight_T = CT.(inv_weight_cpu)
+
+    # 6. Buffers
+    Y_buf_cpu = zeros(CT, M̂_vol)
+    f0_buf_cpu = zeros(T, M_sub...)
+
+    # 7. Transfer to device
+    inv_work_idx = _to_device(backend, inv_work_idx_cpu)
+    inv_weight_dev = _to_device(backend, inv_weight_T)
+    Y_buf = _to_device(backend, Y_buf_cpu)
+    f0_buf = _to_device(backend, f0_buf_cpu)
+
+    M_tup = NTuple{dim, Int}(M_sub)
+    M̂_tup = NTuple{dim, Int}(M̂_sub)
+    Y_view = reshape(Y_buf, M̂_tup)
+    f0_view = reshape(f0_buf, M_tup)
+
+    # 8. irfft plan on device array
+    irfft_plan = plan_irfft(Y_view, M_sub[1])
+
+    # 9. Pmmm detection
+    is_sep = _is_pmmm_pattern(rep_ops, L_vec, N, dim)
+    VA = typeof(Y_buf)
+    if is_sep
+        inv_phase_factors = Vector{VA}(undef, dim)
+        for dd in 1:dim
+            pf_cpu = [CT(cispi(-2 * q / N[dd])) for q in 0:M_sub[dd]-1]
+            inv_phase_factors[dd] = _to_device(backend, pf_cpu)
+        end
+    else
+        inv_phase_factors = VA[]
+    end
+
+    N_tup = NTuple{dim, Int}(N)
+    L_tup = NTuple{dim, Int}(L_vec)
+
+    return RealBackwardPlan(
+        irfft_plan, Y_buf, f0_buf, Y_view, f0_view,
+        inv_work_idx, inv_weight_dev, d, n_spec,
+        is_sep, inv_phase_factors,
+        M_tup, M̂_tup, N_tup, L_tup
+    )
+end
+
+# ============================================================================
 # Phase 3 — Centering fold planning
 # ============================================================================
 
