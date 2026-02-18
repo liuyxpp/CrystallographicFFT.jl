@@ -12,7 +12,7 @@ using FFTW
 using LinearAlgebra
 using LinearAlgebra: LAPACK
 
-using .SymmetryOps: SymOp, CenteringType, CentP, detect_centering_type
+using .SymmetryOps: SymOp, CenteringType, CentP, CentI, CentF, CentC, CentA, detect_centering_type
 using .SpectralIndexing: get_k_vector
 const SpecASU = SpectralIndexing.SpectralIndexing  # type alias to avoid module/type name collision
 
@@ -508,5 +508,287 @@ function plan_backward(::Type{T}, spec_asu::SpecASU,
         inv_work_idx, inv_weight_dev, F_work, d, n_spec,
         is_sep, inv_phase_factors,
         M_tup, N_tup, L_tup
+    )
+end
+
+# ============================================================================
+# Phase 3 — Centering fold planning
+# ============================================================================
+
+"""
+    _alive_offsets(centering) → Vector{NTuple{3,Int}}
+
+Return the parity offsets of alive (non-extinct) frequency classes.
+"""
+function _alive_offsets(centering::CenteringType)
+    if centering == CentI
+        return [(0,0,0), (1,1,0), (1,0,1), (0,1,1)]
+    elseif centering == CentF
+        return [(0,0,0), (1,1,1)]
+    elseif centering == CentC
+        return [(0,0,0), (1,1,0), (0,0,1), (1,1,1)]
+    elseif centering == CentA
+        return [(0,0,0), (0,1,1), (1,0,0), (1,1,1)]
+    else
+        error("Centering fold not applicable for $centering")
+    end
+end
+
+"""
+    plan_centering_fold(::Type{T}, centering, M; backend=CPU()) → CenteringFoldPlan
+
+Construct a device-agnostic centering fold plan for subgrid of dimensions M.
+"""
+function plan_centering_fold(::Type{T}, centering::CenteringType,
+                             M::NTuple{3,Int};
+                             backend=CPU()) where {T<:AbstractFloat}
+    CT = Complex{T}
+    @assert all(iseven, M) "Subgrid dimensions must be even for centering fold"
+    H = M .÷ 2
+
+    offsets = _alive_offsets(centering)
+    n_ch = length(offsets)
+
+    # Per-channel buffers on CPU (then transfer)
+    channel_bufs_cpu = [zeros(CT, H...) for _ in 1:n_ch]
+    channel_fft_out_cpu = [zeros(CT, H...) for _ in 1:n_ch]
+
+    # FFT/IFFT plans
+    fft_plans = [plan_fft(channel_bufs_cpu[c]) for c in 1:n_ch]
+    ifft_plans = [plan_ifft(channel_fft_out_cpu[c]) for c in 1:n_ch]
+
+    # Transfer to device
+    channel_bufs = [_to_device(backend, channel_bufs_cpu[c]) for c in 1:n_ch]
+    channel_fft_out = [_to_device(backend, channel_fft_out_cpu[c]) for c in 1:n_ch]
+
+    # Twiddle tables: tw_d[n+1] = cispi(-2 * off_d * n / M_d) for n in 0:H_d-1
+    twiddle_1d = Vector{NTuple{3, Vector{CT}}}(undef, n_ch)
+    for c in 1:n_ch
+        off = offsets[c]
+        tw = ntuple(3) do d
+            if off[d] == 0
+                ones(CT, H[d])
+            else
+                CT[cispi(T(-2 * off[d] * n / M[d])) for n in 0:H[d]-1]
+            end
+        end
+        twiddle_1d[c] = tw
+    end
+
+    # Sign table: signs[(ez*4+ey*2+ex)+1] = (-1)^(off·ε)
+    sign_table = Vector{NTuple{8,Int}}(undef, n_ch)
+    for c in 1:n_ch
+        off = offsets[c]
+        signs = ntuple(8) do idx
+            ex = (idx - 1) & 1
+            ey = ((idx - 1) >> 1) & 1
+            ez = ((idx - 1) >> 2) & 1
+            1 - 2 * ((off[1]*ex + off[2]*ey + off[3]*ez) & 1)
+        end
+        sign_table[c] = signs
+    end
+
+    # Convert centering enum to Symbol for struct
+    cent_sym = centering == CentI ? :I : centering == CentF ? :F :
+               centering == CentC ? :C : centering == CentA ? :A : :P
+
+    return CenteringFoldPlan(
+        cent_sym, M, H, n_ch, offsets,
+        channel_bufs, fft_plans, ifft_plans, channel_fft_out,
+        twiddle_1d, sign_table
+    )
+end
+
+# ── plan_centered_forward ────────────────────────────────────────────────────
+
+"""
+    plan_centered_forward(::Type{T}, spec_asu, ops_shifted; backend=CPU())
+
+Construct a centered forward CFFT plan.
+Composes: CenteringFoldPlan + ForwardPlan (inner KRFFT for reconstruction).
+"""
+function plan_centered_forward(::Type{T}, spec_asu::SpecASU,
+                               ops_shifted::Vector{<:SymOp};
+                               backend=CPU()) where {T<:AbstractFloat}
+    N = spec_asu.N
+    dim = length(N)
+    @assert dim == 3 "Centered path only supports 3D"
+
+    # Build inner KRFFT plan (operates on M-grid)
+    krfft_plan = plan_forward(T, spec_asu, ops_shifted; backend)
+    M = krfft_plan.M
+
+    # Detect centering
+    cent = detect_centering_type(ops_shifted, NTuple{dim,Int}(N))
+    @assert cent != CentP "Centered path requires non-P centering"
+
+    # Build fold plan
+    fold_plan = plan_centering_fold(T, cent, M; backend)
+
+    # Allocate f₀ buffer (real, on device)
+    f0_buf_cpu = zeros(T, M...)
+    f0_buf = _to_device(backend, f0_buf_cpu)
+
+    # G₀ view = reshape of the inner plan's work_buffer
+    G0_view = reshape(krfft_plan.work_buffer, M)
+
+    return CenteredForwardPlan(krfft_plan, fold_plan, f0_buf, G0_view)
+end
+
+# ── plan_centered_backward ───────────────────────────────────────────────────
+
+"""
+    plan_centered_backward(::Type{T}, spec_asu, ops_shifted; backend=CPU())
+
+Construct a centered backward CFFT plan using CSR orbit-based reconstruction.
+"""
+function plan_centered_backward(::Type{T}, spec_asu::SpecASU,
+                                ops_shifted::Vector{<:SymOp};
+                                backend=CPU()) where {T<:AbstractFloat}
+    CT = Complex{T}
+    N = spec_asu.N
+    dim = length(N)
+    N_vec = collect(N)
+    @assert dim == 3 "Centered path only supports 3D"
+
+    # 1. L, M, d
+    L_vec = auto_L(ops_shifted)
+    M_sub = [N[d] ÷ L_vec[d] for d in 1:dim]
+    M_vol = prod(M_sub)
+    n_spec = length(spec_asu.points)
+    d = prod(L_vec)
+
+    # 2. Representative ops
+    rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+
+    # 3. Spectral reverse lookup
+    h_to_spec = _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)
+
+    # 4. Build M2-style inv_recon (all positions)
+    alphas = Vector{NTuple{3,Int}}(undef, d)
+    a_idx = 0
+    for x0 in Iterators.product([0:L_vec[dd]-1 for dd in 1:dim]...)
+        a_idx += 1
+        alphas[a_idx] = (x0[1], x0[2], x0[3])
+    end
+
+    # Full inv_recon table (spec_idx, weight, conj_flag per fiber entry)
+    full_spec_idx = Vector{Int32}(undef, d * M_vol)
+    full_weight = Vector{ComplexF64}(undef, d * M_vol)
+    full_conj_flag = Vector{Bool}(undef, d * M_vol)
+    _build_inv_recon_table!(full_spec_idx, full_weight, full_conj_flag,
+                            rep_ops, alphas, h_to_spec, M_sub, N, d, dim)
+
+    # 5. Build spatial orbits under G_rem (even-translation ops)
+    M_tup = NTuple{dim, Int}(M_sub)
+    rem_ops = Tuple{Matrix{Int}, Vector{Int}}[]
+    for op in ops_shifted
+        t_int = round.(Int, op.t)
+        if all(mod.(t_int, 2) .== 0)
+            push!(rem_ops, (round.(Int, op.R), t_int .÷ 2))
+        end
+    end
+
+    orbit_id = zeros(Int32, M_vol)
+    orbit_phase = zeros(ComplexF64, M_vol)
+    orbits_rep = Int32[]
+
+    ci = CartesianIndices(M_tup)
+    li = LinearIndices(M_tup)
+
+    for m in 1:M_vol
+        orbit_id[m] != 0 && continue
+        push!(orbits_rep, Int32(m))
+        oid = Int32(length(orbits_rep))
+        orbit_id[m] = oid
+        orbit_phase[m] = complex(1.0)
+
+        # BFS orbit expansion with phase tracking
+        queue = [m]
+        while !isempty(queue)
+            cur = popfirst!(queue)
+            cur0 = cur - 1
+            qv = (mod(cur0, M_sub[1]),
+                  mod(div(cur0, M_sub[1]), M_sub[2]),
+                  div(cur0, M_sub[1] * M_sub[2]))
+            cur_phase = orbit_phase[cur]
+
+            for (R, s) in rem_ops
+                # Apply R^T to frequency q
+                rq = ntuple(d1 -> mod(sum(R[d2, d1] * qv[d2] for d2 in 1:dim),
+                                      M_sub[d1]), Val(3))
+                rq_lin = 1 + rq[1] + M_sub[1] * rq[2] + M_sub[1] * M_sub[2] * rq[3]
+
+                if orbit_id[rq_lin] == 0
+                    ph = cispi(2.0 * sum(qv[dd] * s[dd] / M_sub[dd] for dd in 1:dim))
+                    orbit_id[rq_lin] = oid
+                    orbit_phase[rq_lin] = ph * cur_phase
+                    push!(queue, rq_lin)
+                end
+            end
+        end
+    end
+
+    n_orbits = length(orbits_rep)
+
+    # 6. Build CSR compact table for orbit reps only
+    offsets_csr = Vector{Int32}(undef, n_orbits + 1)
+    offsets_csr[1] = Int32(1)
+    for i in 1:n_orbits
+        q = orbits_rep[i]
+        cnt = Int32(0)
+        for a in 1:d
+            k = (q - 1) * d + a
+            abs(full_weight[k]) > 1e-15 && (cnt += 1)
+        end
+        offsets_csr[i + 1] = offsets_csr[i] + cnt
+    end
+
+    nnz = Int(offsets_csr[n_orbits + 1] - 1)
+    csr_spec_idx = Vector{Int32}(undef, nnz)
+    csr_weight = Vector{ComplexF64}(undef, nnz)
+
+    for i in 1:n_orbits
+        q = orbits_rep[i]
+        j = Int(offsets_csr[i])
+        for a in 1:d
+            k = (q - 1) * d + a
+            abs(full_weight[k]) > 1e-15 || continue
+            # Negative spec_idx signals conjugation at runtime
+            csr_spec_idx[j] = full_conj_flag[k] ? -full_spec_idx[k] : full_spec_idx[k]
+            csr_weight[j] = full_weight[k]
+            j += 1
+        end
+    end
+
+    # 7. Centering fold plan
+    cent = detect_centering_type(ops_shifted, NTuple{dim,Int}(N))
+    fold_plan = plan_centering_fold(T, cent, M_tup; backend)
+
+    # 8. Buffers
+    G0_reps_cpu = zeros(CT, n_orbits)
+    f0_buf_cpu = zeros(T, M_tup...)
+    # G0 view shares the work_buffer concept — allocate a dedicated M³ complex buffer
+    G0_buf_cpu = zeros(CT, M_vol)
+
+    # 9. Transfer to device
+    inv_offsets = _to_device(backend, offsets_csr)
+    inv_spec_idx = _to_device(backend, csr_spec_idx)
+    inv_weight_dev = _to_device(backend, CT.(csr_weight))
+    orbit_rep_dev = _to_device(backend, orbits_rep)
+    orbit_oid_dev = _to_device(backend, orbit_id)
+    orbit_phase_dev = _to_device(backend, CT.(orbit_phase))
+    G0_reps_dev = _to_device(backend, G0_reps_cpu)
+    f0_buf = _to_device(backend, f0_buf_cpu)
+    G0_buf = _to_device(backend, G0_buf_cpu)
+    G0_view = reshape(G0_buf, M_tup)
+
+    N_tup = NTuple{dim, Int}(N)
+
+    return CenteredBackwardPlan(
+        inv_offsets, inv_spec_idx, inv_weight_dev, n_orbits,
+        orbit_rep_dev, orbit_oid_dev, orbit_phase_dev, G0_reps_dev,
+        fold_plan, f0_buf, G0_view,
+        M_tup, n_spec
     )
 end

@@ -150,3 +150,354 @@ function _inv_reconstruct!(bplan::BackwardPlan{T}, F_spec::AbstractVector{<:Comp
         Y[q] = val
     end
 end
+
+# ============================================================================
+# Phase 3 — Centering fold/unfold execute-time functions
+# ============================================================================
+
+# ── Centering fold ───────────────────────────────────────────────────────────
+
+"""
+    centering_fold!(plan::CenteringFoldPlan, f0)
+
+Fold subgrid f₀ into n_channels alias-folded channels on H³.
+"""
+function centering_fold!(plan::CenteringFoldPlan, f0::AbstractArray{<:Real, 3})
+    if plan.n_channels == 4
+        _centering_fold_4ch!(plan, f0)
+    else
+        _centering_fold_2ch!(plan, f0)
+    end
+end
+
+"""2-channel fold for F-centering."""
+function _centering_fold_2ch!(plan::CenteringFoldPlan{T},
+                              f0::AbstractArray{<:Real, 3}) where T
+    H1, H2, H3 = plan.H
+    buf0 = plan.channel_bufs[1]
+    buf1 = plan.channel_bufs[2]
+    tw1, tw2, tw3 = plan.twiddle_1d[2]
+    signs = plan.sign_table[2]
+
+    @inbounds for iz in 0:H3-1
+        tw_z = tw3[iz+1]
+        for iy in 0:H2-1
+            tw_yz = tw2[iy+1] * tw_z
+            for ix in 0:H1-1
+                v000 = f0[ix+1,     iy+1,     iz+1]
+                v100 = f0[ix+H1+1,  iy+1,     iz+1]
+                v010 = f0[ix+1,     iy+H2+1,  iz+1]
+                v110 = f0[ix+H1+1,  iy+H2+1,  iz+1]
+                v001 = f0[ix+1,     iy+1,     iz+H3+1]
+                v101 = f0[ix+H1+1,  iy+1,     iz+H3+1]
+                v011 = f0[ix+1,     iy+H2+1,  iz+H3+1]
+                v111 = f0[ix+H1+1,  iy+H2+1,  iz+H3+1]
+
+                buf0[ix+1, iy+1, iz+1] = v000+v100+v010+v110+v001+v101+v011+v111
+
+                val1 = (signs[1]*v000 + signs[2]*v100 +
+                        signs[3]*v010 + signs[4]*v110 +
+                        signs[5]*v001 + signs[6]*v101 +
+                        signs[7]*v011 + signs[8]*v111)
+                buf1[ix+1, iy+1, iz+1] = val1 * (tw1[ix+1] * tw_yz)
+            end
+        end
+    end
+end
+
+"""4-channel fused WHT fold for I/C/A centering."""
+function _centering_fold_4ch!(plan::CenteringFoldPlan{T},
+                              f0::AbstractArray{<:Real, 3}) where T
+    H1, H2, H3 = plan.H
+    buf1 = plan.channel_bufs[1]
+    buf2 = plan.channel_bufs[2]
+    buf3 = plan.channel_bufs[3]
+    buf4 = plan.channel_bufs[4]
+
+    off2 = plan.offsets[2]; idx2 = off2[1] + off2[2]*2 + off2[3]*4 + 1
+    off3 = plan.offsets[3]; idx3 = off3[1] + off3[2]*2 + off3[3]*4 + 1
+    off4 = plan.offsets[4]; idx4 = off4[1] + off4[2]*2 + off4[3]*4 + 1
+
+    tw1_2, tw2_2, tw3_2 = plan.twiddle_1d[2]
+    tw1_3, tw2_3, tw3_3 = plan.twiddle_1d[3]
+    tw1_4, tw2_4, tw3_4 = plan.twiddle_1d[4]
+
+    @inbounds for iz in 0:H3-1
+        tz2 = tw3_2[iz+1]; tz3 = tw3_3[iz+1]; tz4 = tw3_4[iz+1]
+        for iy in 0:H2-1
+            tyz2 = tw2_2[iy+1] * tz2
+            tyz3 = tw2_3[iy+1] * tz3
+            tyz4 = tw2_4[iy+1] * tz4
+            for ix in 0:H1-1
+                v000 = f0[ix+1,     iy+1,     iz+1]
+                v100 = f0[ix+H1+1,  iy+1,     iz+1]
+                v010 = f0[ix+1,     iy+H2+1,  iz+1]
+                v110 = f0[ix+H1+1,  iy+H2+1,  iz+1]
+                v001 = f0[ix+1,     iy+1,     iz+H3+1]
+                v101 = f0[ix+H1+1,  iy+1,     iz+H3+1]
+                v011 = f0[ix+1,     iy+H2+1,  iz+H3+1]
+                v111 = f0[ix+H1+1,  iy+H2+1,  iz+H3+1]
+
+                # 3-stage WHT butterfly (24 add/sub)
+                a0_00 = v000 + v100;  a1_00 = v000 - v100
+                a0_10 = v010 + v110;  a1_10 = v010 - v110
+                a0_01 = v001 + v101;  a1_01 = v001 - v101
+                a0_11 = v011 + v111;  a1_11 = v011 - v111
+
+                b00_0 = a0_00 + a0_10;  b01_0 = a0_00 - a0_10
+                b10_0 = a1_00 + a1_10;  b11_0 = a1_00 - a1_10
+                b00_1 = a0_01 + a0_11;  b01_1 = a0_01 - a0_11
+                b10_1 = a1_01 + a1_11;  b11_1 = a1_01 - a1_11
+
+                wht = (b00_0 + b00_1,   # c₀₀₀  idx=1
+                       b10_0 + b10_1,   # c₁₀₀  idx=2
+                       b01_0 + b01_1,   # c₀₁₀  idx=3
+                       b11_0 + b11_1,   # c₁₁₀  idx=4
+                       b00_0 - b00_1,   # c₀₀₁  idx=5
+                       b10_0 - b10_1,   # c₁₀₁  idx=6
+                       b01_0 - b01_1,   # c₀₁₁  idx=7
+                       b11_0 - b11_1)   # c₁₁₁  idx=8
+
+                buf1[ix+1, iy+1, iz+1] = wht[1]  # (0,0,0): no twiddle
+                buf2[ix+1, iy+1, iz+1] = wht[idx2] * (tw1_2[ix+1] * tyz2)
+                buf3[ix+1, iy+1, iz+1] = wht[idx3] * (tw1_3[ix+1] * tyz3)
+                buf4[ix+1, iy+1, iz+1] = wht[idx4] * (tw1_4[ix+1] * tyz4)
+            end
+        end
+    end
+end
+
+# ── FFT channels ─────────────────────────────────────────────────────────────
+
+"""Execute FFT on all folded channels (out-of-place: bufs → fft_out)."""
+function fft_channels!(plan::CenteringFoldPlan)
+    @inbounds for c in 1:plan.n_channels
+        mul!(plan.channel_fft_out[c], plan.channel_fft_plans[c], plan.channel_bufs[c])
+    end
+end
+
+"""Execute IFFT on all folded channels (out-of-place: fft_out → bufs)."""
+function ifft_channels!(plan::CenteringFoldPlan)
+    @inbounds for c in 1:plan.n_channels
+        mul!(plan.channel_bufs[c], plan.channel_ifft_plans[c], plan.channel_fft_out[c])
+    end
+end
+
+# ── Assemble / Disassemble G₀ ────────────────────────────────────────────────
+
+"""Assemble G₀ from channel FFT outputs at parity positions h = 2k + off."""
+function assemble_G0!(G0::AbstractArray{<:Complex, 3}, plan::CenteringFoldPlan)
+    H1, H2, H3 = plan.H
+
+    fill!(G0, zero(eltype(G0)))
+
+    @inbounds for c in 1:plan.n_channels
+        off = plan.offsets[c]
+        fft_out = plan.channel_fft_out[c]
+
+        for iz in 0:H3-1, iy in 0:H2-1, ix in 0:H1-1
+            h1 = 2*ix + off[1]
+            h2 = 2*iy + off[2]
+            h3 = 2*iz + off[3]
+            G0[h1+1, h2+1, h3+1] = fft_out[ix+1, iy+1, iz+1]
+        end
+    end
+end
+
+"""Disassemble G₀: extract alive-parity entries into channel fft_out buffers."""
+function disassemble_G0!(plan::CenteringFoldPlan,
+                         G0::AbstractArray{<:Complex, 3})
+    H1, H2, H3 = plan.H
+
+    @inbounds for c in 1:plan.n_channels
+        off = plan.offsets[c]
+        fft_out = plan.channel_fft_out[c]
+
+        for iz in 0:H3-1, iy in 0:H2-1, ix in 0:H1-1
+            h1 = 2*ix + off[1]
+            h2 = 2*iy + off[2]
+            h3 = 2*iz + off[3]
+            fft_out[ix+1, iy+1, iz+1] = G0[h1+1, h2+1, h3+1]
+        end
+    end
+end
+
+# ── Centering unfold ─────────────────────────────────────────────────────────
+
+"""Inverse of centering_fold!: reconstruct f₀(M³) from channels."""
+function centering_unfold!(plan::CenteringFoldPlan, f0::AbstractArray{<:Real, 3})
+    if plan.n_channels == 4
+        _centering_unfold_4ch!(plan, f0)
+    elseif plan.n_channels == 2
+        _centering_unfold_2ch!(plan, f0)
+    end
+end
+
+"""2-channel inverse for F-centering."""
+function _centering_unfold_2ch!(plan::CenteringFoldPlan{T},
+                                f0::AbstractArray{<:Real, 3}) where T
+    H1, H2, H3 = plan.H
+    buf0 = plan.channel_bufs[1]
+    buf1 = plan.channel_bufs[2]
+    tw1, tw2, tw3 = plan.twiddle_1d[2]
+    signs = plan.sign_table[2]
+
+    @inbounds for iz in 0:H3-1
+        tw_z_conj = conj(tw3[iz+1])
+        for iy in 0:H2-1
+            tw_yz_conj = conj(tw2[iy+1]) * tw_z_conj
+            for ix in 0:H1-1
+                tw_conj = conj(tw1[ix+1]) * tw_yz_conj
+                g0 = real(buf0[ix+1, iy+1, iz+1])
+                g1 = real(buf1[ix+1, iy+1, iz+1] * tw_conj)
+
+                for eps_idx in 1:8
+                    s = signs[eps_idx]
+                    val = (g0 + s * g1) / T(8)
+                    ex = (eps_idx - 1) & 1
+                    ey = ((eps_idx - 1) >> 1) & 1
+                    ez = ((eps_idx - 1) >> 2) & 1
+                    f0[ix+ex*H1+1, iy+ey*H2+1, iz+ez*H3+1] = val
+                end
+            end
+        end
+    end
+end
+
+"""4-channel inverse WHT for I/C/A centering."""
+function _centering_unfold_4ch!(plan::CenteringFoldPlan{T},
+                                f0::AbstractArray{<:Real, 3}) where T
+    H1, H2, H3 = plan.H
+    alive_wht_idx = [off[1] + off[2]*2 + off[3]*4 + 1 for off in plan.offsets]
+
+    @inbounds for iz in 0:H3-1
+        tw_z = [conj(plan.twiddle_1d[c][3][iz+1]) for c in 1:4]
+        for iy in 0:H2-1
+            tw_yz = [conj(plan.twiddle_1d[c][2][iy+1]) * tw_z[c] for c in 1:4]
+            for ix in 0:H1-1
+                wht_coeffs = zeros(T, 8)
+                for c in 1:4
+                    tw_full = conj(plan.twiddle_1d[c][1][ix+1]) * tw_yz[c]
+                    wht_coeffs[alive_wht_idx[c]] = real(
+                        plan.channel_bufs[c][ix+1, iy+1, iz+1] * tw_full)
+                end
+
+                # Inverse WHT (same butterfly as forward, self-inverse up to /8)
+                a0_00 = wht_coeffs[1] + wht_coeffs[2]; a1_00 = wht_coeffs[1] - wht_coeffs[2]
+                a0_10 = wht_coeffs[3] + wht_coeffs[4]; a1_10 = wht_coeffs[3] - wht_coeffs[4]
+                a0_01 = wht_coeffs[5] + wht_coeffs[6]; a1_01 = wht_coeffs[5] - wht_coeffs[6]
+                a0_11 = wht_coeffs[7] + wht_coeffs[8]; a1_11 = wht_coeffs[7] - wht_coeffs[8]
+
+                b00_0 = a0_00 + a0_10; b01_0 = a0_00 - a0_10
+                b10_0 = a1_00 + a1_10; b11_0 = a1_00 - a1_10
+                b00_1 = a0_01 + a0_11; b01_1 = a0_01 - a0_11
+                b10_1 = a1_01 + a1_11; b11_1 = a1_01 - a1_11
+
+                inv8 = one(T) / T(8)
+                f0[ix+1,     iy+1,     iz+1]     = (b00_0 + b00_1) * inv8
+                f0[ix+H1+1,  iy+1,     iz+1]     = (b10_0 + b10_1) * inv8
+                f0[ix+1,     iy+H2+1,  iz+1]     = (b01_0 + b01_1) * inv8
+                f0[ix+H1+1,  iy+H2+1,  iz+1]     = (b11_0 + b11_1) * inv8
+                f0[ix+1,     iy+1,     iz+H3+1]  = (b00_0 - b00_1) * inv8
+                f0[ix+H1+1,  iy+1,     iz+H3+1]  = (b10_0 - b10_1) * inv8
+                f0[ix+1,     iy+H2+1,  iz+H3+1]  = (b01_0 - b01_1) * inv8
+                f0[ix+H1+1,  iy+H2+1,  iz+H3+1]  = (b11_0 - b11_1) * inv8
+            end
+        end
+    end
+end
+
+# ── Centered forward pipeline ────────────────────────────────────────────────
+
+"""
+    fft_reconstruct_centered!(plan::CenteredForwardPlan)
+
+Full centered forward pipeline:
+  f₀(M³) → centering_fold → n_ch × H³ FFT → assemble G₀ → reconstruct
+Assumes f₀ is already in plan.f0_buffer.
+"""
+function fft_reconstruct_centered!(plan::CenteredForwardPlan)
+    fold = plan.fold_plan
+    krfft = plan.krfft_plan
+
+    # 1. Centering fold
+    centering_fold!(fold, plan.f0_buffer)
+
+    # 2. FFT each channel
+    fft_channels!(fold)
+
+    # 3. Assemble G₀ into work_buffer
+    assemble_G0!(plan.G0_view, fold)
+
+    # 4. Reconstruct spectral ASU from G₀ (skip FFT step)
+    M_vol = prod(krfft.M)
+    if krfft.is_pmmm && krfft.n_spec == M_vol && length(krfft.phase_factors) == length(krfft.M)
+        _reconstruct_pmmm!(krfft)
+    else
+        _reconstruct_general!(krfft)
+    end
+
+    return krfft.output_buffer
+end
+
+# ── Centered backward pipeline ──────────────────────────────────────────────
+
+"""CSR orbit-based inverse reconstruction: F_spec → G₀(M³)."""
+function _inv_recon_orbit!(G0::AbstractArray{<:Complex, 3},
+                           F_spec::AbstractVector{<:Complex},
+                           bplan::CenteredBackwardPlan)
+    offsets = bplan.inv_offsets
+    sidx = bplan.inv_spec_idx
+    wt = bplan.inv_weight
+    reps = bplan.orbit_rep_pos
+    G0_reps = bplan.G0_reps
+    n_orbits = bplan.n_orbits
+
+    # Step 1: CSR gather at orbit reps
+    @inbounds for i in 1:n_orbits
+        val = zero(eltype(G0_reps))
+        for j in offsets[i]:(offsets[i + 1] - Int32(1))
+            h = sidx[j]
+            if h > 0
+                val += wt[j] * F_spec[h]
+            else
+                val += wt[j] * conj(F_spec[-h])
+            end
+        end
+        G0_reps[i] = val
+    end
+
+    # Step 2: Orbit expand to all M_vol positions
+    G0_flat = vec(G0)
+    oid = bplan.orbit_member_oid
+    oph = bplan.orbit_member_phase
+    @inbounds for q in eachindex(G0_flat)
+        G0_flat[q] = oph[q] * G0_reps[oid[q]]
+    end
+end
+
+"""
+    execute_centered_backward!(bplan::CenteredBackwardPlan, F_spec)
+
+Full centered backward pipeline:
+  F_spec → inv_recon_orbit → G₀ → disassemble → IFFT channels → unfold → f₀
+"""
+function execute_centered_backward!(bplan::CenteredBackwardPlan,
+                                    F_spec::AbstractVector{<:Complex})
+    G0 = bplan.G0_view
+    fold = bplan.fold_plan
+
+    # 1. CSR orbit inv_recon: F_spec → G₀
+    _inv_recon_orbit!(G0, F_spec, bplan)
+
+    # 2. Disassemble G₀ → channel FFT outputs
+    disassemble_G0!(fold, G0)
+
+    # 3. IFFT each channel
+    ifft_channels!(fold)
+
+    # 4. Centering unfold → f₀
+    centering_unfold!(fold, bplan.f0_buffer)
+
+    return bplan.f0_buffer
+end
