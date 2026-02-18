@@ -23,7 +23,7 @@ using .CFFTApi
 
 # ── Public API ──
 export AbstractCFFTPlan, AbstractCFFTPairPlan
-export GeneralCFFTPairPlan
+export GeneralCFFTPairPlan, CenteredCFFTPairPlan
 export CFFTPlan, ICFFTPlan
 export plan_cfft, plan_icfft, plan_cfft_pair
 export cfft!, icfft!
