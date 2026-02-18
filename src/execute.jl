@@ -358,10 +358,8 @@ function assemble_G0!(G0::AbstractArray{<:Complex, 3}, plan::CenteringFoldPlan)
         end
     else
         # GPU: fused assemble — single kernel, no fill needed
-        alive_mask_dev = _to_device(backend, plan.alive_mask)
-
         assemble_g0_fused_kernel!(backend)(
-            G0, plan.batch_fft_out, alive_mask_dev,
+            G0, plan.batch_fft_out, plan.alive_mask,
             Int32(M1), Int32(M2), Int32(M3),
             Int32(H1), Int32(H2), Int32(H3);
             ndrange=M_vol)

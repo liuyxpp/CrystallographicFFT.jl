@@ -109,7 +109,8 @@ kernel launch instead of n_ch sequential FFT calls.
 struct CenteringFoldPlan{T<:AbstractFloat, P, IP, BP, BIP,
                          VA<:AbstractArray{Complex{T}, 3},
                          BA<:AbstractArray{Complex{T}, 4},
-                         VT<:AbstractVector{Complex{T}}}
+                         VT<:AbstractVector{Complex{T}},
+                         VI<:AbstractVector{Int32}}
     centering::Symbol             # :P, :I, :F, :C, :A
     M::NTuple{3, Int}         # subgrid dims (must be even)
     H::NTuple{3, Int}         # folded dims = M .÷ 2
@@ -133,7 +134,7 @@ struct CenteringFoldPlan{T<:AbstractFloat, P, IP, BP, BIP,
     sign_table::Vector{NTuple{8, Int}}  # small constants, stays CPU
 
     # ── GPU fused assemble: parity → channel index (0=dead) ──
-    alive_mask::Vector{Int32}           # (8,) stays on CPU, transferred at execute
+    alive_mask::VI                      # (8,) on device for GPU, Vector{Int32} for CPU
 end
 
 # ── Centered Forward Plan (composition) ──────────────────────────────────────

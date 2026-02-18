@@ -615,12 +615,13 @@ function plan_centering_fold(::Type{T}, centering::CenteringType,
                centering == CentC ? :C : centering == CentA ? :A : :P
 
     # Alive mask: parity → channel index (0 = dead, used by fused assemble kernel)
-    alive_mask = zeros(Int32, 8)
+    alive_mask_cpu = zeros(Int32, 8)
     for c in 1:n_ch
         off = offsets[c]
         parity = off[1] + off[2]*2 + off[3]*4
-        alive_mask[parity + 1] = Int32(c)
+        alive_mask_cpu[parity + 1] = Int32(c)
     end
+    alive_mask = _to_device(backend, alive_mask_cpu)
 
     return CenteringFoldPlan(
         cent_sym, M, H, n_ch, offsets,
