@@ -4,7 +4,7 @@ CurrentModule = CrystallographicFFT
 
 # CrystallographicFFT.jl
 
-Exploit crystallographic symmetry to compute FFTs on 3D periodic grids up to **28× faster** than standard FFTW.
+Exploit crystallographic symmetry to compute FFTs on 3D periodic grids up to **28× faster** than standard FFTW — and up to **600× faster on GPU**.
 
 ## Introduction
 
@@ -19,6 +19,8 @@ The result is a compact spectral representation with $n_{\text{spec}} \approx N^
 ## Key Features
 
 *   **⚡ Up to 28× speedup** over full-grid FFT for highly symmetric groups (Pm-3m, Fm-3m)
+*   **🖥️ GPU acceleration** via [KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl) — CUDA support through a lightweight extension; GPU CFFT is **35–38× faster** than CPU CFFT at N=256
+*   **📐 Real-valued CFFT** (`rcfft!`/`ircfft!`) — uses `rfft`/`irfft` to halve FFT work for real fields, with 1.5–2× forward and 2–3× backward speedup
 *   **🔬 All 230 space groups** via the general KRFFT path
 *   **🧊 Centered lattice optimization** (I/C/A/F centering) with multi-channel fold for additional speedup
 *   **🔄 Full forward + backward** transforms — forward (`cfft!`) and inverse (`icfft!`) with roundtrip error at machine precision
@@ -32,7 +34,15 @@ using Pkg
 Pkg.add("CrystallographicFFT")
 ```
 
+For GPU support, also install CUDA.jl:
+
+```julia
+Pkg.add("CUDA")
+```
+
 ## Quick Example
+
+### CPU
 
 ```julia
 using CrystallographicFFT
@@ -54,4 +64,21 @@ icfft!(f0_out, pair, F̂)
 
 # Roundtrip at machine precision
 @assert maximum(abs.(f0 .- f0_out)) < 1e-12
+```
+
+### GPU (CUDA)
+
+```julia
+using CUDA
+using CrystallographicFFT
+
+N = (64, 64, 64)
+pair = plan_cfft_pair(N, 225, 3; array_type=CuArray{Float64})
+
+f0 = CuArray(randn(subgrid_size(pair)...))
+F̂ = CUDA.zeros(ComplexF64, cfft_asu_size(pair))
+cfft!(F̂, pair, f0)
+
+f0_out = CUDA.zeros(Float64, subgrid_size(pair)...)
+icfft!(f0_out, pair, F̂)
 ```

@@ -67,3 +67,21 @@ The stride factor $L$ determines the subgrid size $M = N/L$. The function `auto_
 
 - **Cubic groups**: typically $L = (2, 2, 2)$, giving $M = N/2$ and an $8\times$ volume reduction
 - **Lower symmetry**: $L$ may be anisotropic, e.g., $L = (2, 2, 1)$ for tetragonal groups with fewer translational symmetries
+
+## Real-Valued FFT Optimization
+
+When the input field is real-valued (as in most physical applications), the spectral coefficients satisfy Hermitian symmetry: $F(-\mathbf{h}) = \overline{F(\mathbf{h})}$. The `rcfft!`/`ircfft!` API exploits this by using `rfft`/`irfft`:
+
+- **Forward**: `rfft` outputs a half-spectrum of size $\hat{M}_1 \times M_2 \times M_3$ where $\hat{M}_1 = M_1 \div 2 + 1$
+- **Backward**: inverse reconstruction fills only the half-spectrum, and `irfft` directly outputs real data
+
+Frequencies beyond the half-spectrum boundary are recovered via Hermitian conjugation. The reconstruction table uses **signed index encoding**: positive indices access the `rfft` output directly, negative indices access the conjugate. This avoids explicit data copying or building the full complex spectrum.
+
+## Device-Agnostic Architecture
+
+All compute-intensive operations (reconstruction, centering fold/unfold, assembly) are implemented as [KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl) `@kernel` functions. This enables the same code to execute on:
+
+- **CPU**: kernels map to optimized scalar loops
+- **GPU**: kernels map to parallel CUDA thread blocks (via the CUDA.jl extension)
+
+Plan construction (spectral ASU enumeration, table building, matrix inversion) runs on CPU. The resulting tables and buffers are transferred to the target device via `_to_device(backend, data)`. FFT plans are created on device arrays, so FFTW and CUFFT dispatch automatically through the `AbstractFFTs` interface.

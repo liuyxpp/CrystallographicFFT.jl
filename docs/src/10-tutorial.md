@@ -77,6 +77,53 @@ bwd = plan_icfft(N, 225, 3)          # → ICFFTPlan (independent)
 
 ---
 
+## Real-Valued Plans (`rcfft!` / `ircfft!`)
+
+When working with real-valued fields (e.g., in SCFT), the `rcfft!` / `ircfft!` API uses `rfft` / `irfft` internally, halving the FFT work compared to `cfft!` / `icfft!`:
+
+```julia
+rpair = plan_rcfft_pair(N, 225, 3)
+
+F̂ = Vector{ComplexF64}(undef, cfft_asu_size(rpair))
+f0 = rand(subgrid_size(rpair)...)
+
+rcfft!(F̂, rpair, f0)          # forward: real subgrid → spectral ASU
+ircfft!(f0, rpair, F̂)         # backward: spectral ASU → real subgrid
+```
+
+The `rcfft` / `ircfft` API works for **all 230 space groups** (always uses the general path internally). See [Real-Valued CFFT](@ref real-valued-cfft) for details.
+
+---
+
+## GPU Usage
+
+To run on GPU, install CUDA.jl and pass `array_type=CuArray{Float64}`:
+
+```julia
+using CUDA
+using CrystallographicFFT
+
+N = (128, 128, 128)
+sg_num = 225
+
+# GPU plan — all buffers allocated on device
+pair = plan_cfft_pair(N, sg_num, 3; array_type=CuArray{Float64})
+
+# Data must be on GPU
+f0 = CuArray(randn(subgrid_size(pair)...))
+F̂ = CUDA.zeros(ComplexF64, cfft_asu_size(pair))
+f0_out = CUDA.zeros(Float64, subgrid_size(pair)...)
+
+cfft!(F̂, pair, f0)
+icfft!(f0_out, pair, F̂)
+```
+
+GPU support is available for all plan types (`plan_cfft`, `plan_icfft`, `plan_cfft_pair`, `plan_rcfft_pair`, etc.) via the `array_type` keyword argument. See [GPU Acceleration](@ref gpu-acceleration) for full details.
+
+> **Note**: CUDA.jl is a *weak dependency* — the package works without it. GPU kernels are only loaded when CUDA.jl is available.
+
+---
+
 ## SCFT Diffusion Step
 
 A common use case: solving the diffusion equation in spectral space.
@@ -160,11 +207,14 @@ fullgrid_to_subgrid!(f0_back, plan, f_full)  # extract full grid → subgrid
 
 ```
 AbstractCFFTPlan
-├── CFFTPlan{FP}        — forward-only
-├── ICFFTPlan{BP}       — backward-only
+├── CFFTPlan{FP}             — forward-only (complex FFT)
+├── ICFFTPlan{BP}            — backward-only (complex FFT)
+├── RCFFTPlan                — forward-only (real FFT)
+├── IRCFFTPlan               — backward-only (real FFT)
 └── AbstractCFFTPairPlan
-    ├── GeneralCFFTPairPlan   — all 230 space groups
-    └── CenteredCFFTPairPlan  — I/C/A/F centering optimization
+    ├── GeneralCFFTPairPlan      — all 230 space groups (complex FFT)
+    ├── CenteredCFFTPairPlan     — I/C/A/F centering optimization
+    └── GeneralRCFFTPairPlan     — all 230 space groups (real FFT)
 ```
 
 All plan types support the same query functions (`subgrid_size`, `fullgrid_size`, etc.).

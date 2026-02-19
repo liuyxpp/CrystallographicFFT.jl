@@ -53,6 +53,51 @@ update_diffusion_kernel!(K, pair, new_Δs, lattice)
 
 This is cheaper than creating a new kernel since it reuses the precomputed $|\mathbf{k}|^2$ values.
 
+## Using Real-Valued Plans for SCFT
+
+For real-valued fields, `rcfft!`/`ircfft!` provides additional speedup (1.5–2.5× over `cfft!`/`icfft!`):
+
+```julia
+rpair = plan_rcfft_pair(N, sg, 3)
+K = make_diffusion_kernel(rpair, Δs, lattice)
+
+F̂ = Vector{ComplexF64}(undef, cfft_asu_size(rpair))
+f = rand(subgrid_size(rpair)...)
+
+rcfft!(F̂, rpair, f)
+@. F̂ *= K
+ircfft!(f, rpair, F̂)
+```
+
+The real-valued path halves the FFT work and the backward reconstruction work. It supports all 230 space groups.
+
+## GPU SCFT Workflow
+
+For GPU-accelerated SCFT, simply pass `array_type=CuArray{Float64}`:
+
+```julia
+using CUDA
+using CrystallographicFFT
+
+N = (128, 128, 128)
+sg = 225
+Δs = 0.01
+lattice = [1.0 0 0; 0 1.0 0; 0 0 1.0]
+
+pair = plan_cfft_pair(N, sg, 3; array_type=CuArray{Float64})
+K = make_diffusion_kernel(pair, Δs, lattice)
+
+F̂ = CUDA.zeros(ComplexF64, cfft_asu_size(pair))
+f = CuArray(randn(subgrid_size(pair)...))
+
+# Same API — runs entirely on GPU
+cfft!(F̂, pair, f)
+@. F̂ *= K
+icfft!(f, pair, F̂)
+```
+
+At N=256, the GPU SCFT step is **35–38× faster** than CPU. All plan types (`plan_cfft_pair`, `plan_rcfft_pair`) support GPU via the `array_type` keyword.
+
 ## Using Separate Forward/Backward Plans
 
 For more control (e.g., when forward and backward are used in different contexts):
@@ -94,38 +139,23 @@ cfft!(F̂, plan, ρ)
 icfft!(Φ, bwd, F̂)
 ```
 
-## Internal SCFT Paths
-
-For advanced users, two internal SCFT execution paths exist (accessible via `CrystallographicFFT.QFusedKRFFT`):
-
-### M2 Forward+Backward SCFT
-
-```julia
-using CrystallographicFFT.QFusedKRFFT: plan_m2_scft, execute_m2_scft!
-
-scft = plan_m2_scft(N, sg, 3, Δs, lattice)
-execute_m2_scft!(scft, f)  # in-place: f₀ → F̂·K → f₀
-```
-
-This bundles the forward+multiply+backward into a single call with optimal buffer reuse.
-
-### Q-Fused SCFT
-
-```julia
-using CrystallographicFFT.QFusedKRFFT: plan_m2_q, execute_m2_q!
-
-m2q = plan_m2_q(N, sg, 3, Δs, lattice)
-execute_m2_q!(m2q, f)  # Q-matrix fused: FFT → Q·Y → IFFT
-```
-
-The Q-fused path replaces the separate reconstruct+multiply+inv_reconstruct steps with a single $Q$-matrix multiplication in the subgrid spectral domain. This can be faster for low-symmetry groups where the spectral ASU is large.
-
 ## Performance Considerations
+
+### CPU Performance
 
 | Method | Best for | Typical speedup |
 |--------|----------|----------------|
-| `plan_cfft_pair` | High-symmetry groups (|G| ≥ 16) | 10–27× |
-| `plan_m2_scft` | Mid-symmetry groups (8 ≤ |G| < 16) | 5–10× |
-| `plan_m2_q` | Low-symmetry groups (|G| < 8) | 2–5× |
+| `plan_cfft_pair` | High-symmetry groups (∣G∣ ≥ 16) | 10–27× |
+| `plan_rcfft_pair` | All groups (real-valued fields) | +1.5–2.5× over cfft |
 
 For most cubic space groups, `plan_cfft_pair` provides the best overall performance.
+
+### GPU Performance (N=128, RTX 2080 Ti)
+
+| Method | Fm-3m forward | Fm-3m backward | vs CPU |
+|--------|--------------|----------------|--------|
+| GPU `cfft!` (centered) | 0.148 ms | 0.163 ms | 9.6× |
+| GPU `rcfft!` (general) | 0.152 ms | 0.257 ms | 10.8× |
+| CUFFT(128³) baseline | 1.21 ms | — | — |
+
+GPU speedup improves with grid size — at N=256, GPU CFFT is 35–38× faster than CPU CFFT.

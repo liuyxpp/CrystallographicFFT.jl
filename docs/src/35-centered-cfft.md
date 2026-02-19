@@ -89,9 +89,35 @@ The backward transform reverses each step:
 - **Per-channel IFFT**: inverse FFT on each channel
 - **Centering Unfold**: combines channels back into the full subgrid
 
-## Performance Impact
+## GPU Optimizations
 
-The centered path provides significant speedup for centered groups:
+On GPU, two key optimizations significantly improve centered path performance:
+
+### Batched CUFFT
+
+Instead of executing $c$ independent CUFFT calls sequentially, the channels are packed into a single 4D batch array and processed with one batched CUFFT call. This reduces kernel launch overhead from $4 \times \sim 30\,\mu s$ to a single $\sim 35\,\mu s$ call — a **37% speedup** for F-centered groups at N=128.
+
+### Fused Kernels
+
+- **Fused Assemble**: `fill!(G0, 0)` + per-channel assembly kernels are replaced by a single `assemble_g0_fused_kernel!` using an `alive_mask` to map each grid position to its channel
+- **Fused Inv. Reconstruct**: the separate `F_work = [F; conj(F)]` buffer construction and scatter are merged into a single kernel using signed index encoding — saving both a kernel launch and the `F_work` buffer allocation. This gives a **46% speedup** on backward transforms for Fm-3m.
+
+### GPU Parity and Scaling
+
+GPU parity (GPU speedup / CPU speedup) for centered groups improves with grid size, as larger subgrids better utilize GPU parallelism:
+
+| N | Subgrid | Fm-3m GPU speedup | Parity |
+|---|---------|-------------------|--------|
+| 32 | 8³ | 0.65× | 4% |
+| 64 | 16³ | 1.35× | 8% |
+| 128 | 32³ | 8.2× | 35% |
+| **256** | **64³** | **14.7×** | **64%** |
+
+N ≥ 128 is recommended for effective GPU acceleration.
+
+## CPU Performance Impact
+
+The centered path provides significant speedup for centered groups on CPU:
 
 | Group | Centering | General speedup | Centered speedup | Improvement |
 |-------|-----------|----------------|-----------------|-------------|

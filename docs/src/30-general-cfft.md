@@ -23,7 +23,7 @@ Real-space field f(x)  [N³ full grid, symmetric under G]
         │
         ▼
   ┌─────────────────┐
-  │  Subgrid FFT     │  FFTW C2C on M³
+  │  Subgrid FFT     │  FFTW C2C on M³ (CPU) / CUFFT C2C on M³ (GPU)
   └─────────────────┘
         │
         ▼
@@ -53,7 +53,7 @@ Real-space field f(x)  [N³ full grid, symmetric under G]
         │
         ▼
   ┌─────────────────┐
-  │  Inverse FFT     │  FFTW C2C⁻¹ on M³
+  │  Inverse FFT     │  FFTW C2C⁻¹ on M³ (CPU) / CUFFT C2C⁻¹ on M³ (GPU)
   └─────────────────┘
         │
         ▼
@@ -83,6 +83,20 @@ F(\mathbf{h}) = \mathbf{w}^\top \cdot Y_{\text{gathered}}
 where $\mathbf{w}$ is a precomputed sparse weight vector.
 
 The plan construction automatically determines which path to use for each spectral ASU point. For high-symmetry cubic groups, the diagonal path handles the majority of frequencies.
+
+## CPU vs GPU Execution
+
+The algorithm is identical on CPU and GPU. The key differences are in the computational primitives:
+
+| Step | CPU | GPU |
+|------|-----|-----|
+| Pack (stride-L extract) | `@inbounds @simd` loop | `copy_real_to_complex_kernel!` |
+| Subgrid FFT | FFTW C2C | CUFFT C2C |
+| Reconstruct | `@inbounds` SoA gather-reduce | `reconstruct_general_kernel!` |
+| Inv. Reconstruct | `@inbounds` SoA scatter | `inv_reconstruct_fused_kernel!` |
+| Inverse FFT | FFTW C2C⁻¹ | CUFFT C2C⁻¹ |
+
+On CPU, the Pmmm fast path uses separable 8-point butterfly reconstruction for diagonal groups. On GPU, all groups use the general `reconstruct_general_kernel!` (the overhead of branching in the butterfly is higher than the benefit on GPU).
 
 ## Memory Layout
 
