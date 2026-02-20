@@ -38,9 +38,10 @@ export RCFFTPlan, IRCFFTPlan, GeneralRCFFTPairPlan
 export plan_rcfft, plan_ircfft, plan_rcfft_pair
 export rcfft!, ircfft!
 export make_diffusion_kernel, update_diffusion_kernel!
-export cfft_k2
+export cfft_k2, cfft_kk_orbsum
 export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size
 export subgrid_to_fullgrid!, fullgrid_to_subgrid!
+export SubgridStarMap, build_subgrid_star_map, expand_stars!, compress_stars!
 
 # ── Backend inference (extensible by CUDA extension) ─────────────────────────
 
@@ -52,6 +53,30 @@ Defaults to `CPU()`. Overridden by CUDAExt for `CuArray`.
 """
 _infer_backend(::Type{<:AbstractArray}) = KA_CPU()
 _infer_backend(::Type{<:Array}) = KA_CPU()
+
+# ── SubgridStarMap ───────────────────────────────────────────────────────────
+
+"""
+    SubgridStarMap
+
+Mapping between subgrid linear indices and star (symmetry orbit) indices.
+Stars are the orbits of subgrid points under the space group symmetry
+projected onto the stride-L subgrid.
+
+# Fields
+- `sub_to_star`: subgrid linear index → star index (length M_vol)
+- `star_offsets`: CSR row offsets (length n_stars+1)
+- `star_sub_list`: CSR column list — subgrid indices in each star (length M_vol)
+- `sub_degeneracy`: number of subgrid points in each star (length n_stars)
+- `n_stars`: total number of distinct stars
+"""
+struct SubgridStarMap
+    sub_to_star::Vector{Int32}
+    star_offsets::Vector{Int32}
+    star_sub_list::Vector{Int32}
+    sub_degeneracy::Vector{Int32}
+    n_stars::Int
+end
 
 # ── Abstract types ───────────────────────────────────────────────────────────
 
@@ -544,6 +569,90 @@ function cfft_k2(plan::AbstractCFFTPlan, lattice::AbstractMatrix)
 end
 
 # ============================================================================
+# Spectral geometry: cfft_kk_orbsum
+# ============================================================================
+
+"""
+    cfft_kk_orbsum(plan, lattice) → Vector{Vector{Float64}}
+
+Return orbit-summed kα·kβ tensor components (Voigt order) for each spectral
+ASU point.  The 6 components are: xx, yy, zz, yz, xz, xy.
+
+For each ASU representative hᵢ, we enumerate its orbit under the reciprocal
+point group, compute k(h) = B*·h for every orbit member, accumulate
+kα·kβ, and normalise by the orbit size.
+
+This is used for computing the stress tensor directly in the spectral ASU.
+"""
+function cfft_kk_orbsum(plan::AbstractCFFTPlan, lattice::AbstractMatrix)
+    N = plan.N
+    D = plan.dim
+    spec_asu = plan.spec_asu
+    n_spec = plan.n_spec
+
+    recip_B = 2π * inv(Matrix(lattice))'
+
+    # Voigt order: xx, yy, zz, yz, xz, xy
+    voigt_pairs = [(1,1), (2,2), (3,3), (2,3), (1,3), (1,2)]
+    n_voigt = 6
+    kk = [Vector{Float64}(undef, n_spec) for _ in 1:n_voigt]
+
+    # Reciprocal point group operations
+    recip_ops = spec_asu.ops
+    n_ops = length(recip_ops)
+    R_mats = [op.R for op in recip_ops]
+
+    h_buf = zeros(Int, D)
+    k_rot = zeros(Int, D)
+    k_vec = zeros(Float64, D)
+    h_centered = zeros(Float64, D)
+
+    for (spec_idx, pt) in enumerate(spec_asu.points)
+        h_asu = pt.idx  # 0-based k-vector
+        orbit_size = pt.multiplicity
+
+        # Accumulate kk tensor over orbit
+        kk_acc = zeros(Float64, n_voigt)
+
+        # Track visited orbit members to avoid double-counting
+        visited = Set{NTuple{D,Int}}()
+
+        for g in 1:n_ops
+            R = R_mats[g]
+            # h' = R * h_asu mod N
+            @inbounds for d in 1:D
+                s = 0
+                for j in 1:D
+                    s += R[d, j] * h_asu[j]
+                end
+                k_rot[d] = mod(s, N[d])
+            end
+            h_key = NTuple{D,Int}(Tuple(k_rot))
+            h_key in visited && continue
+            push!(visited, h_key)
+
+            # Convert to centered frequency and physical k
+            @inbounds for d in 1:D
+                h_centered[d] = k_rot[d] >= N[d] ÷ 2 + 1 ? k_rot[d] - N[d] : k_rot[d]
+            end
+            mul!(k_vec, recip_B, h_centered)
+
+            # Accumulate Voigt components
+            @inbounds for (v, (α, β)) in enumerate(voigt_pairs)
+                kk_acc[v] += k_vec[α] * k_vec[β]
+            end
+        end
+
+        # Normalise by orbit size
+        @inbounds for v in 1:n_voigt
+            kk[v][spec_idx] = kk_acc[v] / orbit_size
+        end
+    end
+
+    return kk
+end
+
+# ============================================================================
 # Grid conversions
 # ============================================================================
 
@@ -567,6 +676,174 @@ function fullgrid_to_subgrid!(f0::AbstractArray, plan::AbstractCFFTPlan,
         f0[i, j, k] = f_full[(i-1)*L[1]+1, (j-1)*L[2]+1, (k-1)*L[3]+1]
     end
     return f0
+end
+
+# ============================================================================
+# Star conversions (SubgridStarMap)
+# ============================================================================
+
+"""
+    build_subgrid_star_map(plan::AbstractCFFTPlan) → SubgridStarMap
+
+Build the mapping between subgrid linear indices and stars (symmetry orbits).
+A star groups subgrid points that are related by the space group symmetry.
+
+The returned map supports efficient `expand_stars!` (star → subgrid) and
+`compress_stars!` (subgrid → star) conversions.
+"""
+function build_subgrid_star_map(plan::AbstractCFFTPlan)
+    M = plan.M
+    N = plan.N
+    L = plan.L
+    D = plan.dim
+
+    M_vol = prod(M)
+    li_sub = LinearIndices(M)
+
+    # Union-Find for grouping subgrid points into stars
+    parent = collect(Int32(1):Int32(M_vol))
+
+    function uf_find(x::Int32)::Int32
+        while parent[x] != x
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        end
+        return x
+    end
+
+    function uf_union!(a::Int32, b::Int32)
+        ra = uf_find(a)
+        rb = uf_find(b)
+        if ra != rb
+            if ra < rb
+                parent[rb] = ra
+            else
+                parent[ra] = rb
+            end
+        end
+    end
+
+    # For each subgrid point, apply all symmetry ops. If the result
+    # lands on the subgrid (x' mod L == 0), the two subgrid points
+    # belong to the same star. Union-Find groups them.
+    ops_s = _get_ops_shifted(plan)
+
+    for ci in CartesianIndices(M)
+        sub_idx1 = Int32(li_sub[ci])
+        # Subgrid point in full-grid coordinates (0-based)
+        x0 = ntuple(d -> (ci[d] - 1) * L[d], Val(D))
+
+        for op in ops_s
+            # Apply op: x' = R * x0 + t mod N
+            on_subgrid = true
+            sub_coords = ntuple(Val(D)) do d
+                s = Int(op.t[d])
+                for j in 1:D
+                    s += Int(op.R[d, j]) * x0[j]
+                end
+                xp = mod(s, N[d])
+                if xp % L[d] != 0
+                    on_subgrid = false
+                end
+                xp ÷ L[d] + 1
+            end
+
+            if on_subgrid
+                sub_idx2 = Int32(li_sub[CartesianIndex(sub_coords)])
+                uf_union!(sub_idx1, sub_idx2)
+            end
+        end
+    end
+
+    # Compress roots and assign star indices
+    # Finalize path compression
+    for i in Int32(1):Int32(M_vol)
+        parent[i] = uf_find(Int32(i))
+    end
+
+    # Map roots to sequential star indices
+    root_to_star = Dict{Int32, Int32}()
+    star_count = Int32(0)
+    sub_to_star = Vector{Int32}(undef, M_vol)
+    for i in 1:M_vol
+        root = parent[i]
+        if !haskey(root_to_star, root)
+            star_count += 1
+            root_to_star[root] = star_count
+        end
+        sub_to_star[i] = root_to_star[root]
+    end
+    n_stars = Int(star_count)
+
+    # Compute degeneracy (points per star)
+    sub_degeneracy = zeros(Int32, n_stars)
+    for i in 1:M_vol
+        sub_degeneracy[sub_to_star[i]] += 1
+    end
+
+    # Build CSR structure
+    star_offsets = Vector{Int32}(undef, n_stars + 1)
+    star_offsets[1] = 1
+    for s in 1:n_stars
+        star_offsets[s + 1] = star_offsets[s] + sub_degeneracy[s]
+    end
+
+    star_sub_list = Vector{Int32}(undef, M_vol)
+    cursor = copy(star_offsets)  # working cursor per star
+    for i in 1:M_vol
+        s = sub_to_star[i]
+        star_sub_list[cursor[s]] = Int32(i)
+        cursor[s] += 1
+    end
+
+    return SubgridStarMap(sub_to_star, star_offsets, star_sub_list,
+                          sub_degeneracy, n_stars)
+end
+
+# Helper: extract shifted ops from any plan type
+function _get_ops_shifted(plan::CFFTPlan)
+    return plan.ops_shifted
+end
+function _get_ops_shifted(plan::RCFFTPlan)
+    return plan.ops_shifted
+end
+function _get_ops_shifted(plan::AbstractCFFTPlan)
+    # Fallback: recompute from sg_num
+    ops = get_ops(plan.sg_num, plan.dim, plan.N)
+    _, ops_s = find_optimal_shift(ops, plan.N)
+    return ops_s
+end
+
+"""
+    expand_stars!(f0, map::SubgridStarMap, compressed)
+
+Expand star values to subgrid: `f0[i] = compressed[star(i)]`.
+"""
+function expand_stars!(f0::AbstractArray, map::SubgridStarMap,
+                       compressed::AbstractVector)
+    f0_vec = vec(f0)
+    @inbounds @simd for i in eachindex(f0_vec)
+        f0_vec[i] = compressed[map.sub_to_star[i]]
+    end
+    return f0
+end
+
+"""
+    compress_stars!(compressed, map::SubgridStarMap, f0)
+
+Compress subgrid to star values by averaging points within each star.
+"""
+function compress_stars!(compressed::AbstractVector, map::SubgridStarMap,
+                         f0::AbstractArray)
+    fill!(compressed, zero(eltype(compressed)))
+    f0_vec = vec(f0)
+    @inbounds for i in eachindex(f0_vec)
+        compressed[map.sub_to_star[i]] += f0_vec[i]
+    end
+    @inbounds @simd for s in 1:map.n_stars
+        compressed[s] /= map.sub_degeneracy[s]
+    end
+    return compressed
 end
 
 # ============================================================================

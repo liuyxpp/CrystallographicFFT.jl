@@ -430,4 +430,119 @@ include("test_helpers.jl")
         end
     end
 
+    # ── 10. Star API ─────────────────────────────────────────────────────
+    @testset "Star API" begin
+        @testset "Structure (Pm-3m)" begin
+            fwd = plan_cfft(N16, 221, 3)
+            smap = build_subgrid_star_map(fwd)
+
+            M = subgrid_size(fwd)
+            M_vol = prod(M)
+            @test length(smap.sub_to_star) == M_vol
+            @test all(1 .<= smap.sub_to_star .<= smap.n_stars)
+            @test length(smap.star_offsets) == smap.n_stars + 1
+            @test length(smap.star_sub_list) == M_vol
+            @test sum(smap.sub_degeneracy) == M_vol
+            @test smap.n_stars > 0
+            @test smap.n_stars <= M_vol
+        end
+
+        @testset "Expand/Compress roundtrip" begin
+            fwd = plan_cfft(N16, 221, 3)
+            smap = build_subgrid_star_map(fwd)
+            M = subgrid_size(fwd)
+
+            # Constant per star should roundtrip
+            compressed = collect(Float64, 1:smap.n_stars)
+            f0 = zeros(M...)
+            expand_stars!(f0, smap, compressed)
+
+            compressed_back = zeros(smap.n_stars)
+            compress_stars!(compressed_back, smap, f0)
+            @test maximum(abs.(compressed .- compressed_back)) < 1e-12
+        end
+
+        @testset "Symmetry invariance" begin
+            for (sg, name) in [(221, "Pm-3m"), (225, "Fm-3m"),
+                               (229, "Im-3m"), (47, "Pmmm")]
+                @testset "$name" begin
+                    p = prep[sg]
+                    fwd = plan_cfft(N16, sg, 3)
+                    smap = build_subgrid_star_map(fwd)
+                    L = stride_factors(fwd)
+                    f0 = extract_subgrid(p.u, N16, collect(L))
+
+                    # For symmetric input, points in same star should be equal
+                    for s in 1:smap.n_stars
+                        idx_start = smap.star_offsets[s]
+                        idx_end = smap.star_offsets[s + 1] - 1
+                        vals = [f0[smap.star_sub_list[j]] for j in idx_start:idx_end]
+                        @test maximum(abs.(vals .- vals[1])) < 1e-10
+                    end
+                end
+            end
+        end
+
+        @testset "n_stars bounds" begin
+            # For trivial group (P1), each subgrid point is its own star
+            fwd_p1 = plan_cfft(N16, 1, 3)
+            smap_p1 = build_subgrid_star_map(fwd_p1)
+            @test smap_p1.n_stars == prod(subgrid_size(fwd_p1))
+
+            # For high symmetry, n_stars << M_vol
+            fwd_pm3m = plan_cfft(N16, 221, 3)
+            smap_pm3m = build_subgrid_star_map(fwd_pm3m)
+            @test smap_pm3m.n_stars < prod(subgrid_size(fwd_pm3m))
+        end
+    end
+
+    # ── 11. cfft_kk_orbsum ────────────────────────────────────────────────
+    @testset "cfft_kk_orbsum" begin
+        @testset "Shape and Γ-point" begin
+            fwd = plan_cfft(N16, 221, 3)
+            kk = cfft_kk_orbsum(fwd, lattice)
+
+            @test length(kk) == 6
+            @test all(length(v) == cfft_asu_size(fwd) for v in kk)
+            # Γ point (k=0): all components should be 0
+            @test all(abs(kk[v][1]) < 1e-15 for v in 1:6)
+        end
+
+        @testset "Trace vs k²" begin
+            fwd = plan_cfft(N16, 221, 3)
+            kk = cfft_kk_orbsum(fwd, lattice)
+            k2 = cfft_k2(fwd, lattice)
+
+            # Trace kk_xx + kk_yy + kk_zz should equal k²
+            trace = kk[1] .+ kk[2] .+ kk[3]
+            @test maximum(abs.(trace .- k2)) < 1e-10
+        end
+
+        @testset "Cubic symmetry" begin
+            # For cubic lattice, orbit-averaged xx ≈ yy ≈ zz
+            fwd = plan_cfft(N16, 221, 3)
+            kk = cfft_kk_orbsum(fwd, lattice)
+
+            # Skip Γ point
+            for i in 2:cfft_asu_size(fwd)
+                @test abs(kk[1][i] - kk[2][i]) < 1e-10
+                @test abs(kk[2][i] - kk[3][i]) < 1e-10
+            end
+        end
+
+        @testset "Multi-group" begin
+            for (sg, name) in [(225, "Fm-3m"), (47, "Pmmm"), (2, "P-1")]
+                @testset "$name" begin
+                    fwd = plan_cfft(N16, sg, 3)
+                    kk = cfft_kk_orbsum(fwd, lattice)
+                    k2 = cfft_k2(fwd, lattice)
+
+                    @test length(kk) == 6
+                    trace = kk[1] .+ kk[2] .+ kk[3]
+                    @test maximum(abs.(trace .- k2)) < 1e-10
+                end
+            end
+        end
+    end
+
 end

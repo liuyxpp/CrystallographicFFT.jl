@@ -31,9 +31,10 @@ export RCFFTPlan, IRCFFTPlan, GeneralRCFFTPairPlan
 export plan_rcfft, plan_ircfft, plan_rcfft_pair
 export rcfft!, ircfft!
 export make_diffusion_kernel, update_diffusion_kernel!
-export cfft_k2
+export cfft_k2, cfft_kk_orbsum
 export subgrid_size, fullgrid_size, stride_factors, cfft_asu_size
 export subgrid_to_fullgrid!, fullgrid_to_subgrid!
+export SubgridStarMap, build_subgrid_star_map, expand_stars!, compress_stars!
 export recommended_N, group_order
 
 end
