@@ -231,18 +231,100 @@ end
 
 Given target grid dimensions, return adjusted N that enables optimal KRFFT speedup.
 
-Adjusts each dimension independently to be a multiple of the corresponding optimal L.
+Uses `auto_L`-based dynamic computation to determine the minimum N divisor for
+each space group, ensuring `auto_L` achieves its maximum `prod(L)`.
+
+# Examples
+```julia
+julia> recommended_N(230, (60, 60, 60))  # Ia-3d needs N % 8 == 0
+(64, 64, 64)
+
+julia> recommended_N(221, (60, 60, 60))  # Pm-3m only needs N % 2 == 0
+(60, 60, 60)
+```
 """
 function recommended_N(sg::Int, target_N::NTuple{D, Int}) where D
-    L = optimal_L(sg, D)
-    
-    # Round each dimension up to nearest multiple of L[d]
+    divisor = _required_N_divisor(sg, D)
+
+    # Round each dimension up to nearest multiple of divisor[d]
     adjusted_N = Tuple(
-        L[d] * ceil(Int, target_N[d] / L[d]) 
+        divisor[d] * ceil(Int, target_N[d] / divisor[d])
         for d in 1:D
     )
-    
+
     return adjusted_N
+end
+
+# Cache for _required_N_divisor results: (sg, D) → NTuple{D, Int}
+const _N_DIVISOR_CACHE = Dict{Tuple{Int,Int}, Tuple}()
+
+"""
+    _required_N_divisor(sg::Int, D::Int) -> NTuple{D, Int}
+
+Compute the minimum N divisor per dimension such that `auto_L` achieves its
+maximum `prod(L)` for space group `sg`.
+
+Uses a reference N to determine the best possible `auto_L`, then tests
+candidate divisors [2, 4, 8] to find the smallest that guarantees optimal L.
+"""
+function _required_N_divisor(sg::Int, D::Int)
+    key = (sg, D)
+    haskey(_N_DIVISOR_CACHE, key) && return _N_DIVISOR_CACHE[key]::NTuple{D, Int} where D
+
+    # Step 1: Compute best_L at a reference N divisible by lcm(2,4,8)=8
+    N_ref = ntuple(_ -> 48, Val(D))  # 48 = 8 × 6, divisible by 2, 4, 8
+    ops_ref = get_ops(sg, D, N_ref)
+    _, ops_s_ref = find_optimal_shift(ops_ref, N_ref)
+    best_L = auto_L(ops_s_ref)
+
+    # If best_L is all ones, no subgrid decomposition is possible
+    if all(best_L .== 1)
+        result = ntuple(_ -> 2, Val(D))
+        _N_DIVISOR_CACHE[key] = result
+        return result
+    end
+
+    # Step 2: Find minimum divisor
+    # Test candidate divisors in ascending order; pick the smallest that works.
+    # Use large odd multipliers so that test N values are big enough to be
+    # commensurate with all fractional translations (e.g., 1/4 needs N%4==0).
+    candidates = [2, 4, 8]
+    divisor = ones(Int, D)
+
+    for div_candidate in candidates
+        # Test with several odd multiples of the candidate divisor
+        test_multipliers = [5, 7, 9, 11, 13]
+        n_ok = 0
+        n_bad = 0
+
+        for k in test_multipliers
+            N_test_val = div_candidate * k
+            N_test = ntuple(_ -> N_test_val, Val(D))
+            try
+                local ops_test = get_ops(sg, D, N_test)
+                local _, ops_s_test = find_optimal_shift(ops_test, N_test)
+                local L_test = auto_L(ops_s_test)
+                if prod(L_test) >= prod(best_L)
+                    n_ok += 1
+                else
+                    n_bad += 1
+                end
+            catch
+                # N not commensurate with group — skip
+                continue
+            end
+        end
+
+        # Accept this divisor only if at least 2 tests succeeded and none failed
+        if n_ok >= 2 && n_bad == 0
+            divisor .= div_candidate
+            break
+        end
+    end
+
+    result = NTuple{D, Int}(Tuple(divisor))
+    _N_DIVISOR_CACHE[key] = result
+    return result
 end
 
 """
