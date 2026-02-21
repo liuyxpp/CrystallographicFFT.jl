@@ -16,7 +16,7 @@ const _SpecASU = _SpectralIndexingModule.SpectralIndexing  # the type struct
 import ..ForwardPlan, ..BackwardPlan
 import ..CenteredForwardPlan, ..CenteredBackwardPlan, ..CenteringFoldPlan
 import ..RealForwardPlan, ..RealBackwardPlan
-import ..auto_L, ..plan_forward, ..plan_backward
+import ..auto_L, ..plan_forward, ..plan_backward, .._select_rep_ops
 import ..plan_centered_forward, ..plan_centered_backward
 import ..plan_real_forward, ..plan_real_backward
 import ..fft_reconstruct!, ..execute_backward!
@@ -247,34 +247,45 @@ end
 
 """Build symmetry fill map: for each full-grid point, its subgrid linear index."""
 function _build_fill_map_internal(shifted_ops, L, M_sub, N, D)
-    N_vol = prod(N)
-    fill_map = zeros(Int32, N...)
-    M_sub_tup = Tuple(M_sub)
-    li_sub = LinearIndices(M_sub_tup)
+    # Pre-extract R and t as flat tuples for zero-allocation inner loop
+    n_ops = length(shifted_ops)
+    # R stored column-major: R_flat[row + 3*(col-1) + 1] = R[row+1, col+1]
+    Rs = Vector{NTuple{9,Int}}(undef, n_ops)
+    ts = Vector{NTuple{3,Int}}(undef, n_ops)
+    @inbounds for i in eachindex(shifted_ops)
+        op = shifted_ops[i]
+        Rs[i] = (Int(op.R[1,1]), Int(op.R[2,1]), Int(op.R[3,1]),
+                 Int(op.R[1,2]), Int(op.R[2,2]), Int(op.R[3,2]),
+                 Int(op.R[1,3]), Int(op.R[2,3]), Int(op.R[3,3]))
+        ts[i] = (Int(op.t[1]), Int(op.t[2]), Int(op.t[3]))
+    end
 
-    for ci in CartesianIndices(Tuple(N))
-        x = [ci[d] - 1 for d in 1:D]  # 0-based
+    N1, N2, N3 = N[1], N[2], N[3]
+    L1, L2, L3 = L[1], L[2], L[3]
+    M1, M2, M3 = M_sub[1], M_sub[2], M_sub[3]
 
-        # Find which subgrid point corresponds to x via symmetry
-        found = false
-        for op in shifted_ops
-            # Apply op: x' = R*x + t mod N
-            x_rot = [mod(sum(Int(op.R[d, d2]) * x[d2] for d2 in 1:D) + Int(op.t[d]), N[d])
-                      for d in 1:D]
+    fill_map = zeros(Int32, N1, N2, N3)
 
+    @inbounds for k3 in 0:N3-1, k2 in 0:N2-1, k1 in 0:N1-1
+        for oi in 1:n_ops
+            R = Rs[oi]
+            t = ts[oi]
+            # x' = R * (k1,k2,k3) + t  mod N  (inline 3×3 matmul)
+            x1 = mod(R[1]*k1 + R[4]*k2 + R[7]*k3 + t[1], N1)
+            x2 = mod(R[2]*k1 + R[5]*k2 + R[8]*k3 + t[2], N2)
+            x3 = mod(R[3]*k1 + R[6]*k2 + R[9]*k3 + t[3], N3)
             # Check if x' is on the stride-L subgrid
-            if all(mod(x_rot[d], L[d]) == 0 for d in 1:D)
-                # Map to subgrid index
-                sub_idx = [x_rot[d] ÷ L[d] + 1 for d in 1:D]
-                fill_map[ci] = Int32(li_sub[CartesianIndex(Tuple(sub_idx))])
-                found = true
+            if x1 % L1 == 0 && x2 % L2 == 0 && x3 % L3 == 0
+                si = (x1 ÷ L1) + M1 * (x2 ÷ L2) + M1 * M2 * (x3 ÷ L3) + 1
+                fill_map[k1 + 1, k2 + 1, k3 + 1] = Int32(si)
                 break
             end
         end
-
-        if !found
-            # Fallback: map to first subgrid point
-            fill_map[ci] = Int32(1)
+        # Fallback: fill_map stays 0 if no op found (zeros default)
+        # The original code used fallback=1; callers should handle 0 gracefully
+        # but we keep backward compat by setting fallback
+        if fill_map[k1 + 1, k2 + 1, k3 + 1] == 0
+            fill_map[k1 + 1, k2 + 1, k3 + 1] = Int32(1)
         end
     end
     return fill_map
@@ -947,8 +958,12 @@ function plan_rcfft_pair(N::NTuple{D,Int}, sg_num::Int, dim::Int;
     ops_s, spec_asu, n_spec, L, M, fill_map, _ =
         _plan_geometry(N, sg_num, dim; method=:general)
 
-    fwd = plan_real_forward(T, spec_asu, ops_s; backend)
-    bwd = plan_real_backward(T, spec_asu, ops_s; backend)
+    # Pre-compute shared values to avoid redundant work in fwd/bwd
+    L_vec = collect(L)
+    rep_ops = _select_rep_ops(ops_s, L_vec, N, dim)
+
+    fwd = plan_real_forward(T, spec_asu, ops_s; backend, L_vec, rep_ops)
+    bwd = plan_real_backward(T, spec_asu, ops_s; backend, L_vec, rep_ops)
     return GeneralRCFFTPairPlan(fwd, bwd, spec_asu, n_spec, sg_num, dim, N, M, L, fill_map)
 end
 

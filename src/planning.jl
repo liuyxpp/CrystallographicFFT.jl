@@ -155,24 +155,33 @@ function _build_recon_soa(spec_asu::SpecASU, rep_ops::Vector{<:SymOp},
     recon_fiber_idx = Vector{Int32}(undef, total)
     recon_weight = Vector{ComplexF64}(undef, total)
 
-    for (h_idx, _) in enumerate(spec_asu.points)
-        h_vec = get_k_vector(spec_asu, h_idx)
-        for (g_idx, g) in enumerate(rep_ops)
-            # Phase: exp(-2πi h·t_g/N)
-            phase_val = 0.0
-            for d in 1:dim
-                phase_val += h_vec[d] * g.t[d] / N[d]
-            end
-            weight = exp(-im * 2π * phase_val)
+    # Pre-extract R (column-major flat) and t as NTuples
+    Rs = Vector{NTuple{9,Int}}(undef, n_ops)
+    ts = Vector{NTuple{3,Float64}}(undef, n_ops)
+    @inbounds for i in 1:n_ops
+        g = rep_ops[i]
+        Rs[i] = (Int(g.R[1,1]), Int(g.R[2,1]), Int(g.R[3,1]),
+                 Int(g.R[1,2]), Int(g.R[2,2]), Int(g.R[3,2]),
+                 Int(g.R[1,3]), Int(g.R[2,3]), Int(g.R[3,3]))
+        ts[i] = (Float64(g.t[1]), Float64(g.t[2]), Float64(g.t[3]))
+    end
+    M1, M2, M3 = M_sub[1], M_sub[2], M_sub[3]
+    N1f, N2f, N3f = Float64(N[1]), Float64(N[2]), Float64(N[3])
 
-            # Rotated frequency: R_g^T h mod M
-            lin_idx = 1
-            stride = 1
-            for d in 1:dim
-                rot_h_d = mod(sum(g.R[d2, d] * h_vec[d2] for d2 in 1:dim), M_sub[d])
-                lin_idx += rot_h_d * stride
-                stride *= M_sub[d]
-            end
+    @inbounds for (h_idx, _) in enumerate(spec_asu.points)
+        h_vec = get_k_vector(spec_asu, h_idx)
+        h1, h2, h3 = h_vec[1], h_vec[2], h_vec[3]
+        for g_idx in 1:n_ops
+            R = Rs[g_idx]; t = ts[g_idx]
+            # Phase: exp(-2πi h·t_g/N)
+            phase_val = h1 * t[1] / N1f + h2 * t[2] / N2f + h3 * t[3] / N3f
+            weight = cispi(-2 * phase_val)
+
+            # Rotated frequency: R_g^T h mod M  (column d of R = row d entries)
+            r1 = mod(R[1]*h1 + R[2]*h2 + R[3]*h3, M1)
+            r2 = mod(R[4]*h1 + R[5]*h2 + R[6]*h3, M2)
+            r3 = mod(R[7]*h1 + R[8]*h2 + R[9]*h3, M3)
+            lin_idx = 1 + r1 + M1 * r2 + M1 * M2 * r3
 
             k = (h_idx - 1) * n_ops + g_idx
             recon_fiber_idx[k] = Int32(lin_idx)
@@ -538,48 +547,46 @@ function _build_recon_soa_rfft(spec_asu::SpecASU, rep_ops::Vector{<:SymOp},
     recon_fiber_idx = Vector{Int32}(undef, total)
     recon_weight = Vector{ComplexF64}(undef, total)
 
-    rot_h = zeros(Int, dim)
+    # Pre-extract R (column-major flat) and t as NTuples
+    Rs = Vector{NTuple{9,Int}}(undef, n_ops)
+    ts = Vector{NTuple{3,Float64}}(undef, n_ops)
+    @inbounds for i in 1:n_ops
+        g = rep_ops[i]
+        Rs[i] = (Int(g.R[1,1]), Int(g.R[2,1]), Int(g.R[3,1]),
+                 Int(g.R[1,2]), Int(g.R[2,2]), Int(g.R[3,2]),
+                 Int(g.R[1,3]), Int(g.R[2,3]), Int(g.R[3,3]))
+        ts[i] = (Float64(g.t[1]), Float64(g.t[2]), Float64(g.t[3]))
+    end
+    M1, M2, M3 = M_sub[1], M_sub[2], M_sub[3]
+    N1f, N2f, N3f = Float64(N[1]), Float64(N[2]), Float64(N[3])
 
-    for (h_idx, _) in enumerate(spec_asu.points)
+    @inbounds for (h_idx, _) in enumerate(spec_asu.points)
         h_vec = get_k_vector(spec_asu, h_idx)
-        for (g_idx, g) in enumerate(rep_ops)
-            # Phase: exp(-2πi h·t_g/N)
-            phase_val = 0.0
-            for d in 1:dim
-                phase_val += h_vec[d] * g.t[d] / N[d]
-            end
-            weight = exp(-im * 2π * phase_val)
+        h1, h2, h3 = h_vec[1], h_vec[2], h_vec[3]
+        for g_idx in 1:n_ops
+            R = Rs[g_idx]; t = ts[g_idx]
+            # Phase: cispi(-2 h·t_g/N)  — more accurate than exp(-im*2π*...)
+            phase_val = h1 * t[1] / N1f + h2 * t[2] / N2f + h3 * t[3] / N3f
+            weight = cispi(-2 * phase_val)
 
-            # Rotated frequency: R_g^T h mod M
-            for d in 1:dim
-                rot_h[d] = mod(sum(g.R[d2, d] * h_vec[d2] for d2 in 1:dim), M_sub[d])
-            end
+            # Rotated frequency: R_g^T h mod M  (column d of R)
+            r1 = mod(R[1]*h1 + R[2]*h2 + R[3]*h3, M1)
+            r2 = mod(R[4]*h1 + R[5]*h2 + R[6]*h3, M2)
+            r3 = mod(R[7]*h1 + R[8]*h2 + R[9]*h3, M3)
 
             k = (h_idx - 1) * n_ops + g_idx
 
-            if rot_h[1] < M̂1
+            if r1 < M̂1
                 # Direct access in rfft output
-                lin_idx = 1 + rot_h[1] + M̂1 * rot_h[2]
-                for dd in 3:dim
-                    stride = M̂1
-                    for dd2 in 2:dd-1
-                        stride *= M_sub[dd2]
-                    end
-                    lin_idx += rot_h[dd] * stride
-                end
+                lin_idx = 1 + r1 + M̂1 * r2 + M̂1 * M2 * r3
                 recon_fiber_idx[k] = Int32(lin_idx)
                 recon_weight[k] = weight
             else
-                # Hermitian map: h' = (-rot_h) mod M → guaranteed h'[1] < M̂1
-                herm = [mod(-rot_h[d], M_sub[d]) for d in 1:dim]
-                lin_idx = 1 + herm[1] + M̂1 * herm[2]
-                for dd in 3:dim
-                    stride = M̂1
-                    for dd2 in 2:dd-1
-                        stride *= M_sub[dd2]
-                    end
-                    lin_idx += herm[dd] * stride
-                end
+                # Hermitian map: h' = (-r) mod M → guaranteed h'[1] < M̂1
+                hm1 = mod(-r1, M1)
+                hm2 = mod(-r2, M2)
+                hm3 = mod(-r3, M3)
+                lin_idx = 1 + hm1 + M̂1 * hm2 + M̂1 * M2 * hm3
                 recon_fiber_idx[k] = Int32(-lin_idx)  # negative = conjugate
                 recon_weight[k] = weight
             end
@@ -598,13 +605,18 @@ Construct a device-agnostic forward KRFFT plan using rfft for real inputs.
 """
 function plan_real_forward(::Type{T}, spec_asu::SpecASU,
                            ops_shifted::Vector{<:SymOp};
-                           backend=CPU()) where {T<:AbstractFloat}
+                           backend=CPU(),
+                           L_vec::Union{Vector{Int},Nothing}=nothing,
+                           rep_ops::Union{Vector{<:SymOp},Nothing}=nothing
+                           ) where {T<:AbstractFloat}
     CT = Complex{T}
     N = spec_asu.N
     dim = length(N)
 
-    # 1. Auto L and M
-    L_vec = auto_L(ops_shifted)
+    # 1. Auto L and M (skip if pre-computed)
+    if L_vec === nothing
+        L_vec = auto_L(ops_shifted)
+    end
     M_sub = [N[d] ÷ L_vec[d] for d in 1:dim]
     M_vol = prod(M_sub)
     n_spec = length(spec_asu.points)
@@ -614,8 +626,10 @@ function plan_real_forward(::Type{T}, spec_asu::SpecASU,
     M̂_sub[1] = M_sub[1] ÷ 2 + 1
     M̂_vol = prod(M̂_sub)
 
-    # 2. Representative ops
-    rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+    # 2. Representative ops (skip if pre-computed)
+    if rep_ops === nothing
+        rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+    end
     n_ops = prod(L_vec)
 
     # 3. SoA reconstruction table (rfft-aware, CPU)
@@ -753,14 +767,19 @@ Inverse reconstruction only fills the half-spectrum (M̂₁×M₂×M₃).
 """
 function plan_real_backward(::Type{T}, spec_asu::SpecASU,
                             ops_shifted::Vector{<:SymOp};
-                            backend=CPU()) where {T<:AbstractFloat}
+                            backend=CPU(),
+                            L_vec::Union{Vector{Int},Nothing}=nothing,
+                            rep_ops::Union{Vector{<:SymOp},Nothing}=nothing
+                            ) where {T<:AbstractFloat}
     CT = Complex{T}
     N = spec_asu.N
     dim = length(N)
     N_vec = collect(N)
 
-    # 1. L and M
-    L_vec = auto_L(ops_shifted)
+    # 1. L and M (skip if pre-computed)
+    if L_vec === nothing
+        L_vec = auto_L(ops_shifted)
+    end
     M_sub = [N[d] ÷ L_vec[d] for d in 1:dim]
     M_vol = prod(M_sub)
     n_spec = length(spec_asu.points)
@@ -771,8 +790,10 @@ function plan_real_backward(::Type{T}, spec_asu::SpecASU,
     M̂_sub[1] = M_sub[1] ÷ 2 + 1
     M̂_vol = prod(M̂_sub)
 
-    # 2. Representative ops
-    rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+    # 2. Representative ops (skip if pre-computed)
+    if rep_ops === nothing
+        rep_ops = _select_rep_ops(ops_shifted, L_vec, N, dim)
+    end
 
     # 3. Spectral reverse lookup
     h_to_spec = _build_spectral_reverse_lookup(spec_asu, ops_shifted, N_vec, dim)

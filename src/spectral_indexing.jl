@@ -23,154 +23,117 @@ function calc_spectral_asu(direct_ops::Vector{<:SymOp}, dim::Int, N::Tuple)
     D = length(N)
     N_vec = collect(N)
     n_total = prod(N)
-    
+
     # Reciprocal-space point group: R* = (R⁻¹)ᵀ, t=0
     recip_ops = dual_ops(direct_ops)
     n_ops = length(recip_ops)
-    
+
     # Visited mask: linear index → already assigned to an orbit
     visited = falses(n_total)
-    
-    # Pre-allocate buffers
-    k = zeros(Int, D)
-    k_rot = zeros(Int, D)
-    
+
     valid_points = Vector{ASUPoint}()
-    
-    # Pre-extract rotation matrices for fast access
-    R_mats = [op.R for op in recip_ops]
-    
-    # Iterate all k-points in lexicographic order
-    for lin_idx in 1:n_total
+    sizehint!(valid_points, n_total ÷ n_ops)
+
+    # Pre-extract rotation matrices as flat NTuples for zero-alloc inner loop
+    R_flat = Vector{NTuple{9,Int}}(undef, n_ops)
+    @inbounds for i in 1:n_ops
+        R = recip_ops[i].R
+        R_flat[i] = (Int(R[1,1]), Int(R[2,1]), Int(R[3,1]),
+                     Int(R[1,2]), Int(R[2,2]), Int(R[3,2]),
+                     Int(R[1,3]), Int(R[2,3]), Int(R[3,3]))
+    end
+
+    # Pre-extract direct op translations for extinction filter
+    t_direct_flat = Vector{NTuple{3,Float64}}(undef, n_ops)
+    @inbounds for i in 1:n_ops
+        t = direct_ops[i].t
+        t_direct_flat[i] = (Float64(t[1]), Float64(t[2]), Float64(t[3]))
+    end
+
+    N1, N2, N3 = N[1], N[2], N[3]
+
+    # Pre-allocated worklist buffer: max orbit size ≤ 2×|G| (point group + Hermitian)
+    # In practice, orbit size ≤ |G|, but be safe
+    max_orbit_size = 2 * n_ops
+    worklist = Vector{Int}(undef, max_orbit_size)
+    depth_zero = zeros(Int, D)  # shared constant for all points
+
+    # Single-pass orbit enumeration using pre-allocated worklist
+    @inbounds for lin_idx in 1:n_total
         visited[lin_idx] && continue
-        
-        # Convert linear index to k-vector (0-based, column-major)
-        rem = lin_idx - 1
-        @inbounds for d in 1:D
-            k[d] = rem % N[d]
-            rem = rem ÷ N[d]
-        end
-        
-        # Compute orbit
-        orbit_size = 0
-        min_lin = lin_idx  # Track canonical rep (smallest linear index)
-        
-        # Use the point itself
+
+        # Mark starting point
         visited[lin_idx] = true
-        orbit_size += 1
-        
-        # Apply all ops to find orbit members
-        for g in 1:n_ops
-            R = R_mats[g]
-            # R * k mod N → linear index
-            @inbounds begin
-                li = 0
-                stride = 1
-                for d in 1:D
-                    s = 0
-                    for j in 1:D
-                        s += R[d, j] * k[j]
-                    end
-                    k_rot[d] = mod(s, N[d])
-                    li += k_rot[d] * stride
-                    stride *= N[d]
-                end
-            end
-            li += 1  # 1-based
-            
-            if !visited[li]
-                visited[li] = true
-                orbit_size += 1
-                if li < min_lin
-                    min_lin = li
-                end
-            end
-        end
-        
-        # Also apply orbit closure (iterate existing orbit members through ops)
-        # For crystallographic point groups, single pass is usually sufficient
-        # but we need to be safe for higher-order groups.
-        # Use worklist approach:
-        worklist = [lin_idx]
+        worklist[1] = lin_idx
+        wlen = 1
+        min_lin = lin_idx
+        orbit_size = 1
+
+        # BFS: apply ops to all discovered orbit members
         wi = 1
-        while wi <= length(worklist)
+        while wi <= wlen
             curr_lin = worklist[wi]
             wi += 1
-            
-            # Convert back to k-vector
+
+            # Decompose linear index → (k1, k2, k3) 0-based
             rem_c = curr_lin - 1
-            @inbounds for d in 1:D
-                k_rot[d] = rem_c % N[d]
-                rem_c = rem_c ÷ N[d]
-            end
-            
+            ck1 = rem_c % N1
+            rem_c = rem_c ÷ N1
+            ck2 = rem_c % N2
+            ck3 = rem_c ÷ N2
+
             for g in 1:n_ops
-                R = R_mats[g]
-                @inbounds begin
-                    li = 0
-                    stride = 1
-                    for d in 1:D
-                        s = 0
-                        for j in 1:D
-                            s += R[d, j] * k_rot[j]
-                        end
-                        val = mod(s, N[d])
-                        li += val * stride
-                        stride *= N[d]
-                    end
-                end
-                li += 1
-                
+                Rg = R_flat[g]
+                # R * k mod N → linear index (inline 3×3 matmul)
+                v1 = mod(Rg[1]*ck1 + Rg[4]*ck2 + Rg[7]*ck3, N1)
+                v2 = mod(Rg[2]*ck1 + Rg[5]*ck2 + Rg[8]*ck3, N2)
+                v3 = mod(Rg[3]*ck1 + Rg[6]*ck2 + Rg[9]*ck3, N3)
+                li = v1 + N1 * v2 + N1 * N2 * v3 + 1
+
                 if !visited[li]
                     visited[li] = true
                     orbit_size += 1
-                    push!(worklist, li)
                     if li < min_lin
                         min_lin = li
                     end
+                    wlen += 1
+                    if wlen <= max_orbit_size
+                        worklist[wlen] = li
+                    end
+                    # If orbit exceeds buffer, we still count but skip BFS expansion
+                    # This is safe because crystallographic orbits are bounded by |G|
                 end
             end
         end
-        
-        # Convert min_lin to k-vector for the representative
+
+        # Decompose min_lin → k_rep (0-based)
         rem_r = min_lin - 1
-        k_rep = zeros(Int, D)
-        @inbounds for d in 1:D
-            k_rep[d] = rem_r % N[d]
-            rem_r = rem_r ÷ N[d]
-        end
-        
+        kr1 = rem_r % N1
+        rem_r = rem_r ÷ N1
+        kr2 = rem_r % N2
+        kr3 = rem_r ÷ N2
+
         # Extinction filter: Sum_{g in Stab(k)} exp(-2πi k·t_g/N) ≠ 0
         stab_sum = zero(ComplexF64)
-        for (i, op) in enumerate(recip_ops)
-            R = op.R
-            is_stab = true
-            @inbounds for d in 1:D
-                s = 0
-                for j in 1:D
-                    s += R[d, j] * k_rep[j]
-                end
-                if (s - k_rep[d]) % N_vec[d] != 0
-                    is_stab = false
-                    break
-                end
-            end
-            if is_stab
-                t_direct = direct_ops[i].t
-                phase = 0.0
-                @inbounds for d in 1:D
-                    phase += k_rep[d] * t_direct[d] / N[d]
-                end
+        for i in 1:n_ops
+            Rg = R_flat[i]
+            # Check if R*k ≡ k (mod N) → stabilizer element
+            s1 = mod(Rg[1]*kr1 + Rg[4]*kr2 + Rg[7]*kr3, N1)
+            s2 = mod(Rg[2]*kr1 + Rg[5]*kr2 + Rg[8]*kr3, N2)
+            s3 = mod(Rg[3]*kr1 + Rg[6]*kr2 + Rg[9]*kr3, N3)
+            if s1 == kr1 && s2 == kr2 && s3 == kr3
+                td = t_direct_flat[i]
+                phase = kr1 * td[1] / N1 + kr2 * td[2] / N2 + kr3 * td[3] / N3
                 stab_sum += cispi(-2 * phase)
             end
         end
-        
+
         if abs(stab_sum) > 1e-5
-            depth = zeros(Int, D)  # Not needed for spectral ASU
-            push!(valid_points, ASUPoint(k_rep, depth, orbit_size))
+            k_rep = [kr1, kr2, kr3]
+            push!(valid_points, ASUPoint(k_rep, depth_zero, orbit_size))
         end
     end
-    
+
     sort!(valid_points, by=p -> p.idx)
     return SpectralIndexing(valid_points, recip_ops, N)
 end
