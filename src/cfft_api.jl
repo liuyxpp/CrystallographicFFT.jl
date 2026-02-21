@@ -264,6 +264,13 @@ function _build_fill_map_internal(shifted_ops, L, M_sub, N, D)
     L1, L2, L3 = L[1], L[2], L[3]
     M1, M2, M3 = M_sub[1], M_sub[2], M_sub[3]
 
+    # Fast modulo: use bitwise AND for power-of-2 sizes (avoids division)
+    _ispow2(n::Int) = n > 0 && (n & (n - 1)) == 0
+    m1 = _ispow2(N1) ? N1 - 1 : -1
+    m2 = _ispow2(N2) ? N2 - 1 : -1
+    m3 = _ispow2(N3) ? N3 - 1 : -1
+    @inline _fmod(x::Int, n::Int, mask::Int) = mask >= 0 ? (x & mask) : mod(x, n)
+
     fill_map = zeros(Int32, N1, N2, N3)
 
     @inbounds for k3 in 0:N3-1, k2 in 0:N2-1, k1 in 0:N1-1
@@ -271,9 +278,9 @@ function _build_fill_map_internal(shifted_ops, L, M_sub, N, D)
             R = Rs[oi]
             t = ts[oi]
             # x' = R * (k1,k2,k3) + t  mod N  (inline 3×3 matmul)
-            x1 = mod(R[1]*k1 + R[4]*k2 + R[7]*k3 + t[1], N1)
-            x2 = mod(R[2]*k1 + R[5]*k2 + R[8]*k3 + t[2], N2)
-            x3 = mod(R[3]*k1 + R[6]*k2 + R[9]*k3 + t[3], N3)
+            x1 = _fmod(R[1]*k1 + R[4]*k2 + R[7]*k3 + t[1], N1, m1)
+            x2 = _fmod(R[2]*k1 + R[5]*k2 + R[8]*k3 + t[2], N2, m2)
+            x3 = _fmod(R[3]*k1 + R[6]*k2 + R[9]*k3 + t[3], N3, m3)
             # Check if x' is on the stride-L subgrid
             if x1 % L1 == 0 && x2 % L2 == 0 && x3 % L3 == 0
                 si = (x1 ÷ L1) + M1 * (x2 ÷ L2) + M1 * M2 * (x3 ÷ L3) + 1

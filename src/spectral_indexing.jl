@@ -52,6 +52,13 @@ function calc_spectral_asu(direct_ops::Vector{<:SymOp}, dim::Int, N::Tuple)
 
     N1, N2, N3 = N[1], N[2], N[3]
 
+    # Fast modulo: use bitwise AND for power-of-2 sizes (avoids division)
+    _ispow2(n::Int) = n > 0 && (n & (n - 1)) == 0
+    m1 = _ispow2(N1) ? N1 - 1 : -1
+    m2 = _ispow2(N2) ? N2 - 1 : -1
+    m3 = _ispow2(N3) ? N3 - 1 : -1
+    @inline _fmod(x::Int, n::Int, mask::Int) = mask >= 0 ? (x & mask) : mod(x, n)
+
     # Pre-allocated worklist buffer: max orbit size ≤ 2×|G| (point group + Hermitian)
     # In practice, orbit size ≤ |G|, but be safe
     max_orbit_size = 2 * n_ops
@@ -85,9 +92,9 @@ function calc_spectral_asu(direct_ops::Vector{<:SymOp}, dim::Int, N::Tuple)
             for g in 1:n_ops
                 Rg = R_flat[g]
                 # R * k mod N → linear index (inline 3×3 matmul)
-                v1 = mod(Rg[1]*ck1 + Rg[4]*ck2 + Rg[7]*ck3, N1)
-                v2 = mod(Rg[2]*ck1 + Rg[5]*ck2 + Rg[8]*ck3, N2)
-                v3 = mod(Rg[3]*ck1 + Rg[6]*ck2 + Rg[9]*ck3, N3)
+                v1 = _fmod(Rg[1]*ck1 + Rg[4]*ck2 + Rg[7]*ck3, N1, m1)
+                v2 = _fmod(Rg[2]*ck1 + Rg[5]*ck2 + Rg[8]*ck3, N2, m2)
+                v3 = _fmod(Rg[3]*ck1 + Rg[6]*ck2 + Rg[9]*ck3, N3, m3)
                 li = v1 + N1 * v2 + N1 * N2 * v3 + 1
 
                 if !visited[li]
@@ -118,9 +125,9 @@ function calc_spectral_asu(direct_ops::Vector{<:SymOp}, dim::Int, N::Tuple)
         for i in 1:n_ops
             Rg = R_flat[i]
             # Check if R*k ≡ k (mod N) → stabilizer element
-            s1 = mod(Rg[1]*kr1 + Rg[4]*kr2 + Rg[7]*kr3, N1)
-            s2 = mod(Rg[2]*kr1 + Rg[5]*kr2 + Rg[8]*kr3, N2)
-            s3 = mod(Rg[3]*kr1 + Rg[6]*kr2 + Rg[9]*kr3, N3)
+            s1 = _fmod(Rg[1]*kr1 + Rg[4]*kr2 + Rg[7]*kr3, N1, m1)
+            s2 = _fmod(Rg[2]*kr1 + Rg[5]*kr2 + Rg[8]*kr3, N2, m2)
+            s3 = _fmod(Rg[3]*kr1 + Rg[6]*kr2 + Rg[9]*kr3, N3, m3)
             if s1 == kr1 && s2 == kr2 && s3 == kr3
                 td = t_direct_flat[i]
                 phase = kr1 * td[1] / N1 + kr2 * td[2] / N2 + kr3 * td[3] / N3
