@@ -700,6 +700,60 @@ end
 # Star conversions (SubgridStarMap)
 # ============================================================================
 
+# Module-level Union-Find helpers (avoid closure overhead in build_subgrid_star_map)
+@inline function _uf_find!(parent::Vector{Int32}, x::Int32)::Int32
+    @inbounds while parent[x] != x
+        parent[x] = parent[parent[x]]  # path compression
+        x = parent[x]
+    end
+    return x
+end
+
+@inline function _uf_union!(parent::Vector{Int32}, a::Int32, b::Int32)
+    ra = _uf_find!(parent, a)
+    rb = _uf_find!(parent, b)
+    if ra != rb
+        @inbounds if ra < rb
+            parent[rb] = ra
+        else
+            parent[ra] = rb
+        end
+    end
+end
+
+# Hot loop extracted as function barrier for optimal LLVM codegen
+function _star_uf_loop!(parent::Vector{Int32},
+                        Rs::Vector{NTuple{9,Int}},
+                        ts::Vector{NTuple{3,Int}},
+                        n_ops::Int,
+                        N::NTuple{3,Int}, L::NTuple{3,Int}, M::NTuple{3,Int})
+    N1, N2, N3 = N
+    L1, L2, L3 = L
+    M1, M2, M3 = M
+
+    @inbounds for k3 in 0:M3-1, k2 in 0:M2-1, k1 in 0:M1-1
+        sub_idx1 = Int32(k1 + M1 * k2 + M1 * M2 * k3 + 1)
+        x1 = k1 * L1
+        x2 = k2 * L2
+        x3 = k3 * L3
+
+        for oi in 1:n_ops
+            R = Rs[oi]
+            t = ts[oi]
+            xp1 = mod(R[1]*x1 + R[4]*x2 + R[7]*x3 + t[1], N1)
+            xp2 = mod(R[2]*x1 + R[5]*x2 + R[8]*x3 + t[2], N2)
+            xp3 = mod(R[3]*x1 + R[6]*x2 + R[9]*x3 + t[3], N3)
+            if xp1 % L1 == 0 && xp2 % L2 == 0 && xp3 % L3 == 0
+                s1 = xp1 ÷ L1
+                s2 = xp2 ÷ L2
+                s3 = xp3 ÷ L3
+                sub_idx2 = Int32(s1 + M1 * s2 + M1 * M2 * s3 + 1)
+                _uf_union!(parent, sub_idx1, sub_idx2)
+            end
+        end
+    end
+end
+
 """
     build_subgrid_star_map(plan::AbstractCFFTPlan) → SubgridStarMap
 
@@ -713,70 +767,35 @@ function build_subgrid_star_map(plan::AbstractCFFTPlan)
     M = plan.M
     N = plan.N
     L = plan.L
-    D = plan.dim
 
     M_vol = prod(M)
-    li_sub = LinearIndices(M)
 
     # Union-Find for grouping subgrid points into stars
     parent = collect(Int32(1):Int32(M_vol))
-
-    function uf_find(x::Int32)::Int32
-        while parent[x] != x
-            parent[x] = parent[parent[x]]  # path compression
-            x = parent[x]
-        end
-        return x
-    end
-
-    function uf_union!(a::Int32, b::Int32)
-        ra = uf_find(a)
-        rb = uf_find(b)
-        if ra != rb
-            if ra < rb
-                parent[rb] = ra
-            else
-                parent[ra] = rb
-            end
-        end
-    end
 
     # For each subgrid point, apply all symmetry ops. If the result
     # lands on the subgrid (x' mod L == 0), the two subgrid points
     # belong to the same star. Union-Find groups them.
     ops_s = _get_ops_shifted(plan)
 
-    for ci in CartesianIndices(M)
-        sub_idx1 = Int32(li_sub[ci])
-        # Subgrid point in full-grid coordinates (0-based)
-        x0 = ntuple(d -> (ci[d] - 1) * L[d], Val(D))
-
-        for op in ops_s
-            # Apply op: x' = R * x0 + t mod N
-            on_subgrid = true
-            sub_coords = ntuple(Val(D)) do d
-                s = Int(op.t[d])
-                for j in 1:D
-                    s += Int(op.R[d, j]) * x0[j]
-                end
-                xp = mod(s, N[d])
-                if xp % L[d] != 0
-                    on_subgrid = false
-                end
-                xp ÷ L[d] + 1
-            end
-
-            if on_subgrid
-                sub_idx2 = Int32(li_sub[CartesianIndex(sub_coords)])
-                uf_union!(sub_idx1, sub_idx2)
-            end
-        end
+    # Pre-extract R and t as flat NTuples for zero-allocation inner loop
+    n_ops = length(ops_s)
+    Rs = Vector{NTuple{9,Int}}(undef, n_ops)
+    ts = Vector{NTuple{3,Int}}(undef, n_ops)
+    @inbounds for i in eachindex(ops_s)
+        op = ops_s[i]
+        Rs[i] = (Int(op.R[1,1]), Int(op.R[2,1]), Int(op.R[3,1]),
+                 Int(op.R[1,2]), Int(op.R[2,2]), Int(op.R[3,2]),
+                 Int(op.R[1,3]), Int(op.R[2,3]), Int(op.R[3,3]))
+        ts[i] = (Int(op.t[1]), Int(op.t[2]), Int(op.t[3]))
     end
 
-    # Compress roots and assign star indices
-    # Finalize path compression
+    # Delegate hot loop to a standalone function (function barrier)
+    _star_uf_loop!(parent, Rs, ts, n_ops, N, L, M)
+
+    # Compress roots and finalize
     for i in Int32(1):Int32(M_vol)
-        parent[i] = uf_find(Int32(i))
+        parent[i] = _uf_find!(parent, Int32(i))
     end
 
     # Map roots to sequential star indices
