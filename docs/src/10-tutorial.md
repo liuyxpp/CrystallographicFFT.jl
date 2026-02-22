@@ -163,12 +163,10 @@ update_diffusion_kernel!(K, pair, new_Δs, lattice)
 Choose grid sizes that are compatible with your space group:
 
 ```julia
-N_good = recommended_N(64, 225)  # → a size ≥ 64 compatible with SG 225
+N_good = recommended_N(225, (64, 64, 64))  # → a size ≥ 64 compatible with SG 225
 ```
 
-The returned `N` satisfies:
-- Divisible by the stride factor `L` for the group
-- Efficient for FFTW (smooth factorization)
+The returned `N` is rounded up to the nearest multiple of the required divisor for the space group, ensuring `auto_L` achieves its maximum stride factor. For example, Ia-3d (SG 230) requires `N` divisible by 8.
 
 ---
 
@@ -186,7 +184,23 @@ cfft_asu_size(plan)    # number of unique spectral coefficients
 ### Spectral Space Utilities
 
 ```julia
-k2 = cfft_k2(plan, lattice)    # |k|² for each spectral ASU point
+k2 = cfft_k2(plan, lattice)          # |k|² for each spectral ASU point
+kk = cfft_kk_orbsum(plan, lattice)   # orbit-weighted k⊗k sums (for stress tensors)
+```
+
+### Star Mapping (SubgridStarMap)
+
+Convert between subgrid points and their symmetry orbits (stars):
+
+```julia
+star_map = build_subgrid_star_map(pair)   # Union-Find star construction
+
+# Compress subgrid → star representation
+compressed = zeros(star_map.n_stars)
+compress_stars!(compressed, star_map, f0)
+
+# Expand star → subgrid representation
+expand_stars!(f0, star_map, compressed)
 ```
 
 ### Grid Conversions

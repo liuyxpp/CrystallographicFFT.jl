@@ -74,6 +74,8 @@ The following `@kernel` functions handle GPU execution:
 | `orbit_gather_kernel!` | CSR orbit gather (centered backward) |
 | `orbit_expand_kernel!` | Orbit phase expansion (centered backward) |
 | `copy_real_to_complex_kernel!` | Real → Complex buffer copy |
+| `reconstruct_rfft_kernel!` | Forward reconstruction (rfft path, signed indices) |
+| `inv_reconstruct_rfft_kernel!` | Backward reconstruction (rfft path) |
 | `copy_complex_to_real_kernel!` | Complex → Real buffer copy |
 
 ## GPU Optimizations

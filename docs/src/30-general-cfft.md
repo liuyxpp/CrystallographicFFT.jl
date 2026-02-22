@@ -5,8 +5,8 @@ This page describes the **general KRFFT path**, which works for all 230 space gr
 ## Plan Types
 
 The general path produces plans of type:
-- **Forward**: `CFFTPlan{<:GeneralForwardPlan}` or the forward half of `GeneralCFFTPairPlan`
-- **Backward**: `ICFFTPlan{<:GeneralBackwardPlan}` or the backward half of `GeneralCFFTPairPlan`
+- **Forward**: `CFFTPlan{<:ForwardPlan}` or the forward half of `GeneralCFFTPairPlan`
+- **Backward**: `ICFFTPlan{<:BackwardPlan}` or the backward half of `GeneralCFFTPairPlan`
 
 ## Forward Data Flow
 
