@@ -1,6 +1,6 @@
 name = "CrystallographicFFT"
 uuid = "77d87cf4-6451-5050-a4a3-5ce7c515c7a6"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Yixin Liu <lyx@fudan.edu.cn>"]
 
 [workspace]
